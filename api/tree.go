@@ -58,11 +58,22 @@ func NewTreeHeadHandler(deps *TreeDeps) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, head.TreeSize))
 		w.Header().Set("Cache-Control", "public, max-age=5")
+
+		// Build signatures array.
+		sigs := make([]map[string]any, len(head.Signatures))
+		for i, s := range head.Signatures {
+			sigs[i] = map[string]any{
+				"signer":    s.Signer,
+				"sig_algo":  s.SigAlgo,
+				"signature": hex.EncodeToString(s.Signature),
+			}
+		}
+
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"tree_size":    head.TreeSize,
-			"root_hash":    hex.EncodeToString(head.RootHash[:]),
-			"scheme_tag":   head.SchemeTag,
-			"cosignatures": hex.EncodeToString(head.Cosignatures),
+			"tree_size":  head.TreeSize,
+			"root_hash":  hex.EncodeToString(head.RootHash[:]),
+			"hash_algo":  head.HashAlgo,
+			"signatures": sigs,
 		})
 	}
 }

@@ -12,6 +12,7 @@ package tests
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"net"
@@ -230,8 +231,12 @@ type stubMerkleAppender struct {
 	mt *smt.StubMerkleTree
 }
 
-func (s *stubMerkleAppender) AppendLeaf(hash [32]byte) (uint64, error) {
-	return s.mt.AppendLeaf(hash)
+func (s *stubMerkleAppender) AppendLeaf(data []byte) (uint64, error) {
+	// Compute SHA-256 of wire bytes, then pass hash to SDK StubMerkleTree.
+	// In production, Tessera computes RFC6962.HashLeaf(data) internally.
+	// For testing, SHA-256 is equivalent — both are deterministic leaf hashes.
+	h := sha256.Sum256(data)
+	return s.mt.AppendLeaf(h)
 }
 
 func (s *stubMerkleAppender) Head() (types.TreeHead, error) {

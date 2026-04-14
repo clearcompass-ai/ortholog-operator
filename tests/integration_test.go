@@ -745,8 +745,11 @@ func TestOps_DynamicDifficulty(t *testing.T) {
 func TestOps_HealthCheckAccuracy(t *testing.T) {
 	pool := skipIfNoPostgres(t)
 	if pool.Ping(context.Background()) != nil { t.Fatal("Postgres should be reachable") }
-	var count int; pool.QueryRow(context.Background(), "SELECT COUNT(*) FROM schema_migrations").Scan(&count)
-	if count == 0 { t.Fatal("migrations should be recorded") }
+	// Verify schema was created (entry_index table exists).
+	var exists bool
+	pool.QueryRow(context.Background(),
+		"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name='entry_index')").Scan(&exists)
+	if !exists { t.Fatal("entry_index table should exist after schema creation") }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

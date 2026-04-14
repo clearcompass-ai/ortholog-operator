@@ -104,10 +104,10 @@ func (em *EquivocationMonitor) check(ctx context.Context) {
 		}
 
 		if localHead.RootHash != peerHead.RootHash {
-			// Serialize local head for complete proof.
 			localBytes, _ := json.Marshal(map[string]any{
 				"tree_size": localHead.TreeSize,
 				"root_hash": fmt.Sprintf("%x", localHead.RootHash),
+				"hash_algo": localHead.HashAlgo,
 			})
 
 			proof := EquivocationProof{
@@ -133,7 +133,7 @@ func (em *EquivocationMonitor) check(ctx context.Context) {
 	}
 }
 
-func (em *EquivocationMonitor) fetchPeerHead(ctx context.Context, endpoint string) (*store.TreeHeadRow, []byte, error) {
+func (em *EquivocationMonitor) fetchPeerHead(ctx context.Context, endpoint string) (*store.CosignedTreeHead, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", endpoint+"/v1/tree/head", nil)
 	if err != nil {
 		return nil, nil, err
@@ -152,17 +152,21 @@ func (em *EquivocationMonitor) fetchPeerHead(ctx context.Context, endpoint strin
 	var parsed struct {
 		TreeSize uint64 `json:"tree_size"`
 		RootHash string `json:"root_hash"`
+		HashAlgo uint16 `json:"hash_algo"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return nil, nil, err
 	}
 
-	row := &store.TreeHeadRow{TreeSize: parsed.TreeSize}
+	head := &store.CosignedTreeHead{
+		TreeSize: parsed.TreeSize,
+		HashAlgo: parsed.HashAlgo,
+	}
 	rootBytes, err := hex.DecodeString(parsed.RootHash)
 	if err == nil && len(rootBytes) == 32 {
-		copy(row.RootHash[:], rootBytes)
+		copy(head.RootHash[:], rootBytes)
 	}
-	return row, body, nil
+	return head, body, nil
 }
 
 func (em *EquivocationMonitor) persistProof(ctx context.Context, proof EquivocationProof) {

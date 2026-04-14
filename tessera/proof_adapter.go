@@ -1,12 +1,11 @@
 /*
 FILE PATH: tessera/proof_adapter.go
 
-TesseraAdapter wraps the Tessera client and implements the sdk smt.MerkleTree
-interface. The builder depends only on the interface — swappable backend.
+TesseraAdapter wraps the Tessera client and implements the operator's
+MerkleAppender interface. The builder depends only on the interface.
 
-SDK smt.MerkleTree methods:
-  - AppendLeaf(hash [32]byte) → (uint64, error)
-  - InclusionProof(position, treeSize uint64) → (*MerkleProof, error)
+Operator MerkleAppender methods:
+  - AppendLeaf(data []byte) → (uint64, error)  [full wire bytes]
   - Head() → (TreeHead, error)
 
 Additional concrete method (NOT in sdk interface):
@@ -49,10 +48,11 @@ func NewTesseraAdapter(client *Client, tileReader *TileReader, logger *slog.Logg
 
 // ─── sdk smt.MerkleTree interface ──────────────────────────────────────────
 
-// AppendLeaf appends an entry hash to the Merkle tree. Returns tree position.
-func (a *TesseraAdapter) AppendLeaf(hash [32]byte) (uint64, error) {
+// AppendLeaf appends full wire bytes to the Merkle tree. Tessera computes
+// RFC6962.HashLeaf(data) internally. Returns tree position.
+func (a *TesseraAdapter) AppendLeaf(data []byte) (uint64, error) {
 	ctx := context.TODO()
-	return a.client.AppendLeaf(ctx, hash)
+	return a.client.AppendLeaf(ctx, data)
 }
 
 // InclusionProof generates a Merkle inclusion proof for a leaf.

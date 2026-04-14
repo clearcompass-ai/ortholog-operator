@@ -48,16 +48,14 @@ func NewClient(cfg ClientConfig, logger *slog.Logger) *Client {
 	}
 }
 
-// AppendLeaf submits a leaf hash to the Merkle tree. Returns assigned index.
-func (c *Client) AppendLeaf(ctx context.Context, leafHash [32]byte) (uint64, error) {
-	body, _ := json.Marshal(map[string]string{
-		"leaf_hash": hex.EncodeToString(leafHash[:]),
-	})
-	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v1/add", bytes.NewReader(body))
+// AppendLeaf submits full wire bytes (canonical + sig_envelope) to the Merkle
+// tree. Tessera computes RFC6962.HashLeaf(data) internally. Returns assigned index.
+func (c *Client) AppendLeaf(ctx context.Context, data []byte) (uint64, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v1/add", bytes.NewReader(data))
 	if err != nil {
 		return 0, fmt.Errorf("tessera/client: build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", "application/octet-stream")
 
 	resp, err := c.client.Do(req)
 	if err != nil {

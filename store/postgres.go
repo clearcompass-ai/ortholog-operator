@@ -124,153 +124,122 @@ func (p *Pools) Close() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2) Migrations — embedded DDL, executed sequentially on startup
+// 2) Schema — single idempotent DDL, no versioned migrations
 // ─────────────────────────────────────────────────────────────────────────────
 
-var migrations = []struct {
-	version int
-	stmts   []string
-}{
-	{0, []string{
-		`CREATE TABLE IF NOT EXISTS schema_migrations (
-			version  INT PRIMARY KEY,
-			applied  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)`,
-	}},
-	{1, []string{
-		`CREATE TABLE IF NOT EXISTS entry_index (
-			sequence_number  BIGINT       PRIMARY KEY,
-			canonical_hash   BYTEA        NOT NULL UNIQUE,
-			log_time         TIMESTAMPTZ  NOT NULL,
-			sig_algorithm_id SMALLINT     NOT NULL,
-			signer_did       TEXT         NOT NULL CHECK (signer_did <> ''),
-			target_root      BYTEA,
-			cosignature_of   BYTEA,
-			schema_ref       BYTEA
-		)`,
-	}},
-	{2, []string{
-		`CREATE INDEX IF NOT EXISTS idx_signer_did ON entry_index (signer_did)`,
-		`CREATE INDEX IF NOT EXISTS idx_target_root ON entry_index (target_root) WHERE target_root IS NOT NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_cosignature_of ON entry_index (cosignature_of) WHERE cosignature_of IS NOT NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_schema_ref ON entry_index (schema_ref) WHERE schema_ref IS NOT NULL`,
-	}},
-	{3, []string{
-		`CREATE TABLE IF NOT EXISTS smt_leaves (
-			leaf_key      BYTEA    PRIMARY KEY,
-			origin_tip    BYTEA    NOT NULL,
-			authority_tip BYTEA    NOT NULL,
-			updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)`,
-		`CREATE TABLE IF NOT EXISTS smt_nodes (
-			path_key   BYTEA    PRIMARY KEY,
-			hash       BYTEA    NOT NULL,
-			depth      INT      NOT NULL,
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)`,
-	}},
-	{4, []string{
-		`CREATE TABLE IF NOT EXISTS credits (
-			exchange_did    TEXT    PRIMARY KEY,
-			balance         BIGINT NOT NULL DEFAULT 0,
-			total_purchased BIGINT NOT NULL DEFAULT 0,
-			total_consumed  BIGINT NOT NULL DEFAULT 0,
-			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)`,
-		`CREATE TABLE IF NOT EXISTS tree_heads (
-			tree_size    BIGINT   PRIMARY KEY,
-			root_hash    BYTEA    NOT NULL,
-			scheme_tag   SMALLINT NOT NULL,
-			cosignatures BYTEA    NOT NULL,
-			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)`,
-		`CREATE TABLE IF NOT EXISTS delta_window_buffers (
-			leaf_key    BYTEA   PRIMARY KEY,
-			tip_history BYTEA   NOT NULL,
-			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)`,
-	}},
-	{5, []string{
-		`CREATE TABLE IF NOT EXISTS builder_queue (
-			sequence_number BIGINT      PRIMARY KEY,
-			status          SMALLINT    NOT NULL DEFAULT 0,
-			enqueued_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			processed_at    TIMESTAMPTZ
-		)`,
-		`CREATE TABLE IF NOT EXISTS witness_sets (
-			version     SERIAL   PRIMARY KEY,
-			set_hash    BYTEA    NOT NULL,
-			keys_json   BYTEA    NOT NULL,
-			scheme_tag  SMALLINT NOT NULL,
-			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)`,
-		`CREATE TABLE IF NOT EXISTS equivocation_proofs (
-			id         SERIAL      PRIMARY KEY,
-			head_a     BYTEA       NOT NULL,
-			head_b     BYTEA       NOT NULL,
-			tree_size  BIGINT      NOT NULL,
-			detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)`,
-		`CREATE TABLE IF NOT EXISTS sessions (
-			token       TEXT        PRIMARY KEY,
-			exchange_did TEXT       NOT NULL,
-			expires_at  TIMESTAMPTZ NOT NULL,
-			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)`,
-	}},
-	{6, []string{
-		`CREATE SEQUENCE IF NOT EXISTS entry_sequence START 1 NO CYCLE`,
-	}},
+var schemaDDL = []string{
+	// ── Entry index (Postgres is an index, not byte storage) ──────────
+	`CREATE TABLE IF NOT EXISTS entry_index (
+		sequence_number  BIGINT       PRIMARY KEY,
+		canonical_hash   BYTEA        NOT NULL UNIQUE,
+		log_time         TIMESTAMPTZ  NOT NULL,
+		sig_algorithm_id SMALLINT     NOT NULL,
+		signer_did       TEXT         NOT NULL CHECK (signer_did <> ''),
+		target_root      BYTEA,
+		cosignature_of   BYTEA,
+		schema_ref       BYTEA
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_signer_did ON entry_index (signer_did)`,
+	`CREATE INDEX IF NOT EXISTS idx_target_root ON entry_index (target_root) WHERE target_root IS NOT NULL`,
+	`CREATE INDEX IF NOT EXISTS idx_cosignature_of ON entry_index (cosignature_of) WHERE cosignature_of IS NOT NULL`,
+	`CREATE INDEX IF NOT EXISTS idx_schema_ref ON entry_index (schema_ref) WHERE schema_ref IS NOT NULL`,
+
+	// ── SMT state ────────────────────────────────────────────────────
+	`CREATE TABLE IF NOT EXISTS smt_leaves (
+		leaf_key      BYTEA    PRIMARY KEY,
+		origin_tip    BYTEA    NOT NULL,
+		authority_tip BYTEA    NOT NULL,
+		updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`,
+	`CREATE TABLE IF NOT EXISTS smt_nodes (
+		path_key   BYTEA    PRIMARY KEY,
+		hash       BYTEA    NOT NULL,
+		depth      INT      NOT NULL,
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`,
+
+	// ── Credits ──────────────────────────────────────────────────────
+	`CREATE TABLE IF NOT EXISTS credits (
+		exchange_did    TEXT    PRIMARY KEY,
+		balance         BIGINT NOT NULL DEFAULT 0,
+		total_purchased BIGINT NOT NULL DEFAULT 0,
+		total_consumed  BIGINT NOT NULL DEFAULT 0,
+		updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`,
+
+	// ── Tree heads (normalized: one row per attestation) ─────────────
+	`CREATE TABLE IF NOT EXISTS tree_heads (
+		tree_size    BIGINT      NOT NULL,
+		root_hash    BYTEA       NOT NULL,
+		hash_algo    SMALLINT    NOT NULL DEFAULT 1,
+		created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		PRIMARY KEY (tree_size, hash_algo)
+	)`,
+	`CREATE TABLE IF NOT EXISTS tree_head_sigs (
+		tree_size    BIGINT      NOT NULL,
+		hash_algo    SMALLINT    NOT NULL DEFAULT 1,
+		signer       TEXT        NOT NULL,
+		sig_algo     SMALLINT    NOT NULL,
+		signature    BYTEA       NOT NULL,
+		created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		PRIMARY KEY (tree_size, hash_algo, signer, sig_algo),
+		FOREIGN KEY (tree_size, hash_algo) REFERENCES tree_heads (tree_size, hash_algo)
+	)`,
+
+	// ── Delta buffer ─────────────────────────────────────────────────
+	`CREATE TABLE IF NOT EXISTS delta_window_buffers (
+		leaf_key    BYTEA   PRIMARY KEY,
+		tip_history BYTEA   NOT NULL,
+		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`,
+
+	// ── Builder queue ────────────────────────────────────────────────
+	`CREATE TABLE IF NOT EXISTS builder_queue (
+		sequence_number BIGINT      PRIMARY KEY,
+		status          SMALLINT    NOT NULL DEFAULT 0,
+		enqueued_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		processed_at    TIMESTAMPTZ
+	)`,
+
+	// ── Witness sets ─────────────────────────────────────────────────
+	`CREATE TABLE IF NOT EXISTS witness_sets (
+		version     SERIAL   PRIMARY KEY,
+		set_hash    BYTEA    NOT NULL,
+		keys_json   BYTEA    NOT NULL,
+		scheme_tag  SMALLINT NOT NULL,
+		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`,
+
+	// ── Equivocation proofs ──────────────────────────────────────────
+	`CREATE TABLE IF NOT EXISTS equivocation_proofs (
+		id         SERIAL      PRIMARY KEY,
+		head_a     BYTEA       NOT NULL,
+		head_b     BYTEA       NOT NULL,
+		tree_size  BIGINT      NOT NULL,
+		detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`,
+
+	// ── Sessions ─────────────────────────────────────────────────────
+	`CREATE TABLE IF NOT EXISTS sessions (
+		token       TEXT        PRIMARY KEY,
+		exchange_did TEXT       NOT NULL,
+		expires_at  TIMESTAMPTZ NOT NULL,
+		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`,
+
+	// ── Sequence ─────────────────────────────────────────────────────
+	`CREATE SEQUENCE IF NOT EXISTS entry_sequence START 1 NO CYCLE`,
 }
 
-// RunMigrations executes all pending migrations. Each statement is atomic.
+// RunMigrations creates the schema. Fully idempotent — every statement uses
+// IF NOT EXISTS. Safe to call on every startup. No versioning, no legacy data.
 func RunMigrations(ctx context.Context, db *pgxpool.Pool) error {
-	// Ensure migration table exists (migration v0).
-	for _, stmt := range migrations[0].stmts {
+	for i, stmt := range schemaDDL {
 		if _, err := db.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("store: migration v0 failed: %w", err)
-		}
-	}
-
-	for _, m := range migrations[1:] {
-		applied, err := isMigrationApplied(ctx, db, m.version)
-		if err != nil {
-			return fmt.Errorf("store: checking migration v%d: %w", m.version, err)
-		}
-		if applied {
-			continue
-		}
-
-		tx, err := db.Begin(ctx)
-		if err != nil {
-			return fmt.Errorf("store: begin migration v%d: %w", m.version, err)
-		}
-
-		for _, stmt := range m.stmts {
-			if _, err := tx.Exec(ctx, stmt); err != nil {
-				_ = tx.Rollback(ctx)
-				return fmt.Errorf("store: migration v%d stmt failed: %w", m.version, err)
-			}
-		}
-
-		if _, err := tx.Exec(ctx, "INSERT INTO schema_migrations (version) VALUES ($1)", m.version); err != nil {
-			_ = tx.Rollback(ctx)
-			return fmt.Errorf("store: recording migration v%d: %w", m.version, err)
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("store: commit migration v%d: %w", m.version, err)
+			return fmt.Errorf("store: schema stmt %d failed: %w", i, err)
 		}
 	}
 	return nil
-}
-
-func isMigrationApplied(ctx context.Context, db *pgxpool.Pool, version int) (bool, error) {
-	var exists bool
-	err := db.QueryRow(ctx,
-		"SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)", version,
-	).Scan(&exists)
-	return exists, err
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

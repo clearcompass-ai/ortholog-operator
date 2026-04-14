@@ -30,7 +30,6 @@ package builder
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -76,8 +75,10 @@ func DefaultLoopConfig(logDID string) LoopConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // MerkleAppender is the subset of sdk smt.MerkleTree used by the builder.
+// AppendLeaf takes full wire bytes (canonical + sig_envelope). Tessera
+// computes RFC6962.HashLeaf(data) internally — the caller does not hash.
 type MerkleAppender interface {
-	AppendLeaf(hash [32]byte) (uint64, error)
+	AppendLeaf(data []byte) (uint64, error)
 	Head() (types.TreeHead, error)
 }
 
@@ -372,13 +373,17 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	// ──────────────────────────────────────────────────────────────────
 
 	// ── Step 6: Append to Merkle tree (post-commit) ──────────────────
-	// Tessera append is idempotent: same hash → same position.
+	// Tessera append is idempotent: same data → same position.
 	// Crash here → re-append on restart is safe.
-	// Hash from raw canonical bytes (not re-serialized through the SDK).
+	// Option B: full wire bytes (canonical + sig_envelope) go into the tree.
+	// The inclusion proof covers both content and signature — the proof says
+	// "this exact signed entry is in the log at position N."
 	if bl.merkle != nil {
 		for _, ewm := range metas {
-			entryHash := sha256.Sum256(ewm.CanonicalBytes)
-			if _, appendErr := bl.merkle.AppendLeaf(entryHash); appendErr != nil {
+			// Reconstruct wire bytes: canonical_bytes + sig_envelope.
+			wireBytes := envelope.AppendSignature(
+				ewm.CanonicalBytes, ewm.SignatureAlgoID, ewm.SignatureBytes)
+			if _, appendErr := bl.merkle.AppendLeaf(wireBytes); appendErr != nil {
 				bl.logger.Error("Tessera append failed",
 					"seq", ewm.Position.Sequence, "error", appendErr)
 			}

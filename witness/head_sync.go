@@ -111,16 +111,32 @@ func (hs *HeadSync) RequestCosignatures(ctx context.Context, head types.TreeHead
 			len(sigs), hs.cfg.QuorumK)
 	}
 
-	// Persist cosigned head.
-	cosigBytes, _ := json.Marshal(sigs)
-	if err := hs.store.Insert(ctx, store.TreeHeadRow{
-		TreeSize:     head.TreeSize,
-		RootHash:     head.RootHash,
-		SchemeTag:    hs.cfg.SchemeTag,
-		Cosignatures: cosigBytes,
-	}); err != nil {
-		return fmt.Errorf("witness/head_sync: persist: %w", err)
+	// Persist tree head fact (idempotent).
+	hashAlgo := uint16(1) // SHA-256 (default).
+	if err := hs.store.InsertHead(ctx, head.TreeSize, head.RootHash, hashAlgo); err != nil {
+		return fmt.Errorf("witness/head_sync: persist head: %w", err)
 	}
+
+	// Persist each witness signature as an individual row.
+	// Serialize each WitnessSignature to JSON — the SDK type fields
+	// are opaque to the operator. The witness endpoint is the signer DID.
+	sigAlgo := uint16(hs.cfg.SchemeTag)
+	for i, sig := range sigs {
+		sigBytes, _ := json.Marshal(sig)
+		// Use endpoint index as signer identifier (witness DID not available
+		// from SDK type). In production, the witness response would include
+		// the witness DID; for now we use the endpoint URL.
+		signer := "witness:" + fmt.Sprintf("%d", i)
+		if i < len(hs.cfg.WitnessEndpoints) {
+			signer = hs.cfg.WitnessEndpoints[i]
+		}
+		if err := hs.store.InsertSig(ctx, head.TreeSize, hashAlgo,
+			signer, sigAlgo, sigBytes); err != nil {
+			return fmt.Errorf("witness/head_sync: persist sig %s: %w", signer, err)
+		}
+	}
+
+	hs.store.Invalidate()
 
 	hs.logger.Info("cosigned tree head",
 		"tree_size", head.TreeSize, "signatures", len(sigs))
