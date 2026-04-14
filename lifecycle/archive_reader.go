@@ -10,31 +10,21 @@ archived. ArchiveReader and PostgresEntryFetcher both return
 types.EntryWithMetadata. They're interchangeable behind the
 builder.EntryFetcher interface.
 
-USAGE:
-  archive := lifecycle.NewArchiveReader(shardIndex)
-  ewm, err := archive.Fetch(types.LogPosition{LogDID: "did:ortholog:davidson:2026", Sequence: 4712003})
-  // ewm is the same type returned by the live operator's Fetch()
-
-SHARD INDEX:
-  The shard index maps shard DIDs to their metadata: sequence range,
-  archive tile endpoint, and final cosigned tree head. This index is
-  loaded from a JSON file, DID Document service endpoints, or operator
-  configuration. The ArchiveReader does not manage the index — it reads it.
-
-TILE ADDRESSING:
-  Entry tiles follow Tessera's standard path: tile/0/{tile_index}
-  where tile_index = sequence_number / 256. Each tile holds 256 entries.
-  The tile format is the same as live tiles — immutable 8 KB blobs.
+TILE FORMAT (Option B):
+  Tessera entry tiles store full wire bytes (canonical + sig_envelope)
+  as submitted via AppendLeaf. Each entry is length-prefixed in the tile
+  bundle (c2sp.org/tlog-tiles format). To recover canonical + sig:
+  envelope.StripSignature(wireBytes).
 */
 package lifecycle
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -51,12 +41,12 @@ import (
 // ShardMeta describes an archived shard's location and range.
 type ShardMeta struct {
 	ShardDID        string `json:"shard_did"`
-	SequenceStart   uint64 `json:"sequence_start"`   // First sequence in this shard (inclusive).
-	SequenceEnd     uint64 `json:"sequence_end"`     // Last sequence in this shard (inclusive).
-	ArchiveEndpoint string `json:"archive_endpoint"` // Base URL for archived tiles.
-	FinalRootHash   string `json:"final_root_hash"`  // Hex-encoded root hash at freeze.
-	FinalTreeSize   uint64 `json:"final_tree_size"`  // Tree size at freeze.
-	ChainPosition   int    `json:"chain_position"`   // 1-indexed position in shard chain.
+	SequenceStart   uint64 `json:"sequence_start"`
+	SequenceEnd     uint64 `json:"sequence_end"`
+	ArchiveEndpoint string `json:"archive_endpoint"`
+	FinalRootHash   string `json:"final_root_hash"`
+	FinalTreeSize   uint64 `json:"final_tree_size"`
+	ChainPosition   int    `json:"chain_position"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -67,7 +57,7 @@ type ShardMeta struct {
 // Implements the same Fetch signature as builder.EntryFetcher.
 type ArchiveReader struct {
 	mu     sync.RWMutex
-	shards map[string]ShardMeta // shard DID → metadata
+	shards map[string]ShardMeta
 	client *http.Client
 }
 
@@ -83,12 +73,12 @@ func NewArchiveReader(shards []ShardMeta) *ArchiveReader {
 	}
 }
 
-// LoadShardIndex loads the shard index from a JSON file or URL.
+// LoadShardIndex loads the shard index from a local JSON file or HTTP URL.
 func LoadShardIndex(ctx context.Context, source string) ([]ShardMeta, error) {
 	var data []byte
 	var err error
 
-	if len(source) > 4 && (source[:4] == "http" || source[:5] == "https") {
+	if len(source) > 4 && (source[:4] == "http") {
 		req, reqErr := http.NewRequestWithContext(ctx, "GET", source, nil)
 		if reqErr != nil {
 			return nil, reqErr
@@ -100,11 +90,10 @@ func LoadShardIndex(ctx context.Context, source string) ([]ShardMeta, error) {
 		defer resp.Body.Close()
 		data, err = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	} else {
-		// Assume local file path — read via os.ReadFile in caller.
-		return nil, fmt.Errorf("lifecycle/archive: local file loading not implemented (use JSON bytes directly)")
+		data, err = os.ReadFile(source)
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("lifecycle/archive: read shard index %q: %w", source, err)
 	}
 
 	var shards []ShardMeta
@@ -123,18 +112,18 @@ func (r *ArchiveReader) AddShard(meta ShardMeta) {
 
 // Fetch retrieves an entry from an archived shard by its log position.
 // Returns the same types.EntryWithMetadata as the live operator's Fetch.
+//
+// Option B: Tessera tiles contain full wire bytes (canonical + sig_envelope).
+// envelope.StripSignature recovers canonical, algoID, and sigBytes.
 func (r *ArchiveReader) Fetch(pos types.LogPosition) (*types.EntryWithMetadata, error) {
-	// Resolve shard.
 	shard, err := r.resolveShard(pos)
 	if err != nil {
 		return nil, err
 	}
 
-	// Compute tile index and offset.
 	tileIndex := pos.Sequence / tessera.EntriesPerTile
 	offset := pos.Sequence % tessera.EntriesPerTile
 
-	// Fetch tile from archive endpoint.
 	tileURL := fmt.Sprintf("%s/tile/0/%d", shard.ArchiveEndpoint, tileIndex)
 	tileData, err := r.fetchTile(tileURL)
 	if err != nil {
@@ -142,30 +131,27 @@ func (r *ArchiveReader) Fetch(pos types.LogPosition) (*types.EntryWithMetadata, 
 			tileIndex, shard.ShardDID, err)
 	}
 
-	// Extract entry from tile.
-	canonical, sig, err := extractEntryFromTile(tileData, offset)
+	// Extract raw entry data from tile bundle (c2sp.org/tlog-tiles format).
+	wireBytes, err := tessera.ParseEntryBundle(tileData, offset)
 	if err != nil {
 		return nil, fmt.Errorf("lifecycle/archive: extract entry seq=%d: %w", pos.Sequence, err)
 	}
 
-	// Parse canonical bytes to get header metadata.
-	entry, parseErr := envelope.Deserialize(canonical)
-	if parseErr != nil {
-		return nil, fmt.Errorf("lifecycle/archive: deserialize entry seq=%d: %w", pos.Sequence, parseErr)
+	// Option B: tile data = full wire bytes. StripSignature splits them.
+	canonical, algoID, sigBytes, err := envelope.StripSignature(wireBytes)
+	if err != nil {
+		return nil, fmt.Errorf("lifecycle/archive: strip signature seq=%d: %w", pos.Sequence, err)
 	}
 
-	hash := sha256.Sum256(canonical)
-
 	return &types.EntryWithMetadata{
-		Position:       pos,
-		CanonicalBytes: canonical,
-		SignatureBytes: sig,
-		CanonicalHash:  hash,
-		SignerDID:      entry.Header.SignerDID,
+		Position:        pos,
+		CanonicalBytes:  canonical,
+		SignatureAlgoID: algoID,
+		SignatureBytes:  sigBytes,
 	}, nil
 }
 
-// FetchBatch retrieves multiple entries. Optimizes by fetching each tile once.
+// FetchBatch retrieves multiple entries.
 func (r *ArchiveReader) FetchBatch(positions []types.LogPosition) ([]*types.EntryWithMetadata, error) {
 	results := make([]*types.EntryWithMetadata, len(positions))
 	for i, pos := range positions {
@@ -206,12 +192,10 @@ func (r *ArchiveReader) resolveShard(pos types.LogPosition) (*ShardMeta, error) 
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// Try exact DID match first.
 	if shard, ok := r.shards[pos.LogDID]; ok {
 		return &shard, nil
 	}
 
-	// Fall back to sequence range match.
 	for _, shard := range r.shards {
 		if pos.Sequence >= shard.SequenceStart && pos.Sequence <= shard.SequenceEnd {
 			return &shard, nil
@@ -232,31 +216,6 @@ func (r *ArchiveReader) fetchTile(url string) ([]byte, error) {
 		return nil, fmt.Errorf("tile fetch returned %d", resp.StatusCode)
 	}
 
-	// Tiles are at most 8 KB (256 entries × ~32 bytes each for hashes).
-	// Entry tiles are larger — up to ~256 × entry size.
-	// Limit to 64 MB to prevent abuse.
+	// Entry tiles: 256 entries × ~1KB avg = ~256KB typical. Cap at 64 MB.
 	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 }
-
-// extractEntryFromTile extracts canonical_bytes and sig_bytes for a given
-// offset within a Tessera entry tile. Uses the c2sp.org/tlog-tiles bundle
-// format: [uint16 big-endian length][data bytes] × N entries per tile.
-// The data blob is then decoded via tessera.DecodeEntryData.
-func extractEntryFromTile(tileData []byte, offset uint64) (canonical []byte, sig []byte, err error) {
-	// Parse the tile bundle to get the raw entry data at this offset.
-	entryData, err := tessera.ParseEntryBundle(tileData, offset)
-	if err != nil {
-		return nil, nil, fmt.Errorf("lifecycle/archive: %w", err)
-	}
-
-	// Decode the Ortholog entry data format: [4-byte len][canonical][sig].
-	canonical, sig, err = tessera.DecodeEntryData(entryData)
-	if err != nil {
-		return nil, nil, fmt.Errorf("lifecycle/archive: %w", err)
-	}
-
-	return canonical, sig, nil
-}
-
-// tessera package alias for tile parsing functions.
-var _ = tessera.ParseEntryBundle

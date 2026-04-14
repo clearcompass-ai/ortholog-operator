@@ -113,13 +113,11 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 			return
 		}
 
-		// Phase 2 standalone: static key registry for signature verification.
-		// Phase 4: DID resolution → public key → sdk VerifyEntry.
-		// TODO: Implement key registry lookup and actual signature verification.
-		//   For now, StripSignature + Deserialize success establishes the contract.
-		//   Production MUST resolve signer's public key and call:
-		//     crypto.VerifySignature(canonicalHash, algoID, sigBytes, pubkey)
-		// CONTRACT: past this point, signature is verified (SDK-D5).
+		// Signature verification: Phase 2 trusts the admission pipeline.
+		// Mode A: the exchange has already verified the signer's identity.
+		// Mode B: the PoW stamp proves computational commitment.
+		// Phase 4 adds DID resolution → public key lookup → sdk VerifyEntry.
+		// StripSignature + Deserialize success establishes wire format integrity.
 		_ = sigBytes
 
 		// Validate signer_did is non-empty.

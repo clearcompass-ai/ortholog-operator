@@ -374,7 +374,7 @@ func TestTreeHead_QuorumInsufficient(t *testing.T) {
 
 func TestTreeHead_MerkleInclusion(t *testing.T) {
 	mt := smt.NewStubMerkleTree()
-	mt.AppendLeaf([32]byte{1}); mt.AppendLeaf([32]byte{2}); mt.AppendLeaf([32]byte{3})
+	mt.AppendLeaf([]byte{1}); mt.AppendLeaf([]byte{2}); mt.AppendLeaf([]byte{3})
 	head, _ := mt.Head()
 	if head.TreeSize != 3 { t.Fatal("size should be 3") }
 	proof, err := mt.InclusionProof(1, head.TreeSize)
@@ -384,9 +384,9 @@ func TestTreeHead_MerkleInclusion(t *testing.T) {
 
 func TestTreeHead_Consistency(t *testing.T) {
 	mt := smt.NewStubMerkleTree()
-	for i := 0; i < 50; i++ { mt.AppendLeaf(sha256.Sum256([]byte{byte(i)})) }
+	for i := 0; i < 50; i++ { mt.AppendLeaf([]byte{byte(i)}) }
 	h50, _ := mt.Head()
-	for i := 50; i < 100; i++ { mt.AppendLeaf(sha256.Sum256([]byte{byte(i)})) }
+	for i := 50; i < 100; i++ { mt.AppendLeaf([]byte{byte(i)}) }
 	h100, _ := mt.Head()
 	if h50.RootHash == h100.RootHash { t.Fatal("roots should differ") }
 	proof, _ := mt.InclusionProof(25, h100.TreeSize)
