@@ -1,17 +1,14 @@
 /*
 FILE PATH: api/tree.go
 
-Tree head distribution and Merkle proof endpoints. Serves cosigned tree heads,
-inclusion proofs, and consistency proofs via the TesseraAdapter.
+Tree head distribution and Merkle proof endpoints.
 
-KEY ARCHITECTURAL DECISIONS:
-  - Cache-Control: max-age=5 on tree/head (spec-compliant).
-  - ETag: tree_size (monotonic) for conditional polling.
-  - Inclusion proofs compatible with sdk verify.VerifyMerkleInclusion.
-  - ConsistencyProver is a separate interface (not part of sdk MerkleTree).
-  - InclusionProver uses RawInclusionProof (returns any for JSON passthrough).
-    Phase 4 cross-log verification uses TypedInclusionProof on the concrete
-    TesseraAdapter (returns *types.MerkleProof).
+CHANGES FROM PHASE 4 PREP:
+  - NewTreeHeadHandler now accepts ?size=N query parameter.
+    GET /v1/tree/head         → latest cosigned tree head (existing)
+    GET /v1/tree/head?size=N  → tree head at specific size (NEW)
+    Falls through to existing Latest() when no parameter.
+    Uses TreeHeadStore.GetBySize() which already exists (store/tree_heads.go).
 */
 package api
 
@@ -26,15 +23,12 @@ import (
 	"github.com/clearcompass-ai/ortholog-operator/store"
 )
 
-// ConsistencyProver generates consistency proofs (concrete method on TesseraAdapter).
+// ConsistencyProver generates consistency proofs.
 type ConsistencyProver interface {
 	ConsistencyProof(oldSize, newSize uint64) (any, error)
 }
 
 // InclusionProver generates inclusion proofs for HTTP passthrough.
-// Returns raw JSON (any) — not parsed into types.MerkleProof.
-// Phase 4 cross-log verification uses TesseraAdapter.TypedInclusionProof
-// directly (returns *types.MerkleProof for smt.VerifyMerkleInclusion).
 type InclusionProver interface {
 	RawInclusionProof(position, treeSize uint64) (any, error)
 }
@@ -47,10 +41,29 @@ type TreeDeps struct {
 	Logger        *slog.Logger
 }
 
-// NewTreeHeadHandler creates GET /v1/tree/head.
+// NewTreeHeadHandler creates GET /v1/tree/head[?size=N].
+// Without ?size=N: returns latest cosigned tree head (existing behavior).
+// With ?size=N: returns tree head at that specific size via GetBySize().
 func NewTreeHeadHandler(deps *TreeDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		head, err := deps.TreeHeadStore.Latest(r.Context())
+		var head *store.CosignedTreeHead
+		var err error
+
+		// Check for ?size=N parameter (blocks fraud_proofs).
+		sizeStr := r.URL.Query().Get("size")
+		if sizeStr != "" {
+			size, parseErr := strconv.ParseUint(sizeStr, 10, 64)
+			if parseErr != nil {
+				writeError(w, http.StatusBadRequest, "invalid size parameter")
+				return
+			}
+			// GetBySize exists in store/tree_heads.go — returns tree head
+			// at specific size, used by equivocation monitor and fraud proofs.
+			head, err = deps.TreeHeadStore.GetBySize(r.Context(), size)
+		} else {
+			head, err = deps.TreeHeadStore.Latest(r.Context())
+		}
+
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to fetch tree head")
 			deps.Logger.Error("tree head fetch", "error", err)
@@ -65,7 +78,6 @@ func NewTreeHeadHandler(deps *TreeDeps) http.HandlerFunc {
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, head.TreeSize))
 		w.Header().Set("Cache-Control", "public, max-age=5")
 
-		// Build signatures array.
 		sigs := make([]map[string]any, len(head.Signatures))
 		for i, s := range head.Signatures {
 			sigs[i] = map[string]any{

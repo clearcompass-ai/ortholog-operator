@@ -17,6 +17,8 @@ INVARIANTS:
   - Migrations are idempotent and ordered.
   - WithTransaction uses Serializable for builder commits, ReadCommitted
     for admission (configurable via TxOptions parameter).
+
+CHANGES: Added derivation_commitments table + index to schemaDDL.
 */
 package store
 
@@ -48,8 +50,7 @@ type PoolConfig struct {
 	MaxConnIdleTime time.Duration
 }
 
-// InitPool creates and validates the connection pool. Fails immediately if
-// the database is unreachable — no silent degradation.
+// InitPool creates and validates the connection pool.
 func InitPool(ctx context.Context, cfg PoolConfig) (*Pool, error) {
 	poolCfg, err := pgxpool.ParseConfig(cfg.DSN)
 	if err != nil {
@@ -77,20 +78,12 @@ func InitPool(ctx context.Context, cfg PoolConfig) (*Pool, error) {
 func (p *Pool) Close() { p.DB.Close() }
 
 // Pools holds separate write and read connection pools.
-// Write pool connects to the primary (builder, submission, queue).
-// Read pool connects to a replica (all GET queries). Falls back to
-// Write pool if no replica is configured.
-//
-// DESIGN RULE: Writes go to Pools.Write. Reads go to Pools.Read.
-// The builder loop, submission handler, and queue use Write.
-// PostgresEntryFetcher, PostgresQueryAPI, and all GET handlers use Read.
 type Pools struct {
-	Write *pgxpool.Pool // Primary — mutations only.
-	Read  *pgxpool.Pool // Replica — queries only. Same as Write if no replica.
+	Write *pgxpool.Pool
+	Read  *pgxpool.Pool
 }
 
-// InitPools creates write and read pools. If replicaDSN is empty,
-// the read pool reuses the write pool (single-instance deployment).
+// InitPools creates write and read pools.
 func InitPools(ctx context.Context, writeCfg PoolConfig, replicaDSN string) (*Pools, error) {
 	writePool, err := InitPool(ctx, writeCfg)
 	if err != nil {
@@ -98,7 +91,6 @@ func InitPools(ctx context.Context, writeCfg PoolConfig, replicaDSN string) (*Po
 	}
 
 	if replicaDSN == "" {
-		// No replica configured — read pool is the write pool.
 		return &Pools{Write: writePool.DB, Read: writePool.DB}, nil
 	}
 
@@ -113,7 +105,7 @@ func InitPools(ctx context.Context, writeCfg PoolConfig, replicaDSN string) (*Po
 	return &Pools{Write: writePool.DB, Read: readPool.DB}, nil
 }
 
-// Close shuts down both pools. Safe to call if Read == Write (single pool).
+// Close shuts down both pools.
 func (p *Pools) Close() {
 	if p.Read != nil && p.Read != p.Write {
 		p.Read.Close()
@@ -227,12 +219,28 @@ var schemaDDL = []string{
 		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`,
 
+	// ── Derivation commitments (NEW — fraud proof lookup index) ──────
+	// Post-commit persistence: crash between atomic commit and this
+	// insert loses the row. Acceptable — reconstructable from entries.
+	// See store/commitments.go for full crash recovery semantics.
+	`CREATE TABLE IF NOT EXISTS derivation_commitments (
+		id              SERIAL      PRIMARY KEY,
+		range_start_seq BIGINT      NOT NULL,
+		range_end_seq   BIGINT      NOT NULL,
+		prior_smt_root  BYTEA       NOT NULL,
+		post_smt_root   BYTEA       NOT NULL,
+		mutations_json  BYTEA       NOT NULL,
+		commentary_seq  BIGINT,
+		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_commitment_range
+		ON derivation_commitments (range_start_seq, range_end_seq)`,
+
 	// ── Sequence ─────────────────────────────────────────────────────
 	`CREATE SEQUENCE IF NOT EXISTS entry_sequence START 1 NO CYCLE`,
 }
 
-// RunMigrations creates the schema. Fully idempotent — every statement uses
-// IF NOT EXISTS. Safe to call on every startup. No versioning, no legacy data.
+// RunMigrations creates the schema. Fully idempotent.
 func RunMigrations(ctx context.Context, db *pgxpool.Pool) error {
 	for i, stmt := range schemaDDL {
 		if _, err := db.Exec(ctx, stmt); err != nil {
@@ -247,11 +255,9 @@ func RunMigrations(ctx context.Context, db *pgxpool.Pool) error {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // BuilderLockID is the Postgres advisory lock key for builder exclusivity.
-// One builder per log. Concurrent builders produce non-deterministic state.
 const BuilderLockID int64 = 0x4F5254484F4C4F47 // "ORTHOLOG" in hex
 
-// AcquireBuilderLock takes the advisory lock. Blocks if another instance holds it.
-// Returns a release function. The lock is session-scoped (released on disconnect).
+// AcquireBuilderLock takes the advisory lock.
 func AcquireBuilderLock(ctx context.Context, db *pgxpool.Pool) (release func(), err error) {
 	conn, err := db.Acquire(ctx)
 	if err != nil {
@@ -275,8 +281,7 @@ func AcquireBuilderLock(ctx context.Context, db *pgxpool.Pool) (release func(), 
 // TxFunc is a function executed within a transaction.
 type TxFunc func(ctx context.Context, tx pgx.Tx) error
 
-// WithTransaction executes fn within a transaction at the given isolation level.
-// Commits on success, rolls back on error.
+// WithTransaction executes fn within a transaction.
 func WithTransaction(ctx context.Context, db *pgxpool.Pool, iso pgx.TxIsoLevel, fn TxFunc) error {
 	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: iso})
 	if err != nil {
@@ -301,7 +306,7 @@ func WithSerializableTx(ctx context.Context, db *pgxpool.Pool, fn TxFunc) error 
 	return WithTransaction(ctx, db, pgx.Serializable, fn)
 }
 
-// WithReadCommittedTx is a convenience for ReadCommitted isolation (admission).
+// WithReadCommittedTx is a convenience for ReadCommitted isolation.
 func WithReadCommittedTx(ctx context.Context, db *pgxpool.Pool, fn TxFunc) error {
 	return WithTransaction(ctx, db, pgx.ReadCommitted, fn)
 }
@@ -310,7 +315,7 @@ func WithReadCommittedTx(ctx context.Context, db *pgxpool.Pool, fn TxFunc) error
 // 5) Errors
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ErrInsufficientCredits signals balance = 0. Upstream returns HTTP 402.
+// ErrInsufficientCredits signals balance = 0.
 var ErrInsufficientCredits = fmt.Errorf("store/credits: insufficient credits")
 
 // ErrDuplicateEntry signals a UNIQUE constraint violation on canonical_hash.

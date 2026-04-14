@@ -9,7 +9,12 @@ KEY ARCHITECTURAL DECISIONS:
   - Middleware chain: size_limit → auth → handler (for submission).
   - All handlers receive dependencies via closure (no globals).
   - Readiness flag is atomic for thread-safe shutdown signaling.
-  - WitnessCosign route registered only when this operator serves as a witness.
+  - Optional endpoints (WitnessCosign, read endpoints) nil-guarded.
+
+CHANGES FROM PHASE 4 PREP:
+  - 5 new handler fields: EntryBySequence, EntryBatch, SMTLeaf, SMTLeafBatch, CommitmentQuery
+  - 5 new routes registered with nil guards
+  - Both cmd/operator/main.go and cmd/operator-reader/main.go wire these
 */
 package api
 
@@ -64,6 +69,7 @@ type Server struct {
 
 // Handlers holds all registered handler functions.
 type Handlers struct {
+	// ── Core endpoints (Phase 2) ────────────────────────────────────
 	Submission      http.HandlerFunc
 	TreeHead        http.HandlerFunc
 	TreeInclusion   http.HandlerFunc
@@ -78,10 +84,20 @@ type Handlers struct {
 	Scan            http.HandlerFunc
 	Difficulty      http.HandlerFunc
 
-	// WitnessCosign handles POST /v1/cosign requests from peer operators.
-	// nil if this operator does not serve as a witness.
-	// Set to witness.NewCosignHandler(...) when witness key is configured.
-	WitnessCosign http.Handler
+	// ── Phase 4 prep: witness cosign (optional) ─────────────────────
+	WitnessCosign http.Handler // nil if not serving as witness
+
+	// ── Full buildout: read endpoints for remote consumers ──────────
+	// Entry fetch by position — blocks Phase 5 verifiers.
+	EntryBySequence http.HandlerFunc // GET /v1/entries/{sequence}
+	EntryBatch      http.HandlerFunc // GET /v1/entries/batch?start=N&count=M
+
+	// SMT leaf data — blocks origin_evaluator.
+	SMTLeaf      http.HandlerFunc // GET /v1/smt/leaf/{key}
+	SMTLeafBatch http.HandlerFunc // POST /v1/smt/leaves
+
+	// Commitment query — blocks fraud_proofs.
+	CommitmentQuery http.HandlerFunc // GET /v1/commitments?seq=N
 }
 
 // NewServer creates the HTTP server with all routes and middleware applied.
@@ -112,17 +128,15 @@ func NewServer(
 	})
 
 	// ── Submission — with full middleware chain ─────────────────────────
-	// Chain: SizeLimit → Auth → submission handler.
-	// Auth sets context values; submission reads them.
 	if handlers.Submission != nil {
 		submissionChain := middleware.SizeLimit(
-			cfg.MaxEntrySize+1024, // sig overhead
+			cfg.MaxEntrySize+1024,
 			middleware.Auth(db, handlers.Submission),
 		)
 		mux.Handle("POST /v1/entries", submissionChain)
 	}
 
-	// ── Tree head + proofs (read-only, no auth required) ───────────────
+	// ── Tree head + proofs (read-only) ─────────────────────────────────
 	mux.HandleFunc("GET /v1/tree/head", handlers.TreeHead)
 	mux.HandleFunc("GET /v1/tree/inclusion/{seq}", handlers.TreeInclusion)
 	mux.HandleFunc("GET /v1/tree/consistency/{old}/{new}", handlers.TreeConsistency)
@@ -143,10 +157,33 @@ func NewServer(
 	mux.HandleFunc("GET /v1/admission/difficulty", handlers.Difficulty)
 
 	// ── Witness cosign endpoint (optional) ─────────────────────────────
-	// Registered only when this operator is configured to serve as a
-	// witness for peer operators. nil = not a witness.
 	if handlers.WitnessCosign != nil {
 		mux.Handle("POST /v1/cosign", handlers.WitnessCosign)
+	}
+
+	// ── Entry read endpoints (nil-guarded for backward compat) ─────────
+	// GET /v1/entries/{sequence} — single entry by position.
+	// GET /v1/entries/batch — batch read for fraud proof replay.
+	// Note: GET /v1/entries/{sequence} doesn't conflict with
+	// POST /v1/entries — different HTTP methods + path structure.
+	if handlers.EntryBySequence != nil {
+		mux.HandleFunc("GET /v1/entries/{sequence}", handlers.EntryBySequence)
+	}
+	if handlers.EntryBatch != nil {
+		mux.HandleFunc("GET /v1/entries/batch", handlers.EntryBatch)
+	}
+
+	// ── SMT leaf read endpoints ────────────────────────────────────────
+	if handlers.SMTLeaf != nil {
+		mux.HandleFunc("GET /v1/smt/leaf/{key}", handlers.SMTLeaf)
+	}
+	if handlers.SMTLeafBatch != nil {
+		mux.HandleFunc("POST /v1/smt/leaves", handlers.SMTLeafBatch)
+	}
+
+	// ── Commitment query ───────────────────────────────────────────────
+	if handlers.CommitmentQuery != nil {
+		mux.HandleFunc("GET /v1/commitments", handlers.CommitmentQuery)
 	}
 
 	s.httpServer = &http.Server{
@@ -169,8 +206,7 @@ func (s *Server) ListenAndServe() error {
 	return nil
 }
 
-// Serve starts the HTTP server on the given listener. Used by integration
-// tests to start on a random port.
+// Serve starts the HTTP server on the given listener.
 func (s *Server) Serve(ln net.Listener) error {
 	s.logger.Info("HTTP server starting", "addr", ln.Addr().String())
 	if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {

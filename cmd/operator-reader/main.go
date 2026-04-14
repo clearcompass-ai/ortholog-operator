@@ -4,24 +4,11 @@ FILE PATH: cmd/operator-reader/main.go
 Read-only Ortholog log operator. Serves all GET endpoints.
 Does NOT run the builder loop, accept submissions, or write anything.
 
-Deploy N instances behind a load balancer. Stateless — any instance
-serves any request. Connects to a Postgres read replica and Tessera
-tile storage (URL). Infrastructure behind that URL (CDN, nginx,
-object store) is a deployment decision, not operator code.
-
-USE CASES:
-  - Horizontal read scaling for query-heavy workloads.
-  - Public API instances serving court record lookups.
-  - Monitoring service endpoints.
-  - Cross-network verification responders.
-
-WHAT'S MISSING vs cmd/operator/main.go:
-  - No builder loop (no advisory lock, no queue, no delta buffer).
-  - No POST /v1/entries (no submission handler, no credit store).
-  - No anchor publisher, no equivocation monitor.
-  - No write pool — connects to replica_dsn only.
-  - Difficulty served from config (static, not queue-adaptive).
-  - No witness cosign endpoint (read-only instances don't sign).
+CHANGES:
+  - 5 new read handlers: EntryBySequence, EntryBatch, SMTLeaf, SMTLeafBatch, CommitmentQuery
+  - CommitmentStore created on read pool
+  - No shard wiring (deferred post Phase 6)
+  - No SchemaResolver (reader doesn't run builder loop)
 */
 package main
 
@@ -58,13 +45,10 @@ func run(logger *slog.Logger) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// ── Load config ────────────────────────────────────────────────────
 	cfg := loadConfig()
 	logger.Info("config loaded (read-only mode)", "log_did", cfg.LogDID, "addr", cfg.ServerAddr)
 
-	// ── Initialize Postgres read pool ──────────────────────────────────
-	// Connects to replica_dsn if set, otherwise primary dsn.
-	// Read-only — never writes.
+	// ── Postgres read pool ─────────────────────────────────────────────
 	dsn := cfg.ReplicaDSN
 	if dsn == "" {
 		dsn = cfg.PostgresDSN
@@ -82,37 +66,33 @@ func run(logger *slog.Logger) error {
 	defer pool.Close()
 	logger.Info("postgres read pool initialized", "replica", cfg.ReplicaDSN != "")
 
-	// ── Tessera tile reader ────────────────────────────────────────────
+	// ── Tessera ────────────────────────────────────────────────────────
 	tileBackend := tessera.NewHTTPTileBackend(cfg.TesseraBaseURL)
 	tileReader := tessera.NewTileReader(tileBackend, cfg.TileCacheSize)
-	logger.Info("tessera tile reader initialized", "url", cfg.TesseraBaseURL)
-
-	// ── Entry byte reader ──────────────────────────────────────────────
 	entryReader := tessera.NewTesseraEntryReader(tileReader)
-
-	// ── Tessera adapter (for proof endpoints) ──────────────────────────
 	tesseraClient := tessera.NewClient(tessera.ClientConfig{
 		BaseURL: cfg.TesseraBaseURL,
 		Timeout: 30 * time.Second,
 	}, logger)
 	tesseraAdapter := tessera.NewTesseraAdapter(tesseraClient, tileReader, logger)
+	logger.Info("tessera initialized", "url", cfg.TesseraBaseURL)
 
-	// ── SMT (read-only — for proof endpoints) ──────────────────────────
+	// ── SMT (read-only) ────────────────────────────────────────────────
 	leafStore := store.NewPostgresLeafStore(pool.DB)
 	nodeCache := store.NewPostgresNodeCache(pool.DB, cfg.SMTCacheSize)
 	tree := smt.NewTree(leafStore, nodeCache)
-
-	// ── Warm SMT cache ─────────────────────────────────────────────────
 	if err := nodeCache.WarmCache(ctx, cfg.WarmTopLevels); err != nil {
 		logger.Warn("cache warm failed (non-fatal)", "error", err)
 	}
 
-	// ── Stores (read-only) ─────────────────────────────────────────────
+	// ── Stores ─────────────────────────────────────────────────────────
 	treeHeadStore := store.NewTreeHeadStore(pool.DB)
+	commitmentStore := store.NewCommitmentStore(pool.DB)
+	fetcher := store.NewPostgresEntryFetcher(pool.DB, entryReader, cfg.LogDID)
 
-	// ── Difficulty (static from config — no queue to poll) ─────────────
+	// ── Difficulty (static) ────────────────────────────────────────────
 	diffController := middleware.NewDifficultyController(
-		nil, // No queue — static difficulty from config.
+		nil,
 		middleware.DifficultyConfig{
 			InitialDifficulty: uint32(cfg.InitialDifficulty),
 			MinDifficulty:     uint32(cfg.MinDifficulty),
@@ -120,27 +100,25 @@ func run(logger *slog.Logger) error {
 			HashFunction:      cfg.HashFunction,
 		}, logger,
 	)
-	// NOTE: diffController.Run() is NOT started. CurrentDifficulty()
-	// returns InitialDifficulty. The primary operator serves the
-	// dynamic difficulty. Read-only instances serve the configured default.
 
-	// ── Query API (read pool + entry reader) ───────────────────────────
+	// ── Query API ──────────────────────────────────────────────────────
 	queryAPI := indexes.NewPostgresQueryAPI(pool.DB, entryReader, cfg.LogDID)
 
-	// ── HTTP handlers (GET only — no submission handler) ───────────────
+	// ── HTTP handlers ──────────────────────────────────────────────────
 	treeDeps := &api.TreeDeps{
-		TreeHeadStore: treeHeadStore,
-		Inclusion:     tesseraAdapter,
-		Consistency:   tesseraAdapter,
-		Logger:        logger,
+		TreeHeadStore: treeHeadStore, Inclusion: tesseraAdapter,
+		Consistency: tesseraAdapter, Logger: logger,
 	}
-
 	smtDeps := &api.SMTDeps{Tree: tree, LeafStore: leafStore, Logger: logger}
-
 	queryDeps := &api.QueryDeps{
-		QueryAPI:       queryAPI,
-		DiffController: diffController,
-		Logger:         logger,
+		QueryAPI: queryAPI, DiffController: diffController, Logger: logger,
+	}
+	entryReadDeps := &api.EntryReadDeps{
+		Fetcher: fetcher, QueryAPI: queryAPI,
+		LogDID: cfg.LogDID, Logger: logger,
+	}
+	commitDeps := &api.CommitmentDeps{
+		CommitmentStore: commitmentStore, Logger: logger,
 	}
 
 	handlers := api.Handlers{
@@ -157,15 +135,19 @@ func run(logger *slog.Logger) error {
 		SchemaRef:       api.NewQuerySchemaRefHandler(queryDeps),
 		Scan:            api.NewQueryScanHandler(queryDeps),
 		Difficulty:      api.NewDifficultyHandler(queryDeps),
-		WitnessCosign:   nil, // Read-only instances never serve as witnesses.
+		WitnessCosign:   nil,
+		EntryBySequence: api.NewEntryBySequenceHandler(entryReadDeps),
+		EntryBatch:      api.NewEntryBatchHandler(entryReadDeps),
+		SMTLeaf:         api.NewSMTLeafHandler(smtDeps),
+		SMTLeafBatch:    api.NewSMTLeafBatchHandler(smtDeps),
+		CommitmentQuery: api.NewCommitmentQueryHandler(commitDeps),
 	}
 
 	serverCfg := api.DefaultServerConfig()
 	serverCfg.Addr = cfg.ServerAddr
-
 	server := api.NewServer(serverCfg, pool.DB, handlers, logger)
 
-	// ── Start HTTP server ──────────────────────────────────────────────
+	// ── Start + shutdown ───────────────────────────────────────────────
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -176,7 +158,6 @@ func run(logger *slog.Logger) error {
 	}()
 	logger.Info("HTTP server started (read-only)", "addr", cfg.ServerAddr)
 
-	// ── Block on signals + shutdown ────────────────────────────────────
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	sig := <-sigCh
@@ -184,11 +165,7 @@ func run(logger *slog.Logger) error {
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutdownCancel()
-
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		logger.Error("http shutdown error", "error", err)
-	}
-
+	_ = server.Shutdown(shutdownCtx)
 	cancel()
 	wg.Wait()
 	logger.Info("operator-reader stopped cleanly")
@@ -196,7 +173,7 @@ func run(logger *slog.Logger) error {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Configuration (subset of full operator config — no builder/submission fields)
+// Configuration
 // ─────────────────────────────────────────────────────────────────────────────
 
 type readerConfig struct {

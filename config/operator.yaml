@@ -1,15 +1,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# FILE PATH:
-#     config/operator.yaml
+# FILE PATH: config/operator.yaml
 #
-# DESCRIPTION:
-#     Full operator configuration schema. All values shown are production
-#     defaults. Override with environment variables: ORTHOLOG_<SECTION>_<KEY>.
+# Full operator configuration schema. Override with env vars.
 #
-# KEY ARCHITECTURAL DECISIONS:
-#     - Single YAML file: all config in one place, no scattered env vars
-#     - ENV override pattern: ORTHOLOG_POSTGRES_DSN overrides postgres.dsn
-#     - Secrets (DSN, keys) should be injected via env, not stored in file
+# CHANGES: Added did_resolver + schema sections.
+#          Shard section deferred to post Phase 6.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Identity
@@ -20,8 +15,7 @@ operator:
 # Postgres connection
 postgres:
   dsn: "postgres://ortholog:ortholog@localhost:5432/ortholog?sslmode=disable"
-  replica_dsn: ""                # optional — GET queries use this if set
-                                 # empty = read from primary (single-instance)
+  replica_dsn: ""
   max_conns: 20
   min_conns: 5
   max_conn_lifetime: "30m"
@@ -40,36 +34,33 @@ builder:
   batch_size: 1000
   poll_interval: "100ms"
   delta_window_size: 10
-  commitment_interval: 1000    # entries between commitments
-  commitment_max_age: "1h"     # max time between commitments
+  commitment_interval: 1000
+  commitment_max_age: "1h"
 
 # Admission
 admission:
   initial_difficulty: 16
   min_difficulty: 8
   max_difficulty: 24
-  low_threshold: 100       # Queue depth below → decrease difficulty
-  high_threshold: 10000    # Queue depth above → increase difficulty
+  low_threshold: 100
+  high_threshold: 10000
   adjust_interval: "30s"
-  hash_function: "sha256"  # sha256 or argon2id
+  hash_function: "sha256"
 
 # Tessera integration
 tessera:
   endpoint: "http://localhost:2024"
   timeout: "30s"
   tile_cache_size: 10000
+  tile_storage: object
 
-  # Tile storage — immutable 8 KB files. Two families:
-  tile_storage: object          # object | filesystem
-
-  object:                       # Any S3-compatible API (cloud or self-hosted)
-    endpoint: ""                # empty = cloud default (GCS, AWS S3)
-                                # self-hosted: "https://minio.internal:9000"
+  object:
+    endpoint: ""
     bucket: davidson-cases-tiles
     region: us-east-1
-    path_style: false           # true for self-hosted (MinIO, Ceph, R2, DO Spaces)
+    path_style: false
 
-  filesystem:                   # Local POSIX path, serve via nginx/caddy
+  filesystem:
     root: /var/lib/tessera/tiles
 
 # Witness configuration
@@ -80,25 +71,44 @@ witness:
     - "http://witness-3:8081"
   quorum_k: 2
   per_witness_timeout: "30s"
-  scheme_tag: 1            # 1=ECDSA, 2=BLS
+  scheme_tag: 1
 
 # Equivocation monitor
 equivocation:
-  peer_endpoints: []       # Endpoints of peer operators/mirrors
+  peer_endpoints: []
   poll_interval: "5m"
 
 # Anchor publisher
 anchor:
   enabled: false
   interval: "1h"
-  sources: []              # [{log_did: "", endpoint_url: ""}]
+  sources: []
 
 # SMT cache warming
 smt:
-  warm_top_levels: 32      # Preload this many levels on startup
-  cache_size: 100000       # LRU node count
+  warm_top_levels: 32
+  cache_size: 100000
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DID resolution (Phase 4)
+# ─────────────────────────────────────────────────────────────────────────────
+# When configured, submission handler performs full DID → pubkey → VerifyEntry.
+# Empty = Phase 2 trust model (nil DIDResolver, wire format integrity only).
+did_resolver:
+  endpoint: ""      # Empty = Phase 2 trust model
+  method: "http"    # "http" (REST API) or "local" (embedded)
+  timeout: "5s"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Schema resolution
+# ─────────────────────────────────────────────────────────────────────────────
+# SDK's schema.CachingResolver handles this — fetches schema entries,
+# checks commutative_operations, returns SchemaResolution.
+# Wired in cmd/operator/main.go as schema.NewCachingResolver().
+schema:
+  enabled: true     # false = all schemas use strict OCC
 
 # Logging
 logging:
-  level: "info"            # debug, info, warn, error
-  format: "json"           # json or text
+  level: "info"
+  format: "json"

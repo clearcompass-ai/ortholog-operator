@@ -8,12 +8,21 @@ KEY ARCHITECTURAL DECISIONS:
   - Commentary entry: no SMT leaf created or modified.
   - Frequency controlled: every N entries OR every T duration, whichever first.
   - Commitment serialized as JSON in Domain Payload.
-  - In production: entry is signed by operator DID and submitted through
-    the local admission pipeline.
+  - submitFn: signs and submits the commentary entry to the log.
+    Uses SubmitViaHTTP (same pattern as anchor/publisher.go).
+    nil submitFn = commitments computed but not published on the log.
+  - WithCommitmentStore: optional persistence to derivation_commitments
+    table for indexed lookup by fraud proof verifiers.
 
-INVARIANTS:
-  - Commitment post_root matches batch result's NewRoot.
-  - Every entry range is eventually covered by a commitment.
+PERSISTENCE NOTE (correction #4): Commitment persistence runs POST-COMMIT
+(loop.go step 7). A crash between atomic commit and persistence loses the
+commitment row. This is acceptable — the table is a lookup index, not
+consensus-critical state. Rebuild by replaying entries if diverged.
+
+submitFn NOTE (correction #6): submitFn must be wired to a real submission
+path for commentary entries to appear on the log. The anchor/publisher.go
+pattern (SubmitViaHTTP) is the reference implementation. Until submitFn is
+wired, the commentary_seq column in derivation_commitments has no value.
 */
 package builder
 
@@ -27,6 +36,8 @@ import (
 	sdkbuilder "github.com/clearcompass-ai/ortholog-sdk/builder"
 	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
 	"github.com/clearcompass-ai/ortholog-sdk/types"
+
+	"github.com/clearcompass-ai/ortholog-operator/store"
 )
 
 // CommitmentPublisherConfig configures commitment frequency.
@@ -37,16 +48,14 @@ type CommitmentPublisherConfig struct {
 
 // CommitmentPublisher publishes derivation commitments.
 type CommitmentPublisher struct {
-	operatorDID string
-	cfg         CommitmentPublisherConfig
-	logger      *slog.Logger
-	mu          sync.Mutex
-	lastPublish time.Time
+	operatorDID  string
+	cfg          CommitmentPublisherConfig
+	logger       *slog.Logger
+	mu           sync.Mutex
+	lastPublish  time.Time
 	entriesSince int
-	// submitFn is the callback to submit the signed commitment entry.
-	// In production: signs and POSTs to local /v1/entries.
-	// In tests: captures the entry for verification.
-	submitFn func(entry *envelope.Entry) error
+	submitFn     func(entry *envelope.Entry) error
+	commitStore  *store.CommitmentStore // nil = no table persistence
 }
 
 // NewCommitmentPublisher creates a commitment publisher.
@@ -71,8 +80,15 @@ func NewCommitmentPublisher(
 	}
 }
 
-// MaybePublish checks if a commitment should be published based on frequency,
-// and publishes if thresholds are exceeded. Called after each batch.
+// WithCommitmentStore enables persistence to the derivation_commitments table.
+// Fluent setter — avoids changing constructor signature (existing callers unaffected).
+// Returns self for chaining: NewCommitmentPublisher(...).WithCommitmentStore(cs)
+func (cp *CommitmentPublisher) WithCommitmentStore(cs *store.CommitmentStore) *CommitmentPublisher {
+	cp.commitStore = cs
+	return cp
+}
+
+// MaybePublish checks if a commitment should be published based on frequency.
 func (cp *CommitmentPublisher) MaybePublish(
 	ctx context.Context,
 	batchSize int,
@@ -97,7 +113,7 @@ func (cp *CommitmentPublisher) MaybePublish(
 	cp.publish(ctx, rangeStart, rangeEnd, priorRoot, result)
 }
 
-// ForcePublish publishes a commitment unconditionally (e.g., at shutdown).
+// ForcePublish publishes a commitment unconditionally.
 func (cp *CommitmentPublisher) ForcePublish(
 	ctx context.Context,
 	rangeStart, rangeEnd types.LogPosition,
@@ -138,10 +154,33 @@ func (cp *CommitmentPublisher) publish(
 		return
 	}
 
+	// Submit commentary entry to the log (correction #6).
+	// submitFn nil = commitments computed but not published on the log.
+	// When wired (via SubmitViaHTTP or direct enqueue), the entry gets a
+	// sequence number which is stored as commentary_seq in the table.
 	if cp.submitFn != nil {
 		if err := cp.submitFn(entry); err != nil {
 			cp.logger.Error("commitment submission failed", "error", err)
-			return
+			// Continue to persist even if submission fails — the commitment
+			// data is still useful for fraud proof verification.
+		}
+	}
+
+	// Persist to derivation_commitments table (correction #4).
+	// Post-commit, best-effort. A crash here loses the row — acceptable
+	// because commitments are reconstructable from entries.
+	if cp.commitStore != nil {
+		row := store.CommitmentRow{
+			RangeStartSeq: rangeStart.Sequence,
+			RangeEndSeq:   rangeEnd.Sequence,
+			PriorSMTRoot:  priorRoot,
+			PostSMTRoot:   commitment.PostSMTRoot,
+			MutationsJSON: payload,
+			// CommentarySeq: nil until submitFn is wired and we track
+			// the sequence number returned by the submission.
+		}
+		if insertErr := cp.commitStore.Insert(ctx, row); insertErr != nil {
+			cp.logger.Error("commitment persistence failed", "error", insertErr)
 		}
 	}
 

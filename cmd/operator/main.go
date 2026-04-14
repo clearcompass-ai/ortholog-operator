@@ -2,17 +2,15 @@
 FILE PATH: cmd/operator/main.go
 
 Entry point for the Ortholog log operator (read-write mode).
-Executes the startup sequence, manages goroutine lifecycle, handles shutdown.
 
-KEY ARCHITECTURAL DECISIONS:
-  - Pools.Write for builder, submission, queue (primary).
-  - Pools.Read for all GET queries (replica, falls back to primary).
-  - Advisory lock before builder start: exactly one builder per log.
-  - Graceful shutdown: SIGTERM → drain → exit 0.
-  - TesseraAdapter implements sdk MerkleTree; injected into builder loop.
-  - InMemoryEntryStore for entry bytes (production: TesseraEntryReader).
-  - DIDResolver: nil until Phase 4 DID resolution is deployed.
-  - WitnessCosign: nil until witness key is configured.
+CHANGES:
+  - SchemaResolver: schema.NewCachingResolver() from SDK (one line, no wrapper)
+  - submitFn: anchor.SubmitViaHTTP (correction #6)
+  - CommitmentStore: created + wired via WithCommitmentStore
+  - 5 new handlers: EntryBySequence, EntryBatch, SMTLeaf, SMTLeafBatch, CommitmentQuery
+  - No artifact_client (moved to SDK)
+  - No shard wiring (deferred post Phase 6)
+  - No builder/schema_resolver.go needed (SDK provides CachingResolver)
 */
 package main
 
@@ -27,6 +25,7 @@ import (
 	"time"
 
 	"github.com/clearcompass-ai/ortholog-sdk/core/smt"
+	"github.com/clearcompass-ai/ortholog-sdk/schema"
 
 	"github.com/clearcompass-ai/ortholog-operator/anchor"
 	"github.com/clearcompass-ai/ortholog-operator/api"
@@ -56,7 +55,7 @@ func run(logger *slog.Logger) error {
 	cfg := loadConfig()
 	logger.Info("config loaded", "log_did", cfg.LogDID, "addr", cfg.ServerAddr)
 
-	// ── Step 2: Initialize Postgres pools (write + read) ───────────────
+	// ── Step 2: Initialize Postgres pools ──────────────────────────────
 	pools, err := store.InitPools(ctx, store.PoolConfig{
 		DSN:             cfg.PostgresDSN,
 		MaxConns:        int32(cfg.MaxConns),
@@ -68,50 +67,35 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("step 2: %w", err)
 	}
 	defer pools.Close()
-	if cfg.ReplicaDSN != "" {
-		logger.Info("postgres pools initialized (primary + replica)")
-	} else {
-		logger.Info("postgres pool initialized (single instance)")
-	}
 
-	// ── Step 3: Run migrations (on primary only) ────────────────────────
+	// ── Step 3: Run migrations ─────────────────────────────────────────
+	// derivation_commitments table is now in schemaDDL (store/postgres.go).
 	if err := store.RunMigrations(ctx, pools.Write); err != nil {
 		return fmt.Errorf("step 3: %w", err)
 	}
 	logger.Info("migrations complete")
 
-	// ── Step 4: Initialize Tessera client ──────────────────────────────
+	// ── Step 4-5: Tessera ──────────────────────────────────────────────
 	tesseraClient := tessera.NewClient(tessera.ClientConfig{
 		BaseURL: cfg.TesseraBaseURL,
 		Timeout: 30 * time.Second,
 	}, logger)
 	tileBackend := tessera.NewHTTPTileBackend(cfg.TesseraBaseURL)
 	tileReader := tessera.NewTileReader(tileBackend, cfg.TileCacheSize)
-	logger.Info("tessera client initialized", "url", cfg.TesseraBaseURL)
-
-	// ── Step 5: Initialize TesseraAdapter (sdk MerkleTree interface) ───
 	tesseraAdapter := tessera.NewTesseraAdapter(tesseraClient, tileReader, logger)
-
-	// ── Entry byte store (source of truth for entry bytes) ─────────────
-	// Production: TesseraEntryReader reads from entry tiles.
-	// For now: InMemoryEntryStore (same as tests — swap when Tessera
-	// entry tile format is wired).
 	entryBytes := tessera.NewInMemoryEntryStore()
 
-	// ── Step 6: Initialize SMT with Postgres backends ──────────────────
+	// ── Step 6-7: SMT ──────────────────────────────────────────────────
 	leafStore := store.NewPostgresLeafStore(pools.Write)
 	nodeCache := store.NewPostgresNodeCache(pools.Write, cfg.SMTCacheSize)
 	tree := smt.NewTree(leafStore, nodeCache)
-	logger.Info("SMT initialized")
-
-	// ── Step 7: Warm SMT node cache ────────────────────────────────────
 	if err := nodeCache.WarmCache(ctx, cfg.WarmTopLevels); err != nil {
 		logger.Warn("cache warm failed (non-fatal)", "error", err)
 	} else {
 		logger.Info("SMT cache warmed", "top_levels", cfg.WarmTopLevels)
 	}
 
-	// ── Step 8: Load delta-window buffer ───────────────────────────────
+	// ── Step 8: Delta buffer ───────────────────────────────────────────
 	bufferStore := opbuilder.NewDeltaBufferStore(pools.Write, cfg.DeltaWindowSize, logger)
 	deltaBuffer, err := bufferStore.Load(ctx)
 	if err != nil {
@@ -119,7 +103,7 @@ func run(logger *slog.Logger) error {
 	}
 	logger.Info("delta buffer loaded")
 
-	// ── Step 9: Load current witness set ───────────────────────────────
+	// ── Step 9: Witness set ────────────────────────────────────────────
 	witnessKeys, schemeTag, err := witness.LoadCurrentSet(ctx, pools.Read)
 	if err != nil {
 		logger.Warn("witness set not found (genesis deployment)", "error", err)
@@ -128,7 +112,7 @@ func run(logger *slog.Logger) error {
 	}
 	logger.Info("witness set loaded", "keys", len(witnessKeys), "scheme", schemeTag)
 
-	// ── Acquire builder advisory lock (on primary) ─────────────────────
+	// ── Builder advisory lock ──────────────────────────────────────────
 	releaseLock, err := store.AcquireBuilderLock(ctx, pools.Write)
 	if err != nil {
 		return fmt.Errorf("builder lock: %w", err)
@@ -136,7 +120,7 @@ func run(logger *slog.Logger) error {
 	defer releaseLock()
 	logger.Info("builder advisory lock acquired")
 
-	// ── Step 10: Start builder loop goroutine ──────────────────────────
+	// ── Step 10: Builder loop ──────────────────────────────────────────
 	entryStore := store.NewEntryStore(pools.Write)
 	fetcher := store.NewPostgresEntryFetcher(pools.Read, entryBytes, cfg.LogDID)
 	queue := opbuilder.NewQueue(pools.Write)
@@ -149,19 +133,32 @@ func run(logger *slog.Logger) error {
 		SchemeTag:         schemeTag,
 	}, treeHeadStore, logger)
 
+	// CommitmentStore for indexed commitment lookup.
+	commitmentStore := store.NewCommitmentStore(pools.Write)
+
+	// SchemaResolver: SDK's CachingResolver already implements
+	// builder.SchemaResolver — fetches schema entry, deserializes,
+	// checks CommutativeOperations. No operator wrapper needed.
+	schemaResolver := schema.NewCachingResolver()
+
+	// submitFn via SubmitViaHTTP — same pattern as anchor/publisher.go.
+	// Commentary entries get signed and submitted through local admission.
+	submitFn := anchor.SubmitViaHTTP(fmt.Sprintf("http://localhost%s", cfg.ServerAddr))
+
 	commitPub := opbuilder.NewCommitmentPublisher(
 		cfg.OperatorDID,
 		opbuilder.CommitmentPublisherConfig{
 			IntervalEntries: cfg.CommitmentInterval,
 			IntervalTime:    cfg.CommitmentMaxAge,
 		},
-		nil, logger,
-	)
+		submitFn,
+		logger,
+	).WithCommitmentStore(commitmentStore)
 
 	builderLoop := opbuilder.NewBuilderLoop(
 		opbuilder.DefaultLoopConfig(cfg.LogDID),
 		pools.Write, tree, leafStore, nodeCache,
-		queue, fetcher, nil, deltaBuffer, bufferStore, commitPub,
+		queue, fetcher, schemaResolver, deltaBuffer, bufferStore, commitPub,
 		tesseraAdapter, headSync, logger,
 	)
 
@@ -175,24 +172,19 @@ func run(logger *slog.Logger) error {
 	}()
 	logger.Info("builder loop started")
 
-	// ── Step 11: Start equivocation monitor goroutine ──────────────────
+	// ── Step 11: Equivocation monitor ──────────────────────────────────
 	if len(cfg.PeerEndpoints) > 0 {
 		eqMonitor := witness.NewEquivocationMonitor(
 			witness.EquivocationMonitorConfig{
 				PeerEndpoints: cfg.PeerEndpoints,
 				PollInterval:  5 * time.Minute,
-			},
-			pools.Write, treeHeadStore, logger,
-		)
+			}, pools.Write, treeHeadStore, logger)
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			eqMonitor.Run(ctx)
-		}()
+		go func() { defer wg.Done(); eqMonitor.Run(ctx) }()
 		logger.Info("equivocation monitor started", "peers", len(cfg.PeerEndpoints))
 	}
 
-	// ── Step 12: Start anchor publisher goroutine ──────────────────────
+	// ── Step 12: Anchor publisher ──────────────────────────────────────
 	if cfg.AnchorEnabled && len(cfg.AnchorSources) > 0 {
 		anchorPub := anchor.NewPublisher(
 			anchor.PublisherConfig{
@@ -205,14 +197,11 @@ func run(logger *slog.Logger) error {
 			logger,
 		)
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			anchorPub.Run(ctx)
-		}()
+		go func() { defer wg.Done(); anchorPub.Run(ctx) }()
 		logger.Info("anchor publisher started", "sources", len(cfg.AnchorSources))
 	}
 
-	// ── Step 13: Start difficulty controller goroutine ──────────────────
+	// ── Step 13: Difficulty controller ──────────────────────────────────
 	creditStore := store.NewCreditStore(pools.Write)
 	diffController := middleware.NewDifficultyController(
 		queue, middleware.DifficultyConfig{
@@ -225,44 +214,31 @@ func run(logger *slog.Logger) error {
 		}, logger,
 	)
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		diffController.Run(ctx, 30*time.Second)
-	}()
+	go func() { defer wg.Done(); diffController.Run(ctx, 30*time.Second) }()
 
-	// ── Step 14: Start HTTP server ─────────────────────────────────────
-	// Queries use Read pool. Submission uses Write pool.
+	// ── Step 14: HTTP server ───────────────────────────────────────────
 	queryAPI := indexes.NewPostgresQueryAPI(pools.Read, entryBytes, cfg.LogDID)
 
 	submissionDeps := &api.SubmissionDeps{
-		DB:             pools.Write,
-		EntryStore:     entryStore,
-		EntryWriter:    entryBytes,
-		CreditStore:    creditStore,
-		Queue:          queue,
-		LogDID:         cfg.LogDID,
-		MaxEntrySize:   int64(cfg.MaxEntrySize),
-		DiffController: diffController,
-		Logger:         logger,
-
-		// Phase 4: replace with did.NewResolver(httpClient) when DID
-		// resolution infrastructure is deployed. nil = Phase 2 trust model.
-		DIDResolver: nil,
+		DB: pools.Write, EntryStore: entryStore, EntryWriter: entryBytes,
+		CreditStore: creditStore, Queue: queue, LogDID: cfg.LogDID,
+		MaxEntrySize: int64(cfg.MaxEntrySize), DiffController: diffController,
+		Logger: logger, DIDResolver: nil,
 	}
-
 	treeDeps := &api.TreeDeps{
-		TreeHeadStore: treeHeadStore,
-		Inclusion:     tesseraAdapter,
-		Consistency:   tesseraAdapter,
-		Logger:        logger,
+		TreeHeadStore: treeHeadStore, Inclusion: tesseraAdapter,
+		Consistency: tesseraAdapter, Logger: logger,
 	}
-
 	smtDeps := &api.SMTDeps{Tree: tree, LeafStore: leafStore, Logger: logger}
-
 	queryDeps := &api.QueryDeps{
-		QueryAPI:       queryAPI,
-		DiffController: diffController,
-		Logger:         logger,
+		QueryAPI: queryAPI, DiffController: diffController, Logger: logger,
+	}
+	entryReadDeps := &api.EntryReadDeps{
+		Fetcher: fetcher, QueryAPI: queryAPI,
+		LogDID: cfg.LogDID, Logger: logger,
+	}
+	commitDeps := &api.CommitmentDeps{
+		CommitmentStore: commitmentStore, Logger: logger,
 	}
 
 	handlers := api.Handlers{
@@ -279,21 +255,17 @@ func run(logger *slog.Logger) error {
 		SchemaRef:       api.NewQuerySchemaRefHandler(queryDeps),
 		Scan:            api.NewQueryScanHandler(queryDeps),
 		Difficulty:      api.NewDifficultyHandler(queryDeps),
-
-		// Witness cosign endpoint: nil until witness key is configured.
-		// When this operator serves as a witness for peer logs:
-		//   witnessKey := loadWitnessKey(cfg)
-		//   handlers.WitnessCosign = witness.NewCosignHandler(witness.ServeConfig{
-		//       WitnessKey: witnessKey,
-		//       Logger:     logger,
-		//   })
-		WitnessCosign: nil,
+		WitnessCosign:   nil,
+		EntryBySequence: api.NewEntryBySequenceHandler(entryReadDeps),
+		EntryBatch:      api.NewEntryBatchHandler(entryReadDeps),
+		SMTLeaf:         api.NewSMTLeafHandler(smtDeps),
+		SMTLeafBatch:    api.NewSMTLeafBatchHandler(smtDeps),
+		CommitmentQuery: api.NewCommitmentQueryHandler(commitDeps),
 	}
 
 	serverCfg := api.DefaultServerConfig()
 	serverCfg.Addr = cfg.ServerAddr
 	serverCfg.MaxEntrySize = int64(cfg.MaxEntrySize)
-
 	server := api.NewServer(serverCfg, pools.Write, handlers, logger)
 
 	wg.Add(1)
@@ -305,7 +277,7 @@ func run(logger *slog.Logger) error {
 	}()
 	logger.Info("HTTP server started", "addr", cfg.ServerAddr)
 
-	// ── Steps 15-16: Block on signals + graceful shutdown ──────────────
+	// ── Steps 15-16: Signals + shutdown ────────────────────────────────
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	sig := <-sigCh
@@ -313,11 +285,7 @@ func run(logger *slog.Logger) error {
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
-
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		logger.Error("http shutdown error", "error", err)
-	}
-
+	_ = server.Shutdown(shutdownCtx)
 	cancel()
 	wg.Wait()
 	logger.Info("all goroutines stopped, exiting cleanly")
@@ -332,7 +300,7 @@ type operatorConfig struct {
 	LogDID             string
 	OperatorDID        string
 	PostgresDSN        string
-	ReplicaDSN         string // optional — GET queries use this if set
+	ReplicaDSN         string
 	MaxConns           int
 	MinConns           int
 	ServerAddr         string

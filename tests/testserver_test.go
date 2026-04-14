@@ -7,6 +7,8 @@ Real Postgres, real middleware chain, real builder loop.
 DESIGN RULE: Postgres is an index. Entry bytes live in EntryReader.
 InMemoryEntryStore satisfies both EntryReader and EntryWriter.
 MerkleAppender and WitnessCosigner use in-process stubs.
+
+CHANGES: 5 new handler fields wired for full buildout endpoints.
 */
 package tests
 
@@ -50,9 +52,6 @@ type testOperator struct {
 	cancel      context.CancelFunc
 }
 
-// startTestOperator creates a fully-wired operator HTTP server on a random
-// port backed by real Postgres and a running builder loop.
-// Entry bytes go to InMemoryEntryStore (not Postgres).
 func startTestOperator(t *testing.T) *testOperator {
 	t.Helper()
 
@@ -77,7 +76,7 @@ func startTestOperator(t *testing.T) *testOperator {
 	}
 	cleanTables(t, pool)
 
-	// ── Entry byte store (source of truth for bytes) ────────────────────
+	// ── Entry byte store ───────────────────────────────────────────────
 	entryBytes := optessera.NewInMemoryEntryStore()
 
 	// ── Stores ─────────────────────────────────────────────────────────
@@ -89,6 +88,7 @@ func startTestOperator(t *testing.T) *testOperator {
 	nodeCache := store.NewPostgresNodeCache(pool, 10000)
 	tree := smt.NewTree(leafStore, nodeCache)
 	fetcher := store.NewPostgresEntryFetcher(pool, entryBytes, testLogDID)
+	commitmentStore := store.NewCommitmentStore(pool)
 
 	// ── Delta buffer ───────────────────────────────────────────────────
 	bufferStore := opbuilder.NewDeltaBufferStore(pool, 10, logger)
@@ -101,7 +101,7 @@ func startTestOperator(t *testing.T) *testOperator {
 	merkle := &stubMerkleAppender{mt: smt.NewStubMerkleTree()}
 	witnessCosigner := &stubWitnessCosigner{}
 
-	// ── Commitment publisher (no-op for HTTP tests) ────────────────────
+	// ── Commitment publisher ───────────────────────────────────────────
 	commitPub := opbuilder.NewCommitmentPublisher(
 		testLogDID,
 		opbuilder.CommitmentPublisherConfig{IntervalEntries: 100000, IntervalTime: 24 * time.Hour},
@@ -134,7 +134,7 @@ func startTestOperator(t *testing.T) *testOperator {
 		CreditStore: creditStore,
 		Queue: queue, LogDID: testLogDID, MaxEntrySize: 1 << 20,
 		DiffController: diffController, Logger: logger,
-		DIDResolver: nil, // Phase 2 trust model in tests.
+		DIDResolver: nil,
 	}
 	treeDeps := &api.TreeDeps{
 		TreeHeadStore: treeHeadStore, Inclusion: merkle,
@@ -143,6 +143,15 @@ func startTestOperator(t *testing.T) *testOperator {
 	smtDeps := &api.SMTDeps{Tree: tree, LeafStore: leafStore, Logger: logger}
 	queryDeps := &api.QueryDeps{
 		QueryAPI: queryAPI, DiffController: diffController, Logger: logger,
+	}
+
+	// NEW: Deps for full buildout endpoints.
+	entryReadDeps := &api.EntryReadDeps{
+		Fetcher: fetcher, QueryAPI: queryAPI,
+		LogDID: testLogDID, Logger: logger,
+	}
+	commitDeps := &api.CommitmentDeps{
+		CommitmentStore: commitmentStore, Logger: logger,
 	}
 
 	handlers := api.Handlers{
@@ -159,7 +168,14 @@ func startTestOperator(t *testing.T) *testOperator {
 		SchemaRef:       api.NewQuerySchemaRefHandler(queryDeps),
 		Scan:            api.NewQueryScanHandler(queryDeps),
 		Difficulty:      api.NewDifficultyHandler(queryDeps),
-		WitnessCosign:   nil, // No witness serving in tests.
+		WitnessCosign:   nil,
+
+		// NEW: Full buildout read endpoints.
+		EntryBySequence: api.NewEntryBySequenceHandler(entryReadDeps),
+		EntryBatch:      api.NewEntryBatchHandler(entryReadDeps),
+		SMTLeaf:         api.NewSMTLeafHandler(smtDeps),
+		SMTLeafBatch:    api.NewSMTLeafBatchHandler(smtDeps),
+		CommitmentQuery: api.NewCommitmentQueryHandler(commitDeps),
 	}
 
 	serverCfg := api.DefaultServerConfig()
@@ -234,9 +250,6 @@ type stubMerkleAppender struct {
 }
 
 func (s *stubMerkleAppender) AppendLeaf(data []byte) (uint64, error) {
-	// Compute SHA-256 of wire bytes, then pass hash to SDK StubMerkleTree.
-	// In production, Tessera computes RFC6962.HashLeaf(data) internally.
-	// For testing, SHA-256 is equivalent — both are deterministic leaf hashes.
 	h := sha256.Sum256(data)
 	return s.mt.AppendLeaf(h[:])
 }
@@ -245,8 +258,6 @@ func (s *stubMerkleAppender) Head() (types.TreeHead, error) {
 	return s.mt.Head()
 }
 
-// RawInclusionProof satisfies the api.InclusionProver interface.
-// Returns raw proof data for JSON passthrough in HTTP handlers.
 func (s *stubMerkleAppender) RawInclusionProof(position, treeSize uint64) (any, error) {
 	return s.mt.InclusionProof(position, treeSize)
 }
