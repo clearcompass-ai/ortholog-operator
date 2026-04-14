@@ -236,7 +236,7 @@ func (s *stubMerkleAppender) AppendLeaf(data []byte) (uint64, error) {
 	// In production, Tessera computes RFC6962.HashLeaf(data) internally.
 	// For testing, SHA-256 is equivalent — both are deterministic leaf hashes.
 	h := sha256.Sum256(data)
-	return s.mt.AppendLeaf(h)
+	return s.mt.AppendLeaf(h[:])
 }
 
 func (s *stubMerkleAppender) Head() (types.TreeHead, error) {

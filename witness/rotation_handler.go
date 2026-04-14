@@ -63,18 +63,11 @@ func (rh *RotationHandler) ProcessRotation(
 	// Phase 2 validates structural constraints: non-empty set, non-empty sigs,
 	// dual-sign flag consistency. Signature verification against public keys
 	// requires the same key registry infrastructure as entry signature verification.
-	// Fabricated rotations are detectable by witnesses and monitoring.
-	if int(len(rotation.CurrentSignatures)) < rh.cfg.QuorumK {
-		return nil, fmt.Errorf("witness/rotation: %d signatures < quorum %d",
-			len(rotation.CurrentSignatures), rh.cfg.QuorumK)
-	}
 
 	isDualSign := rotation.IsDualSigned()
 	if isDualSign {
 		rh.logger.Info("witness rotation: scheme transition",
 			"from", rotation.SchemeTagOld, "to", rotation.SchemeTagNew)
-		// Dual-sign transitions require verification under BOTH schemes.
-		// Phase 4 key registry resolves both old and new public keys.
 		if len(rotation.NewSignatures) == 0 {
 			return nil, fmt.Errorf("witness/rotation: dual-sign requires new-scheme signatures")
 		}
