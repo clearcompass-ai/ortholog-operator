@@ -1,0 +1,418 @@
+/*
+FILE PATH: tests/helpers_test.go
+
+Shared test infrastructure for the operator integration suite.
+Provides: in-memory SDK harness, Postgres connection/migration helpers,
+mock types, and builder convenience functions.
+*/
+package tests
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/clearcompass-ai/ortholog-sdk/builder"
+	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
+	"github.com/clearcompass-ai/ortholog-sdk/core/smt"
+	"github.com/clearcompass-ai/ortholog-sdk/types"
+
+	"github.com/clearcompass-ai/ortholog-operator/store"
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+const testLogDID = "did:ortholog:test:integration"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Position helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+func pos(seq uint64) types.LogPosition {
+	return types.LogPosition{LogDID: testLogDID, Sequence: seq}
+}
+
+func foreignPos(seq uint64) types.LogPosition {
+	return types.LogPosition{LogDID: "did:ortholog:foreign", Sequence: seq}
+}
+
+func ptrTo[T any](v T) *T { return &v }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Authority path helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+func sameSigner() *envelope.AuthorityPath {
+	v := envelope.AuthoritySameSigner
+	return &v
+}
+
+func delegation() *envelope.AuthorityPath {
+	v := envelope.AuthorityDelegation
+	return &v
+}
+
+func scopeAuth() *envelope.AuthorityPath {
+	v := envelope.AuthorityScopeAuthority
+	return &v
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Entry construction helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+func makeEntry(t *testing.T, h envelope.ControlHeader, payload []byte) *envelope.Entry {
+	t.Helper()
+	entry, err := envelope.NewEntry(h, payload)
+	if err != nil {
+		t.Fatalf("NewEntry: %v", err)
+	}
+	return entry
+}
+
+func canonicalHashBytes(entry *envelope.Entry) [32]byte {
+	return sha256.Sum256(envelope.Serialize(entry))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// String helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	buf := make([]byte, 0, 4)
+	for n > 0 {
+		buf = append([]byte{byte('0' + n%10)}, buf...)
+		n /= 10
+	}
+	return string(buf)
+}
+
+func didForUser(i int) string {
+	return "did:example:user" + itoa(i)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mock fetcher
+// ─────────────────────────────────────────────────────────────────────────────
+
+type mockFetcher struct {
+	mu      sync.RWMutex
+	entries map[types.LogPosition]*types.EntryWithMetadata
+}
+
+func newMockFetcher() *mockFetcher {
+	return &mockFetcher{entries: make(map[types.LogPosition]*types.EntryWithMetadata)}
+}
+
+func (f *mockFetcher) Fetch(pos types.LogPosition) (*types.EntryWithMetadata, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.entries[pos], nil
+}
+
+func (f *mockFetcher) storeEntry(pos types.LogPosition, entry *envelope.Entry) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.entries[pos] = &types.EntryWithMetadata{
+		CanonicalBytes: envelope.Serialize(entry),
+		LogTime:        time.Now(),
+		Position:       pos,
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mock schema resolver
+// ─────────────────────────────────────────────────────────────────────────────
+
+type mockSchemaResolver struct {
+	commutative bool
+}
+
+func (r *mockSchemaResolver) Resolve(ref types.LogPosition, fetcher builder.EntryFetcher) (*builder.SchemaResolution, error) {
+	return &builder.SchemaResolution{
+		IsCommutative:   r.commutative,
+		DeltaWindowSize: 10,
+	}, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// In-memory test harness (wraps SDK builder with convenience methods)
+// ─────────────────────────────────────────────────────────────────────────────
+
+type testHarness struct {
+	tree    *smt.Tree
+	fetcher *mockFetcher
+	schema  builder.SchemaResolver
+	buffer  *builder.DeltaWindowBuffer
+}
+
+func newHarness() *testHarness {
+	return &testHarness{
+		tree:    smt.NewTree(smt.NewInMemoryLeafStore(), smt.NewInMemoryNodeCache()),
+		fetcher: newMockFetcher(),
+		buffer:  builder.NewDeltaWindowBuffer(10),
+	}
+}
+
+// addRootEntity creates a root entity leaf in the SMT and stores the entry.
+func (h *testHarness) addRootEntity(t *testing.T, p types.LogPosition, signerDID string) *envelope.Entry {
+	t.Helper()
+	entry := makeEntry(t, envelope.ControlHeader{
+		SignerDID:     signerDID,
+		AuthorityPath: sameSigner(),
+	}, nil)
+	h.fetcher.storeEntry(p, entry)
+	key := smt.DeriveKey(p)
+	leaf := types.SMTLeaf{Key: key, OriginTip: p, AuthorityTip: p}
+	if err := h.tree.SetLeaf(key, leaf); err != nil {
+		t.Fatal(err)
+	}
+	return entry
+}
+
+// addDelegation creates a delegation entry and leaf.
+func (h *testHarness) addDelegation(t *testing.T, delegPos types.LogPosition, signerDID, delegateDID string) *envelope.Entry {
+	t.Helper()
+	entry := makeEntry(t, envelope.ControlHeader{
+		SignerDID:     signerDID,
+		AuthorityPath: sameSigner(),
+		DelegateDID:   &delegateDID,
+	}, nil)
+	h.fetcher.storeEntry(delegPos, entry)
+	key := smt.DeriveKey(delegPos)
+	_ = h.tree.SetLeaf(key, types.SMTLeaf{Key: key, OriginTip: delegPos, AuthorityTip: delegPos})
+	return entry
+}
+
+// addScopeEntity creates a scope entity with an authority set.
+func (h *testHarness) addScopeEntity(t *testing.T, p types.LogPosition, signerDID string, authSet map[string]struct{}) *envelope.Entry {
+	t.Helper()
+	entry := makeEntry(t, envelope.ControlHeader{
+		SignerDID:     signerDID,
+		AuthorityPath: sameSigner(),
+		AuthoritySet:  authSet,
+	}, nil)
+	h.fetcher.storeEntry(p, entry)
+	key := smt.DeriveKey(p)
+	_ = h.tree.SetLeaf(key, types.SMTLeaf{Key: key, OriginTip: p, AuthorityTip: p})
+	return entry
+}
+
+// process runs a single entry through ProcessBatch.
+func (h *testHarness) process(t *testing.T, entry *envelope.Entry, p types.LogPosition) *builder.BatchResult {
+	t.Helper()
+	h.fetcher.storeEntry(p, entry)
+	result, err := builder.ProcessBatch(
+		h.tree, []*envelope.Entry{entry}, []types.LogPosition{p},
+		h.fetcher, h.schema, testLogDID, h.buffer,
+	)
+	if err != nil {
+		t.Fatalf("ProcessBatch: %v", err)
+	}
+	return result
+}
+
+// processBatch runs multiple entries through ProcessBatch.
+func (h *testHarness) processBatch(t *testing.T, entries []*envelope.Entry, positions []types.LogPosition) *builder.BatchResult {
+	t.Helper()
+	for i, entry := range entries {
+		h.fetcher.storeEntry(positions[i], entry)
+	}
+	result, err := builder.ProcessBatch(
+		h.tree, entries, positions,
+		h.fetcher, h.schema, testLogDID, h.buffer,
+	)
+	if err != nil {
+		t.Fatalf("ProcessBatch: %v", err)
+	}
+	return result
+}
+
+func (h *testHarness) leafOriginTip(t *testing.T, p types.LogPosition) types.LogPosition {
+	t.Helper()
+	leaf, err := h.tree.GetLeaf(smt.DeriveKey(p))
+	if err != nil || leaf == nil {
+		t.Fatalf("leaf not found for %s", p)
+	}
+	return leaf.OriginTip
+}
+
+func (h *testHarness) leafAuthorityTip(t *testing.T, p types.LogPosition) types.LogPosition {
+	t.Helper()
+	leaf, err := h.tree.GetLeaf(smt.DeriveKey(p))
+	if err != nil || leaf == nil {
+		t.Fatalf("leaf not found for %s", p)
+	}
+	return leaf.AuthorityTip
+}
+
+func (h *testHarness) leafExists(t *testing.T, p types.LogPosition) bool {
+	t.Helper()
+	leaf, err := h.tree.GetLeaf(smt.DeriveKey(p))
+	return err == nil && leaf != nil
+}
+
+func (h *testHarness) root(t *testing.T) [32]byte {
+	t.Helper()
+	r, err := h.tree.Root()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bulk entry generation
+// ─────────────────────────────────────────────────────────────────────────────
+
+func generateEntries(n int) ([]*envelope.Entry, []types.LogPosition) {
+	entries := make([]*envelope.Entry, n)
+	positions := make([]types.LogPosition, n)
+	for i := 0; i < n; i++ {
+		var ap *envelope.AuthorityPath
+		if i%5 == 0 {
+			v := envelope.AuthoritySameSigner
+			ap = &v
+		}
+		entries[i], _ = envelope.NewEntry(envelope.ControlHeader{
+			SignerDID:     didForUser(i / 10),
+			AuthorityPath: ap,
+		}, []byte{byte(i)})
+		positions[i] = pos(uint64(i + 1))
+	}
+	return entries, positions
+}
+
+// runSDKBuilder runs ProcessBatch against a fresh in-memory tree.
+func runSDKBuilder(t *testing.T, entries []*envelope.Entry, positions []types.LogPosition) *builder.BatchResult {
+	t.Helper()
+	tree := smt.NewTree(smt.NewInMemoryLeafStore(), smt.NewInMemoryNodeCache())
+	f := newMockFetcher()
+	for i, e := range entries {
+		f.storeEntry(positions[i], e)
+	}
+	result, err := builder.ProcessBatch(tree, entries, positions, f, nil, testLogDID, builder.NewDeltaWindowBuffer(10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Postgres helpers (for integration tests requiring a real database)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// skipIfNoPostgres checks for ORTHOLOG_TEST_DSN. Returns a pool or skips the test.
+func skipIfNoPostgres(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	dsn := os.Getenv("ORTHOLOG_TEST_DSN")
+	if dsn == "" {
+		t.Skip("ORTHOLOG_TEST_DSN not set — skipping Postgres integration test")
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect to test database: %v", err)
+	}
+
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		t.Fatalf("ping test database: %v", err)
+	}
+
+	// Run migrations.
+	if err := store.RunMigrations(ctx, pool); err != nil {
+		pool.Close()
+		t.Fatalf("run migrations: %v", err)
+	}
+
+	// Clean all tables for test isolation.
+	cleanTables(t, pool)
+
+	t.Cleanup(func() {
+		cleanTables(t, pool)
+		pool.Close()
+	})
+
+	return pool
+}
+
+func cleanTables(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	ctx := context.Background()
+	tables := []string{
+		"builder_queue", "entries", "smt_leaves", "smt_nodes",
+		"credits", "tree_heads", "delta_window_buffers",
+		"witness_sets", "equivocation_proofs", "sessions",
+	}
+	for _, table := range tables {
+		if _, err := pool.Exec(ctx, "DELETE FROM "+table); err != nil {
+			// Table might not exist yet; ignore.
+		}
+	}
+	// Reset sequence.
+	_, _ = pool.Exec(ctx, "ALTER SEQUENCE entry_sequence RESTART WITH 1")
+}
+
+// insertTestEntry directly inserts an entry into Postgres for query testing.
+func insertTestEntry(t *testing.T, pool *pgxpool.Pool, seq uint64, entry *envelope.Entry, logDID string) {
+	t.Helper()
+	ctx := context.Background()
+	canonical := envelope.Serialize(entry)
+	hash := sha256.Sum256(canonical)
+	logTime := time.Now().UTC()
+
+	var targetRoot, cosigOf, schemaRef []byte
+	if entry.Header.TargetRoot != nil {
+		targetRoot = store.SerializeLogPosition(*entry.Header.TargetRoot)
+	}
+	if entry.Header.CosignatureOf != nil {
+		cosigOf = store.SerializeLogPosition(*entry.Header.CosignatureOf)
+	}
+	if entry.Header.SchemaRef != nil {
+		schemaRef = store.SerializeLogPosition(*entry.Header.SchemaRef)
+	}
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO entries (sequence_number, canonical_bytes, canonical_hash, log_time,
+			sig_algorithm_id, sig_bytes, signer_did, target_root, cosignature_of, schema_ref)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		seq, canonical, hash[:], logTime,
+		uint16(1), []byte("test-sig"), entry.Header.SignerDID,
+		targetRoot, cosigOf, schemaRef,
+	)
+	if err != nil {
+		t.Fatalf("insert test entry seq=%d: %v", seq, err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JSON payload helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+func mustJSON(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Suppress unused import warnings
+// ─────────────────────────────────────────────────────────────────────────────
+
+var _ = fmt.Sprintf

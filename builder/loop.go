@@ -8,11 +8,13 @@ appends to Merkle tree, publishes commitments, requests witness cosignatures.
 KEY ARCHITECTURAL DECISIONS:
   - Single goroutine: determinism requires exactly one builder per log.
     Advisory lock prevents concurrent instances.
-  - Atomic commit: leaf mutations + node cache updates + delta buffer +
-    queue status in ONE Postgres transaction. No partial state on crash.
+  - Atomic commit: leaf mutations + delta buffer + queue status in ONE
+    Postgres transaction. No partial state on crash.
   - SDK MerkleTree interface: builder touches only the interface, never
     tessera/client.go directly. Swappable backend.
   - Idempotent: replaying the same batch produces identical state.
+  - SDK LeafMutation is a diff format: carries tip positions, not a full
+    SMTLeaf. The operator reconstructs the leaf from mutation fields.
 
 INVARIANTS:
   - processBatch either fully commits or fully rolls back.
@@ -63,7 +65,7 @@ func DefaultLoopConfig(logDID string) LoopConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2) MerkleAppender interface (satisfied by TesseraAdapter)
+// 2) Interfaces (satisfied by TesseraAdapter and HeadSync respectively)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // MerkleAppender is the subset of sdk smt.MerkleTree used by the builder.
@@ -192,9 +194,9 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	// ── Step 1: Dequeue batch ─────────────────────────────────────────
 	var seqs []uint64
 	err = store.WithReadCommittedTx(ctx, bl.db, func(ctx context.Context, tx pgx.Tx) error {
-		var err error
-		seqs, err = bl.queue.DequeueBatch(ctx, tx, bl.cfg.BatchSize)
-		return err
+		var dqErr error
+		seqs, dqErr = bl.queue.DequeueBatch(ctx, tx, bl.cfg.BatchSize)
+		return dqErr
 	})
 	if err != nil {
 		return 0, fmt.Errorf("dequeue: %w", err)
@@ -207,20 +209,22 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	metas := make([]*types.EntryWithMetadata, 0, len(seqs))
 	for _, seq := range seqs {
 		pos := types.LogPosition{LogDID: bl.cfg.LogDID, Sequence: seq}
-		meta, err := bl.fetcher.Fetch(pos)
-		if err != nil || meta == nil {
-			return 0, fmt.Errorf("fetch seq=%d: not found or error: %w", seq, err)
+		meta, fetchErr := bl.fetcher.Fetch(pos)
+		if fetchErr != nil || meta == nil {
+			return 0, fmt.Errorf("fetch seq=%d: not found or error: %w", seq, fetchErr)
 		}
 		metas = append(metas, meta)
 	}
 
-	// ── Step 3: Split for ProcessBatch ────────────────────────────────
+	// ── Step 3: Split EntryWithMetadata → entries + positions ─────────
+	// SDK ProcessBatch takes deserialized entries and separate positions,
+	// not EntryWithMetadata directly. The operator is responsible for split.
 	entries := make([]*envelope.Entry, len(metas))
 	positions := make([]types.LogPosition, len(metas))
 	for i, ewm := range metas {
-		entry, err := envelope.Deserialize(ewm.CanonicalBytes)
-		if err != nil {
-			return 0, fmt.Errorf("deserialize seq=%d: %w", seqs[i], err)
+		entry, desErr := envelope.Deserialize(ewm.CanonicalBytes)
+		if desErr != nil {
+			return 0, fmt.Errorf("deserialize seq=%d: %w", seqs[i], desErr)
 		}
 		entries[i] = entry
 		positions[i] = ewm.Position
@@ -236,29 +240,38 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	}
 
 	// ── Step 5: Atomic commit ─────────────────────────────────────────
-	// All state changes in ONE Postgres transaction:
-	//   - Leaf mutations → smt_leaves
-	//   - Node cache updates → smt_nodes (write-through)
+	// All state changes in ONE Postgres Serializable transaction:
+	//   - Leaf mutations → smt_leaves (reconstructed from diff)
 	//   - Delta buffer → delta_window_buffers
 	//   - Queue status → builder_queue (mark done)
+	//
+	// SDK LeafMutation is a diff format carrying tip positions, not a
+	// full SMTLeaf. The operator reconstructs the leaf:
+	//   types.SMTLeaf{Key: mut.LeafKey, OriginTip: mut.NewOriginTip,
+	//                 AuthorityTip: mut.NewAuthorityTip}
 	err = store.WithSerializableTx(ctx, bl.db, func(ctx context.Context, tx pgx.Tx) error {
 		// Write leaf mutations.
 		for _, mut := range result.Mutations {
-			if err := bl.leafStore.SetTx(ctx, tx, mut.Key, mut.NewLeaf); err != nil {
-				return fmt.Errorf("set leaf: %w", err)
+			leaf := types.SMTLeaf{
+				Key:          mut.LeafKey,
+				OriginTip:    mut.NewOriginTip,
+				AuthorityTip: mut.NewAuthorityTip,
+			}
+			if setErr := bl.leafStore.SetTx(ctx, tx, mut.LeafKey, leaf); setErr != nil {
+				return fmt.Errorf("set leaf %x: %w", mut.LeafKey[:8], setErr)
 			}
 		}
 
 		// Save delta buffer.
 		if bl.bufferStore != nil && result.UpdatedBuffer != nil {
-			if err := bl.bufferStore.SaveTx(ctx, tx, result.UpdatedBuffer); err != nil {
-				return fmt.Errorf("save buffer: %w", err)
+			if bufErr := bl.bufferStore.SaveTx(ctx, tx, result.UpdatedBuffer); bufErr != nil {
+				return fmt.Errorf("save buffer: %w", bufErr)
 			}
 		}
 
 		// Mark queue entries as processed.
-		if err := bl.queue.MarkProcessed(ctx, tx, seqs); err != nil {
-			return fmt.Errorf("mark processed: %w", err)
+		if qErr := bl.queue.MarkProcessed(ctx, tx, seqs); qErr != nil {
+			return fmt.Errorf("mark processed: %w", qErr)
 		}
 
 		return nil
@@ -272,14 +285,15 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	// Crash here → re-append on restart is safe.
 	if bl.merkle != nil {
 		for _, ewm := range metas {
-			entry, _ := envelope.Deserialize(ewm.CanonicalBytes)
-			if entry != nil {
-				entryHash := crypto.CanonicalHash(entry)
-				if _, err := bl.merkle.AppendLeaf(entryHash); err != nil {
-					bl.logger.Error("Tessera append failed",
-						"seq", ewm.Position.Sequence, "error", err)
-					// Non-fatal: Merkle tree will catch up on next cycle.
-				}
+			entry, desErr := envelope.Deserialize(ewm.CanonicalBytes)
+			if desErr != nil || entry == nil {
+				continue
+			}
+			entryHash := crypto.CanonicalHash(entry)
+			if _, appendErr := bl.merkle.AppendLeaf(entryHash); appendErr != nil {
+				bl.logger.Error("Tessera append failed",
+					"seq", ewm.Position.Sequence, "error", appendErr)
+				// Non-fatal: Merkle tree will catch up on next cycle.
 			}
 		}
 	}
@@ -293,16 +307,16 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 
 	// ── Step 8: Request witness cosignatures ──────────────────────────
 	if bl.merkle != nil && bl.witness != nil {
-		head, err := bl.merkle.Head()
-		if err == nil {
-			if err := bl.witness.RequestCosignatures(ctx, head); err != nil {
-				bl.logger.Warn("witness cosignature request failed", "error", err)
+		head, headErr := bl.merkle.Head()
+		if headErr == nil {
+			if cosigErr := bl.witness.RequestCosignatures(ctx, head); cosigErr != nil {
+				bl.logger.Warn("witness cosignature request failed", "error", cosigErr)
 				// Non-fatal: retry on next cycle.
 			}
 		}
 	}
 
-	// Update buffer reference.
+	// Update buffer reference for next cycle.
 	if result.UpdatedBuffer != nil {
 		bl.buffer = result.UpdatedBuffer
 	}

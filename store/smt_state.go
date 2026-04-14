@@ -80,15 +80,6 @@ func (s *PostgresLeafStore) Get(key [32]byte) (*types.SMTLeaf, error) {
 // Used during non-critical paths. Builder uses SetTx for atomic commits.
 func (s *PostgresLeafStore) Set(key [32]byte, leaf types.SMTLeaf) error {
 	ctx := context.TODO()
-	return s.upsertLeaf(ctx, s.db, key, leaf)
-}
-
-// SetTx writes a leaf within a transaction (for atomic builder commit).
-func (s *PostgresLeafStore) SetTx(ctx context.Context, tx pgx.Tx, key [32]byte, leaf types.SMTLeaf) error {
-	return s.upsertLeafTx(ctx, tx, key, leaf)
-}
-
-func (s *PostgresLeafStore) upsertLeaf(ctx context.Context, db interface{ Exec(ctx context.Context, sql string, args ...any) (interface{ RowsAffected() int64 }, error) }, key [32]byte, leaf types.SMTLeaf) error {
 	originBytes := SerializeLogPosition(leaf.OriginTip)
 	authBytes := SerializeLogPosition(leaf.AuthorityTip)
 
@@ -107,7 +98,8 @@ func (s *PostgresLeafStore) upsertLeaf(ctx context.Context, db interface{ Exec(c
 	return nil
 }
 
-func (s *PostgresLeafStore) upsertLeafTx(ctx context.Context, tx pgx.Tx, key [32]byte, leaf types.SMTLeaf) error {
+// SetTx writes a leaf within a transaction (for atomic builder commit).
+func (s *PostgresLeafStore) SetTx(ctx context.Context, tx pgx.Tx, key [32]byte, leaf types.SMTLeaf) error {
 	originBytes := SerializeLogPosition(leaf.OriginTip)
 	authBytes := SerializeLogPosition(leaf.AuthorityTip)
 

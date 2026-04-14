@@ -6,14 +6,17 @@ Survives operator restarts. Empty on cold start → strict OCC (SDK-D9).
 
 KEY ARCHITECTURAL DECISIONS:
   - Load/Save symmetry: Load → sdk DeltaWindowBuffer, Save → Postgres.
-  - Save is called INSIDE the atomic commit transaction — buffer and
-    leaf mutations are committed together.
+  - SaveTx called INSIDE the atomic commit transaction — buffer and leaf
+    mutations are committed together. No partial state.
+  - Uses buf.AllKeys() to enumerate all leaves with recorded history.
+    AllKeys returns every leaf that has received Path C updates — typically
+    under 100 active leaves per batch.
   - Tip history serialized as compact BYTEA: [count][pos1][pos2]...
   - Reconstructable from ScanFromPosition if table is lost.
 
 INVARIANTS:
   - Empty table = cold start = strict OCC (SDK-D9).
-  - Save persists only modified leaves (batch delta).
+  - SaveTx persists all active buffer entries, not just current-batch deltas.
 */
 package builder
 
@@ -89,21 +92,25 @@ func (s *DeltaBufferStore) Load(ctx context.Context) (*sdkbuilder.DeltaWindowBuf
 }
 
 // SaveTx persists the current buffer state within a transaction.
-// Called as part of the builder's atomic commit.
+// Called as part of the builder's atomic commit in loop.go step 5.
+//
+// Uses buf.AllKeys() to enumerate every leaf with recorded history.
+// For each key, persists the tip history via UPSERT. Removes entries
+// whose history has been emptied. Trims to windowSize.
 func (s *DeltaBufferStore) SaveTx(ctx context.Context, tx pgx.Tx, buf *sdkbuilder.DeltaWindowBuffer) error {
-	modifiedKeys := buf.ModifiedKeys()
-	if len(modifiedKeys) == 0 {
+	allKeys := buf.AllKeys()
+	if len(allKeys) == 0 {
 		return nil
 	}
 
-	for _, key := range modifiedKeys {
+	for _, key := range allKeys {
 		tips := buf.History(key)
 		if len(tips) == 0 {
 			// Remove entries with empty history.
-			_, err := tx.Exec(ctx,
-				"DELETE FROM delta_window_buffers WHERE leaf_key = $1", key[:])
-			if err != nil {
-				return fmt.Errorf("builder/delta_buffer: delete: %w", err)
+			if _, err := tx.Exec(ctx,
+				"DELETE FROM delta_window_buffers WHERE leaf_key = $1", key[:],
+			); err != nil {
+				return fmt.Errorf("builder/delta_buffer: delete %x: %w", key[:8], err)
 			}
 			continue
 		}
@@ -114,16 +121,15 @@ func (s *DeltaBufferStore) SaveTx(ctx context.Context, tx pgx.Tx, buf *sdkbuilde
 		}
 
 		histBytes := serializeTipHistory(tips)
-		_, err := tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO delta_window_buffers (leaf_key, tip_history, updated_at)
 			VALUES ($1, $2, NOW())
 			ON CONFLICT (leaf_key) DO UPDATE SET
 				tip_history = EXCLUDED.tip_history,
 				updated_at = NOW()`,
 			key[:], histBytes,
-		)
-		if err != nil {
-			return fmt.Errorf("builder/delta_buffer: upsert: %w", err)
+		); err != nil {
+			return fmt.Errorf("builder/delta_buffer: upsert %x: %w", key[:8], err)
 		}
 	}
 
