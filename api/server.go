@@ -154,6 +154,16 @@ func (s *Server) ListenAndServe() error {
 	return nil
 }
 
+// Serve starts the HTTP server on the given listener. Used by integration
+// tests to start on a random port.
+func (s *Server) Serve(ln net.Listener) error {
+	s.logger.Info("HTTP server starting", "addr", ln.Addr().String())
+	if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+		return fmt.Errorf("api/server: %w", err)
+	}
+	return nil
+}
+
 // Shutdown gracefully shuts down the server.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.ready.Store(false)
