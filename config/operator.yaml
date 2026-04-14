@@ -1,0 +1,86 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE PATH:
+#     config/operator.yaml
+#
+# DESCRIPTION:
+#     Full operator configuration schema. All values shown are production
+#     defaults. Override with environment variables: ORTHOLOG_<SECTION>_<KEY>.
+#
+# KEY ARCHITECTURAL DECISIONS:
+#     - Single YAML file: all config in one place, no scattered env vars
+#     - ENV override pattern: ORTHOLOG_POSTGRES_DSN overrides postgres.dsn
+#     - Secrets (DSN, keys) should be injected via env, not stored in file
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Identity
+operator:
+  log_did: "did:ortholog:operator:001"
+  operator_did: "did:ortholog:operator:001:signer"
+
+# Postgres connection
+postgres:
+  dsn: "postgres://ortholog:ortholog@localhost:5432/ortholog?sslmode=disable"
+  max_conns: 20
+  min_conns: 5
+  max_conn_lifetime: "30m"
+  max_conn_idle_time: "5m"
+
+# HTTP server
+server:
+  addr: ":8080"
+  read_timeout: "30s"
+  write_timeout: "60s"
+  shutdown_timeout: "30s"
+  max_entry_size: 1048576  # 1MB (SDK-D11)
+
+# Builder loop
+builder:
+  batch_size: 1000
+  poll_interval: "100ms"
+  delta_window_size: 10
+
+# Admission
+admission:
+  initial_difficulty: 16
+  min_difficulty: 8
+  max_difficulty: 24
+  low_threshold: 100       # Queue depth below → decrease difficulty
+  high_threshold: 10000    # Queue depth above → increase difficulty
+  adjust_interval: "30s"
+  hash_function: "sha256"  # sha256 or argon2id
+
+# Tessera integration
+tessera:
+  base_url: "http://localhost:2024"
+  timeout: "30s"
+  tile_cache_size: 10000
+
+# Witness configuration
+witness:
+  endpoints:
+    - "http://witness-1:8081"
+    - "http://witness-2:8081"
+    - "http://witness-3:8081"
+  quorum_k: 2
+  per_witness_timeout: "30s"
+  scheme_tag: 1            # 1=ECDSA, 2=BLS
+
+# Equivocation monitor
+equivocation:
+  peer_endpoints: []       # Endpoints of peer operators/mirrors
+  poll_interval: "5m"
+
+# Anchor publisher
+anchor:
+  enabled: false
+  interval: "1h"
+  sources: []              # [{log_did: "", endpoint_url: ""}]
+
+# SMT cache warming
+smt:
+  warm_top_levels: 32      # Preload this many levels on startup
+
+# Logging
+logging:
+  level: "info"            # debug, info, warn, error
+  format: "json"           # json or text
