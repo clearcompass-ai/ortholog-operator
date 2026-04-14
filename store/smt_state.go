@@ -1,28 +1,22 @@
 /*
-FILE PATH:
-    store/smt_state.go
+FILE PATH: store/smt_state.go
 
-DESCRIPTION:
-    Postgres-backed implementations of sdk LeafStore and NodeCache interfaces.
-    The SMT builder writes leaf mutations here; the proof generator reads them.
+Postgres-backed implementations of sdk smt.LeafStore and sdk smt.NodeCache.
 
 KEY ARCHITECTURAL DECISIONS:
-    - PostgresLeafStore: direct Get/Set/Delete against smt_leaves table.
-      No in-memory caching at this layer — NodeCache handles hot paths.
-    - PostgresNodeCache: write-through to both Postgres (smt_nodes) and
-      an in-memory LRU. Top N levels warmed on startup for sub-millisecond
-      root computation.
-    - Serialization of LogPosition into BYTEA: length-prefixed DID + uint64
-      (same as sdk canonical serialization for consistency).
+  - PostgresLeafStore: supports both direct writes (pool) and transactional
+    writes (via SetTx for atomic builder commits). The builder loop uses
+    SetTx within its atomic commit transaction.
+  - PostgresNodeCache: write-through to both Postgres (smt_nodes) and an
+    in-memory LRU. Top N levels warmed on startup. Depth tracked correctly
+    per node for selective warming.
+  - LogPosition serialization: length-prefixed DID + uint64, matching SDK
+    canonical serialization.
 
-OVERVIEW:
-    PostgresLeafStore implements sdk smt.LeafStore (Get/Set/Delete/Count).
-    PostgresNodeCache implements sdk smt.NodeCache (Get/Set) with LRU.
-    WarmCache preloads top N levels from Postgres into LRU on startup.
-
-KEY DEPENDENCIES:
-    - github.com/clearcompass-ai/ortholog-sdk/types: SMTLeaf, LogPosition
-    - github.com/clearcompass-ai/ortholog-sdk/core/smt: LeafStore, NodeCache
+INVARIANTS:
+  - After builder atomic commit, smt_leaves and smt_nodes are consistent.
+  - WarmCache only loads nodes at depth <= topLevels (not all nodes).
+  - LRU eviction preserves recently accessed nodes, not random eviction.
 */
 package store
 
@@ -39,11 +33,12 @@ import (
 	"github.com/clearcompass-ai/ortholog-sdk/types"
 )
 
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 // 1) PostgresLeafStore — implements sdk smt.LeafStore
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 
 // PostgresLeafStore persists SMT leaves in Postgres.
+// Supports transactional writes for atomic builder commits via SetTx/DeleteTx.
 type PostgresLeafStore struct {
 	db *pgxpool.Pool
 }
@@ -53,9 +48,11 @@ func NewPostgresLeafStore(db *pgxpool.Pool) *PostgresLeafStore {
 	return &PostgresLeafStore{db: db}
 }
 
+// Get reads a leaf by key. Returns nil if not found.
 func (s *PostgresLeafStore) Get(key [32]byte) (*types.SMTLeaf, error) {
+	ctx := context.TODO()
 	var originTipBytes, authorityTipBytes []byte
-	err := s.db.QueryRow(context.Background(),
+	err := s.db.QueryRow(ctx,
 		"SELECT origin_tip, authority_tip FROM smt_leaves WHERE leaf_key = $1",
 		key[:],
 	).Scan(&originTipBytes, &authorityTipBytes)
@@ -67,11 +64,11 @@ func (s *PostgresLeafStore) Get(key [32]byte) (*types.SMTLeaf, error) {
 		return nil, fmt.Errorf("store/smt: get leaf: %w", err)
 	}
 
-	originTip, err := deserializeLogPosition(originTipBytes)
+	originTip, err := DeserializeLogPosition(originTipBytes)
 	if err != nil {
 		return nil, fmt.Errorf("store/smt: decode origin_tip: %w", err)
 	}
-	authorityTip, err := deserializeLogPosition(authorityTipBytes)
+	authorityTip, err := DeserializeLogPosition(authorityTipBytes)
 	if err != nil {
 		return nil, fmt.Errorf("store/smt: decode authority_tip: %w", err)
 	}
@@ -79,11 +76,23 @@ func (s *PostgresLeafStore) Get(key [32]byte) (*types.SMTLeaf, error) {
 	return &types.SMTLeaf{Key: key, OriginTip: originTip, AuthorityTip: authorityTip}, nil
 }
 
+// Set writes a leaf using the connection pool (non-transactional).
+// Used during non-critical paths. Builder uses SetTx for atomic commits.
 func (s *PostgresLeafStore) Set(key [32]byte, leaf types.SMTLeaf) error {
-	originBytes := serializeLogPosition(leaf.OriginTip)
-	authBytes := serializeLogPosition(leaf.AuthorityTip)
+	ctx := context.TODO()
+	return s.upsertLeaf(ctx, s.db, key, leaf)
+}
 
-	_, err := s.db.Exec(context.Background(), `
+// SetTx writes a leaf within a transaction (for atomic builder commit).
+func (s *PostgresLeafStore) SetTx(ctx context.Context, tx pgx.Tx, key [32]byte, leaf types.SMTLeaf) error {
+	return s.upsertLeafTx(ctx, tx, key, leaf)
+}
+
+func (s *PostgresLeafStore) upsertLeaf(ctx context.Context, db interface{ Exec(ctx context.Context, sql string, args ...any) (interface{ RowsAffected() int64 }, error) }, key [32]byte, leaf types.SMTLeaf) error {
+	originBytes := SerializeLogPosition(leaf.OriginTip)
+	authBytes := SerializeLogPosition(leaf.AuthorityTip)
+
+	_, err := s.db.Exec(ctx, `
 		INSERT INTO smt_leaves (leaf_key, origin_tip, authority_tip, updated_at)
 		VALUES ($1, $2, $3, NOW())
 		ON CONFLICT (leaf_key) DO UPDATE SET
@@ -98,57 +107,96 @@ func (s *PostgresLeafStore) Set(key [32]byte, leaf types.SMTLeaf) error {
 	return nil
 }
 
-func (s *PostgresLeafStore) Delete(key [32]byte) error {
-	_, err := s.db.Exec(context.Background(),
-		"DELETE FROM smt_leaves WHERE leaf_key = $1", key[:],
+func (s *PostgresLeafStore) upsertLeafTx(ctx context.Context, tx pgx.Tx, key [32]byte, leaf types.SMTLeaf) error {
+	originBytes := SerializeLogPosition(leaf.OriginTip)
+	authBytes := SerializeLogPosition(leaf.AuthorityTip)
+
+	_, err := tx.Exec(ctx, `
+		INSERT INTO smt_leaves (leaf_key, origin_tip, authority_tip, updated_at)
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (leaf_key) DO UPDATE SET
+			origin_tip = EXCLUDED.origin_tip,
+			authority_tip = EXCLUDED.authority_tip,
+			updated_at = NOW()`,
+		key[:], originBytes, authBytes,
 	)
+	if err != nil {
+		return fmt.Errorf("store/smt: set leaf tx: %w", err)
+	}
+	return nil
+}
+
+// Delete removes a leaf.
+func (s *PostgresLeafStore) Delete(key [32]byte) error {
+	ctx := context.TODO()
+	_, err := s.db.Exec(ctx, "DELETE FROM smt_leaves WHERE leaf_key = $1", key[:])
 	if err != nil {
 		return fmt.Errorf("store/smt: delete leaf: %w", err)
 	}
 	return nil
 }
 
+// Count returns the total number of SMT leaves.
 func (s *PostgresLeafStore) Count() (int, error) {
+	ctx := context.TODO()
 	var count int
-	err := s.db.QueryRow(context.Background(),
-		"SELECT COUNT(*) FROM smt_leaves",
-	).Scan(&count)
+	err := s.db.QueryRow(ctx, "SELECT COUNT(*) FROM smt_leaves").Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("store/smt: count leaves: %w", err)
 	}
 	return count, nil
 }
 
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 // 2) PostgresNodeCache — write-through Postgres + in-memory LRU
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 
 // PostgresNodeCache implements sdk smt.NodeCache with write-through persistence.
+// Uses a simple map with access tracking for LRU eviction.
 type PostgresNodeCache struct {
-	db  *pgxpool.Pool
-	mu  sync.RWMutex
-	lru map[[32]byte][]byte // In-memory LRU (simple map; production: proper LRU eviction)
+	db       *pgxpool.Pool
+	mu       sync.RWMutex
+	cache    map[[32]byte]cacheEntry
+	access   map[[32]byte]int64 // access counter for LRU
+	counter  int64
+	maxSize  int
 }
 
-// NewPostgresNodeCache creates a node cache.
-func NewPostgresNodeCache(db *pgxpool.Pool) *PostgresNodeCache {
+type cacheEntry struct {
+	hash  []byte
+	depth int
+}
+
+// NewPostgresNodeCache creates a node cache with the given LRU capacity.
+func NewPostgresNodeCache(db *pgxpool.Pool, maxSize int) *PostgresNodeCache {
+	if maxSize < 1024 {
+		maxSize = 100000
+	}
 	return &PostgresNodeCache{
-		db:  db,
-		lru: make(map[[32]byte][]byte, 1<<16), // Pre-allocate for top levels.
+		db:      db,
+		cache:   make(map[[32]byte]cacheEntry, maxSize),
+		access:  make(map[[32]byte]int64, maxSize),
+		maxSize: maxSize,
 	}
 }
 
+// Get reads a node hash from cache, falling back to Postgres.
 func (c *PostgresNodeCache) Get(key [32]byte) ([]byte, bool) {
 	c.mu.RLock()
-	v, ok := c.lru[key]
+	entry, ok := c.cache[key]
 	c.mu.RUnlock()
 	if ok {
-		return v, true
+		c.mu.Lock()
+		c.counter++
+		c.access[key] = c.counter
+		c.mu.Unlock()
+		return entry.hash, true
 	}
 
 	// Cache miss — fetch from Postgres.
+	ctx := context.TODO()
 	var hash []byte
-	err := c.db.QueryRow(context.Background(),
+	err := c.db.QueryRow(ctx,
 		"SELECT hash FROM smt_nodes WHERE path_key = $1", key[:],
 	).Scan(&hash)
 	if err != nil {
@@ -156,58 +204,131 @@ func (c *PostgresNodeCache) Get(key [32]byte) ([]byte, bool) {
 	}
 
 	c.mu.Lock()
-	c.lru[key] = hash
+	c.counter++
+	c.cache[key] = cacheEntry{hash: hash, depth: 0}
+	c.access[key] = c.counter
 	c.mu.Unlock()
 	return hash, true
 }
 
+// Set writes a node to cache and Postgres (write-through).
 func (c *PostgresNodeCache) Set(key [32]byte, value []byte) {
+	c.SetWithDepth(key, value, 0)
+}
+
+// SetWithDepth writes a node with its tree depth for selective warming.
+func (c *PostgresNodeCache) SetWithDepth(key [32]byte, value []byte, depth int) {
 	c.mu.Lock()
-	c.lru[key] = value
+	if len(c.cache) >= c.maxSize {
+		c.evictLRU()
+	}
+	c.counter++
+	c.cache[key] = cacheEntry{hash: value, depth: depth}
+	c.access[key] = c.counter
 	c.mu.Unlock()
 
-	// Write-through to Postgres (best-effort; cache is authoritative during batch).
-	_, _ = c.db.Exec(context.Background(), `
+	// Write-through to Postgres.
+	ctx := context.TODO()
+	_, _ = c.db.Exec(ctx, `
 		INSERT INTO smt_nodes (path_key, hash, depth, updated_at)
-		VALUES ($1, $2, 0, NOW())
-		ON CONFLICT (path_key) DO UPDATE SET hash = EXCLUDED.hash, updated_at = NOW()`,
-		key[:], value,
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (path_key) DO UPDATE SET
+			hash = EXCLUDED.hash,
+			depth = EXCLUDED.depth,
+			updated_at = NOW()`,
+		key[:], value, depth,
 	)
 }
 
-// WarmCache preloads the top N levels of SMT nodes into the LRU.
+// SetWithDepthTx writes a node within a transaction (for atomic builder commit).
+func (c *PostgresNodeCache) SetWithDepthTx(ctx context.Context, tx pgx.Tx, key [32]byte, value []byte, depth int) error {
+	c.mu.Lock()
+	if len(c.cache) >= c.maxSize {
+		c.evictLRU()
+	}
+	c.counter++
+	c.cache[key] = cacheEntry{hash: value, depth: depth}
+	c.access[key] = c.counter
+	c.mu.Unlock()
+
+	_, err := tx.Exec(ctx, `
+		INSERT INTO smt_nodes (path_key, hash, depth, updated_at)
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (path_key) DO UPDATE SET
+			hash = EXCLUDED.hash,
+			depth = EXCLUDED.depth,
+			updated_at = NOW()`,
+		key[:], value, depth,
+	)
+	return err
+}
+
+// evictLRU removes the least recently accessed 25% of entries. Caller holds mu.
+func (c *PostgresNodeCache) evictLRU() {
+	target := c.maxSize * 3 / 4
+	if len(c.cache) <= target {
+		return
+	}
+	// Find the access threshold: remove entries with lowest access counters.
+	// Simple approach: remove entries until below target.
+	type kv struct {
+		key    [32]byte
+		access int64
+	}
+	entries := make([]kv, 0, len(c.cache))
+	for k := range c.cache {
+		entries = append(entries, kv{key: k, access: c.access[k]})
+	}
+	// Sort by access time ascending (oldest first).
+	for i := 0; i < len(entries)-1; i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if entries[j].access < entries[i].access {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
+	toRemove := len(c.cache) - target
+	for i := 0; i < toRemove && i < len(entries); i++ {
+		delete(c.cache, entries[i].key)
+		delete(c.access, entries[i].key)
+	}
+}
+
+// WarmCache preloads top N levels of SMT nodes into the LRU.
 func (c *PostgresNodeCache) WarmCache(ctx context.Context, topLevels int) error {
 	rows, err := c.db.Query(ctx,
-		"SELECT path_key, hash FROM smt_nodes WHERE depth <= $1", topLevels,
+		"SELECT path_key, hash, depth FROM smt_nodes WHERE depth <= $1", topLevels,
 	)
 	if err != nil {
 		return fmt.Errorf("store/smt: warm cache: %w", err)
 	}
 	defer rows.Close()
 
-	count := 0
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for rows.Next() {
 		var keyBytes, hash []byte
-		if err := rows.Scan(&keyBytes, &hash); err != nil {
+		var depth int
+		if err := rows.Scan(&keyBytes, &hash, &depth); err != nil {
 			return fmt.Errorf("store/smt: warm cache scan: %w", err)
 		}
 		if len(keyBytes) == 32 {
 			var key [32]byte
 			copy(key[:], keyBytes)
-			c.lru[key] = hash
-			count++
+			c.counter++
+			c.cache[key] = cacheEntry{hash: hash, depth: depth}
+			c.access[key] = c.counter
 		}
 	}
 	return rows.Err()
 }
 
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 // 3) LogPosition serialization for BYTEA columns
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 
-func serializeLogPosition(pos types.LogPosition) []byte {
+// SerializeLogPosition encodes a LogPosition as length-prefixed DID + uint64.
+func SerializeLogPosition(pos types.LogPosition) []byte {
 	did := []byte(pos.LogDID)
 	buf := make([]byte, 2+len(did)+8)
 	binary.BigEndian.PutUint16(buf[0:2], uint16(len(did)))
@@ -216,7 +337,8 @@ func serializeLogPosition(pos types.LogPosition) []byte {
 	return buf
 }
 
-func deserializeLogPosition(data []byte) (types.LogPosition, error) {
+// DeserializeLogPosition decodes a BYTEA into a LogPosition.
+func DeserializeLogPosition(data []byte) (types.LogPosition, error) {
 	if len(data) < 10 {
 		return types.LogPosition{}, fmt.Errorf("LogPosition bytes too short: %d", len(data))
 	}

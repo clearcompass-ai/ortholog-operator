@@ -1,40 +1,30 @@
 /*
-FILE PATH:
-    tessera/client.go
+FILE PATH: tessera/client.go
 
-DESCRIPTION:
-    Tessera API client. Appends leaves to the transparency log's Merkle
-    tree and retrieves tree heads. This is the bridge between the operator's
-    entry storage and the append-only Merkle tree.
+Tessera low-level API client. Communicates with the Tessera transparency log
+to append leaves and retrieve tree heads. Internal to the tessera package —
+the builder interacts only with TesseraAdapter (proof_adapter.go).
 
 KEY ARCHITECTURAL DECISIONS:
-    - HTTP client to Tessera service (separate process/container)
-    - Append is idempotent: same leaf hash → same position
-    - TreeHead returns Tessera's view of the tree (may lag operator)
-
-OVERVIEW:
-    AppendLeaf: sends canonical hash to Tessera for Merkle tree inclusion.
-    TreeHead: retrieves current Merkle tree head from Tessera.
-
-KEY DEPENDENCIES:
-    - net/http: HTTP client
+  - HTTP client to Tessera service (separate process/container).
+  - Append is idempotent: same leaf hash → same position.
+  - TreeHead returns root hash + tree size.
 */
 package tessera
 
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"time"
-)
 
-// -------------------------------------------------------------------------------------------------
-// 1) Client
-// -------------------------------------------------------------------------------------------------
+	"github.com/clearcompass-ai/ortholog-sdk/types"
+)
 
 // ClientConfig configures the Tessera client.
 type ClientConfig struct {
@@ -58,9 +48,11 @@ func NewClient(cfg ClientConfig, logger *slog.Logger) *Client {
 	}
 }
 
-// AppendLeaf submits a leaf hash to the Merkle tree. Returns the assigned index.
+// AppendLeaf submits a leaf hash to the Merkle tree. Returns assigned index.
 func (c *Client) AppendLeaf(ctx context.Context, leafHash [32]byte) (uint64, error) {
-	body, _ := json.Marshal(map[string]any{"leaf_hash": leafHash})
+	body, _ := json.Marshal(map[string]string{
+		"leaf_hash": hex.EncodeToString(leafHash[:]),
+	})
 	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v1/add", bytes.NewReader(body))
 	if err != nil {
 		return 0, fmt.Errorf("tessera/client: build request: %w", err)
@@ -88,24 +80,31 @@ func (c *Client) AppendLeaf(ctx context.Context, leafHash [32]byte) (uint64, err
 }
 
 // TreeHead retrieves the current Merkle tree head from Tessera.
-func (c *Client) TreeHead(ctx context.Context) (uint64, [32]byte, error) {
+func (c *Client) TreeHead(ctx context.Context) (types.TreeHead, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/api/v1/tree/head", nil)
 	if err != nil {
-		return 0, [32]byte{}, fmt.Errorf("tessera/client: build request: %w", err)
+		return types.TreeHead{}, fmt.Errorf("tessera/client: build request: %w", err)
 	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return 0, [32]byte{}, fmt.Errorf("tessera/client: request: %w", err)
+		return types.TreeHead{}, fmt.Errorf("tessera/client: request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	var result struct {
-		TreeSize uint64   `json:"tree_size"`
-		RootHash [32]byte `json:"root_hash"`
+	var raw struct {
+		TreeSize uint64 `json:"tree_size"`
+		RootHash string `json:"root_hash"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return 0, [32]byte{}, fmt.Errorf("tessera/client: decode: %w", err)
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return types.TreeHead{}, fmt.Errorf("tessera/client: decode: %w", err)
 	}
-	return result.TreeSize, result.RootHash, nil
+
+	var head types.TreeHead
+	head.TreeSize = raw.TreeSize
+	rootBytes, err := hex.DecodeString(raw.RootHash)
+	if err == nil && len(rootBytes) == 32 {
+		copy(head.RootHash[:], rootBytes)
+	}
+	return head, nil
 }

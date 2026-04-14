@@ -38,6 +38,8 @@ builder:
   batch_size: 1000
   poll_interval: "100ms"
   delta_window_size: 10
+  commitment_interval: 1000    # entries between commitments
+  commitment_max_age: "1h"     # max time between commitments
 
 # Admission
 admission:
@@ -79,6 +81,7 @@ anchor:
 # SMT cache warming
 smt:
   warm_top_levels: 32      # Preload this many levels on startup
+  cache_size: 100000       # LRU node count
 
 # Logging
 logging:

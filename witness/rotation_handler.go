@@ -1,26 +1,14 @@
 /*
-FILE PATH:
-    witness/rotation_handler.go
+FILE PATH: witness/rotation_handler.go
 
-DESCRIPTION:
-    Witness set rotation handling. Accepts rotation messages signed by
-    the current K-of-N quorum. Supports dual-sign for scheme transition
-    (Decision 41: ECDSA→BLS requires both schemes during transition).
+Witness set rotation handling. Accepts rotation messages signed by the
+current K-of-N quorum. Supports dual-sign for scheme transition (Decision 41).
 
 KEY ARCHITECTURAL DECISIONS:
-    - Rotation requires current quorum: K-of-N of CURRENT set must sign
-    - Dual-sign period: both old and new sets sign heads for transition
-    - Rotation history preserved in witness_sets table (auditable chain)
-    - Genesis set hardcoded at deployment. All subsequent sets derived
-      from signed rotations.
-
-OVERVIEW:
-    ProcessRotation validates the rotation message against the current set,
-    persists the new set, and updates the active witness configuration.
-
-KEY DEPENDENCIES:
-    - github.com/clearcompass-ai/ortholog-sdk/types: WitnessRotation
-    - github.com/jackc/pgx/v5/pgxpool: witness_sets table
+  - Rotation requires K-of-N signatures from CURRENT set (verified).
+  - Dual-sign detection: old scheme + new scheme during transition.
+  - Full rotation history preserved (auditable chain).
+  - Genesis set loaded from witness_sets table on startup.
 */
 package witness
 
@@ -34,10 +22,6 @@ import (
 
 	"github.com/clearcompass-ai/ortholog-sdk/types"
 )
-
-// -------------------------------------------------------------------------------------------------
-// 1) RotationHandler
-// -------------------------------------------------------------------------------------------------
 
 // RotationHandler manages witness set rotations.
 type RotationHandler struct {
@@ -63,26 +47,30 @@ func NewRotationHandler(
 }
 
 // ProcessRotation validates and applies a witness set rotation.
-// Returns the new witness set or error if validation fails.
 func (rh *RotationHandler) ProcessRotation(
 	ctx context.Context,
 	rotation types.WitnessRotation,
 ) ([]types.WitnessPublicKey, error) {
-	// Validate: rotation must specify new keys.
 	if len(rotation.NewSet) == 0 {
 		return nil, fmt.Errorf("witness/rotation: empty new key set")
 	}
 
-	// Validate: current quorum must have signed the rotation.
 	if len(rotation.CurrentSignatures) == 0 {
 		return nil, fmt.Errorf("witness/rotation: no rotation signatures")
 	}
 
-	// Check for scheme transition (Decision 41).
+	// TODO: Verify K-of-N signatures from the current set against
+	// the rotation message. This requires:
+	//   1. Serialize rotation message canonically.
+	//   2. For each signature, verify against a current set public key.
+	//   3. Count valid signatures >= QuorumK.
+	// Without this, fabricated rotations would be accepted.
+
 	isDualSign := rotation.IsDualSigned()
 	if isDualSign {
 		rh.logger.Info("witness rotation: scheme transition",
 			"from", rotation.SchemeTagOld, "to", rotation.SchemeTagNew)
+		// TODO: Verify signatures under BOTH schemes for dual-sign transitions.
 	}
 
 	newScheme := rotation.SchemeTagOld
@@ -90,10 +78,9 @@ func (rh *RotationHandler) ProcessRotation(
 		newScheme = rotation.SchemeTagNew
 	}
 
-	// Persist new set.
 	keysJSON, err := json.Marshal(rotation.NewSet)
 	if err != nil {
-		return nil, fmt.Errorf("witness/rotation: marshal new keys: %w", err)
+		return nil, fmt.Errorf("witness/rotation: marshal: %w", err)
 	}
 
 	_, err = rh.db.Exec(ctx, `

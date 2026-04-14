@@ -1,23 +1,14 @@
 /*
-FILE PATH:
-    tessera/tile_reader.go
+FILE PATH: tessera/tile_reader.go
 
-DESCRIPTION:
-    Tile-based storage backend for Merkle tree data. Supports GCS, S3,
-    and local filesystem. Read-through LRU cache minimizes backend calls.
+Tile-based storage backend for Merkle tree data. Read-through LRU cache
+minimizes backend calls. Tiles are immutable once written (append-only tree).
 
 KEY ARCHITECTURAL DECISIONS:
-    - Backend interface: swappable for GCS/S3/local without code changes
-    - LRU cache: tiles are immutable once written (append-only tree)
-    - Tile path convention: "tiles/{level}/{offset}" (Tessera standard)
-    - No write path: Tessera manages tile writes. Operator only reads.
-
-OVERVIEW:
-    TileReader wraps a TileBackend with an LRU cache. ReadTile checks
-    cache first, falls back to backend, and caches the result.
-
-KEY DEPENDENCIES:
-    - io, net/http: HTTP-based backends (GCS, S3 presigned URLs)
+  - Backend interface: swappable for GCS/S3/local.
+  - LRU with access-counter eviction (not random).
+  - Tile path convention: "tiles/{level}/{offset}" (Tessera standard).
+  - No write path: Tessera manages writes. Operator only reads.
 */
 package tessera
 
@@ -29,26 +20,23 @@ import (
 	"sync"
 )
 
-// -------------------------------------------------------------------------------------------------
-// 1) TileBackend Interface
-// -------------------------------------------------------------------------------------------------
-
 // TileBackend reads Merkle tree tiles from a storage backend.
 type TileBackend interface {
-	// ReadTile reads a tile at the given level and offset.
 	ReadTile(ctx context.Context, level, offset uint64) ([]byte, error)
 }
-
-// -------------------------------------------------------------------------------------------------
-// 2) TileReader — cached tile access
-// -------------------------------------------------------------------------------------------------
 
 // TileReader wraps a TileBackend with an in-memory LRU cache.
 type TileReader struct {
 	backend TileBackend
 	mu      sync.RWMutex
-	cache   map[string][]byte
+	cache   map[string]tileEntry
+	counter int64
 	maxSize int
+}
+
+type tileEntry struct {
+	data   []byte
+	access int64
 }
 
 // NewTileReader creates a cached tile reader.
@@ -58,7 +46,7 @@ func NewTileReader(backend TileBackend, cacheSize int) *TileReader {
 	}
 	return &TileReader{
 		backend: backend,
-		cache:   make(map[string][]byte, cacheSize),
+		cache:   make(map[string]tileEntry, cacheSize),
 		maxSize: cacheSize,
 	}
 }
@@ -68,10 +56,15 @@ func (tr *TileReader) ReadTile(ctx context.Context, level, offset uint64) ([]byt
 	key := fmt.Sprintf("%d/%d", level, offset)
 
 	tr.mu.RLock()
-	data, ok := tr.cache[key]
+	entry, ok := tr.cache[key]
 	tr.mu.RUnlock()
 	if ok {
-		return data, nil
+		tr.mu.Lock()
+		tr.counter++
+		entry.access = tr.counter
+		tr.cache[key] = entry
+		tr.mu.Unlock()
+		return entry.data, nil
 	}
 
 	data, err := tr.backend.ReadTile(ctx, level, offset)
@@ -81,25 +74,46 @@ func (tr *TileReader) ReadTile(ctx context.Context, level, offset uint64) ([]byt
 
 	tr.mu.Lock()
 	if len(tr.cache) >= tr.maxSize {
-		// Simple eviction: clear half the cache. Production: proper LRU.
-		for k := range tr.cache {
-			delete(tr.cache, k)
-			if len(tr.cache) < tr.maxSize/2 {
-				break
-			}
-		}
+		tr.evictLRU()
 	}
-	tr.cache[key] = data
+	tr.counter++
+	tr.cache[key] = tileEntry{data: data, access: tr.counter}
 	tr.mu.Unlock()
 
 	return data, nil
 }
 
-// -------------------------------------------------------------------------------------------------
-// 3) HTTP Tile Backend — GCS/S3 via presigned or public URLs
-// -------------------------------------------------------------------------------------------------
+// evictLRU removes the least recently accessed 25% of entries. Caller holds mu.
+func (tr *TileReader) evictLRU() {
+	target := tr.maxSize * 3 / 4
+	if len(tr.cache) <= target {
+		return
+	}
+	type kv struct {
+		key    string
+		access int64
+	}
+	entries := make([]kv, 0, len(tr.cache))
+	for k, v := range tr.cache {
+		entries = append(entries, kv{key: k, access: v.access})
+	}
+	// Sort by access ascending.
+	for i := 0; i < len(entries)-1; i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if entries[j].access < entries[i].access {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
+	toRemove := len(tr.cache) - target
+	for i := 0; i < toRemove && i < len(entries); i++ {
+		delete(tr.cache, entries[i].key)
+	}
+}
 
-// HTTPTileBackend reads tiles from an HTTP endpoint.
+// ─── HTTP Tile Backend ─────────────────────────────────────────────────────
+
+// HTTPTileBackend reads tiles from an HTTP endpoint (GCS/S3 public URLs).
 type HTTPTileBackend struct {
 	baseURL string
 	client  *http.Client
@@ -130,30 +144,9 @@ func (b *HTTPTileBackend) ReadTile(ctx context.Context, level, offset uint64) ([
 		return nil, fmt.Errorf("tessera/tile: HTTP %d for %s", resp.StatusCode, url)
 	}
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB max tile.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, fmt.Errorf("tessera/tile: read: %w", err)
 	}
 	return data, nil
-}
-
-// -------------------------------------------------------------------------------------------------
-// 4) Local Filesystem Backend — for development/testing
-// -------------------------------------------------------------------------------------------------
-
-// LocalTileBackend reads tiles from the local filesystem.
-type LocalTileBackend struct {
-	basePath string
-}
-
-// NewLocalTileBackend creates a local tile backend.
-func NewLocalTileBackend(basePath string) *LocalTileBackend {
-	return &LocalTileBackend{basePath: basePath}
-}
-
-func (b *LocalTileBackend) ReadTile(_ context.Context, level, offset uint64) ([]byte, error) {
-	path := fmt.Sprintf("%s/tiles/%d/%d", b.basePath, level, offset)
-	// In production: os.ReadFile(path)
-	_ = path
-	return nil, fmt.Errorf("tessera/tile: local backend not implemented (use HTTP for now)")
 }

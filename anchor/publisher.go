@@ -1,31 +1,20 @@
 /*
-FILE PATH:
-    anchor/publisher.go
+FILE PATH: anchor/publisher.go
 
-DESCRIPTION:
-    Periodic anchor entry publisher. Creates commentary entries containing
-    tree head references from remote logs, anchoring them to the local log.
-    Decision 44: anchors are standard entries, no special handling.
+Periodic anchor entry publisher. Creates commentary entries containing tree
+head references, submitting them to the parent log's admission API.
+Decision 44: anchors are standard entries, no special handling.
 
 KEY ARCHITECTURAL DECISIONS:
-    - Commentary entries: Target_Root=null, Authority_Path=null → zero SMT
-      impact (Fix 1 discriminator)
-    - Domain Payload contains: source_log_did, tree_head_ref (hash of
-      remote tree head), tree_size, timestamp
-    - Configurable interval: default 1 hour
-    - Anchor sources configurable per deployment (hub-spoke, mesh, etc.)
-
-OVERVIEW:
-    Run(ctx) loops at configured interval:
-      For each anchor source: fetch remote tree head, build commentary entry,
-      submit through local admission pipeline.
-
-KEY DEPENDENCIES:
-    - github.com/clearcompass-ai/ortholog-sdk/core/envelope: NewEntry
+  - Commentary entries: Target_Root=null, Authority_Path=null → zero SMT impact.
+  - Domain Payload: source_log_did, tree_head_ref (SHA-256), tree_size, timestamp.
+  - Submits to PARENT log (not local) via Mode A write credits.
+  - Configurable interval: default 1 hour.
 */
 package anchor
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -36,43 +25,53 @@ import (
 	"time"
 
 	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
+	"github.com/clearcompass-ai/ortholog-sdk/types"
 )
-
-// -------------------------------------------------------------------------------------------------
-// 1) Configuration
-// -------------------------------------------------------------------------------------------------
 
 // PublisherConfig configures the anchor publisher.
 type PublisherConfig struct {
 	OperatorDID    string
 	Interval       time.Duration
 	AnchorSources  []AnchorSource
-	LocalSubmitURL string // POST /v1/entries on self
 }
 
 // AnchorSource is a remote log to anchor.
 type AnchorSource struct {
 	LogDID      string
-	EndpointURL string // GET /v1/tree/head
+	EndpointURL string // Base URL with /v1/tree/head
 }
 
-// -------------------------------------------------------------------------------------------------
-// 2) Publisher
-// -------------------------------------------------------------------------------------------------
+// MerkleHeadProvider returns the current Merkle tree head.
+type MerkleHeadProvider interface {
+	Head() (types.TreeHead, error)
+}
 
 // Publisher periodically anchors remote tree heads to the local log.
 type Publisher struct {
 	cfg    PublisherConfig
-	client *http.Client
-	logger *slog.Logger
+	merkle MerkleHeadProvider
+	// submitFn submits a signed entry to the local admission pipeline.
+	submitFn func(entry *envelope.Entry) error
+	client   *http.Client
+	logger   *slog.Logger
 }
 
 // NewPublisher creates an anchor publisher.
-func NewPublisher(cfg PublisherConfig, logger *slog.Logger) *Publisher {
+func NewPublisher(
+	cfg PublisherConfig,
+	merkle MerkleHeadProvider,
+	submitFn func(entry *envelope.Entry) error,
+	logger *slog.Logger,
+) *Publisher {
+	if cfg.Interval <= 0 {
+		cfg.Interval = 1 * time.Hour
+	}
 	return &Publisher{
-		cfg:    cfg,
-		client: &http.Client{Timeout: 30 * time.Second},
-		logger: logger,
+		cfg:      cfg,
+		merkle:   merkle,
+		submitFn: submitFn,
+		client:   &http.Client{Timeout: 30 * time.Second},
+		logger:   logger,
 	}
 }
 
@@ -100,9 +99,7 @@ func (p *Publisher) publishAll(ctx context.Context) {
 	for _, source := range p.cfg.AnchorSources {
 		if err := p.publishOne(ctx, source); err != nil {
 			p.logger.Warn("anchor: publish failed",
-				"source_log", source.LogDID,
-				"error", err,
-			)
+				"source_log", source.LogDID, "error", err)
 		}
 	}
 }
@@ -143,10 +140,38 @@ func (p *Publisher) publishOne(ctx context.Context, source AnchorSource) error {
 		return fmt.Errorf("build entry: %w", err)
 	}
 
-	_ = entry // In production: sign and submit via local admission pipeline.
+	// Submit through local admission pipeline.
+	if p.submitFn != nil {
+		if err := p.submitFn(entry); err != nil {
+			return fmt.Errorf("submit anchor: %w", err)
+		}
+	}
+
 	p.logger.Info("anchor published",
 		"source_log", source.LogDID,
 		"tree_head_ref", fmt.Sprintf("%x", treeHeadRef[:8]),
 	)
 	return nil
+}
+
+// SubmitViaHTTP creates a submitFn that POSTs signed entry bytes to a URL.
+func SubmitViaHTTP(targetURL string) func(entry *envelope.Entry) error {
+	client := &http.Client{Timeout: 30 * time.Second}
+	return func(entry *envelope.Entry) error {
+		canonical := envelope.Serialize(entry)
+		// In production: sign canonical bytes, append signature envelope.
+		// For now: submit raw canonical (the local operator would need to
+		// accept self-submissions, or use a pre-signed path).
+		resp, err := client.Post(targetURL+"/v1/entries", "application/octet-stream",
+			bytes.NewReader(canonical))
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusAccepted {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+			return fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
+		}
+		return nil
+	}
 }

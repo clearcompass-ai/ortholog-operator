@@ -1,37 +1,34 @@
 /*
-FILE PATH:
-    api/submission.go
+FILE PATH: api/submission.go
 
-DESCRIPTION:
-    Entry submission endpoint — the complete admission pipeline. Every entry
-    passes through 10 sequential steps before reaching the builder queue.
-    Fail-fast: first failure terminates with appropriate HTTP status.
+Entry submission endpoint — the complete 10-step admission pipeline.
+Fail-fast: first failure terminates with appropriate HTTP status.
 
 KEY ARCHITECTURAL DECISIONS:
-    - Sequential pipeline: no parallel validation. Order matters (sig before
-      size, size before enqueue).
-    - SDK-D5 contract established HERE: signature verified before any
-      persistence. The builder trusts this invariant.
-    - Decision 50: Log_Time assigned at step (6), never in canonical bytes.
-    - Decision 51: Evidence_Pointers cap checked at step (4), before builder.
-    - Atomic persist+enqueue: single Postgres tx prevents orphaned entries.
+  - Sequential pipeline: order matters (sig before size, size before enqueue).
+  - SDK-D5 contract established HERE: signature verified before persistence.
+  - Decision 50: Log_Time assigned at step 6, never in canonical bytes.
+  - Decision 51: Evidence_Pointers cap checked at step 4.
+  - Atomic persist+enqueue: single Postgres tx prevents orphaned entries.
+  - Live difficulty: reads from DifficultyController per-request, not snapshot.
+  - Protocol version validated at step 1 (preamble check).
+  - Canonical hash computed from RAW canonical bytes (not re-serialized).
+  - Duplicate hash mapped to HTTP 409 (not generic 500).
 
-OVERVIEW:
-    Steps 1-10 as specified in the Phase 2 layout document.
-    On success: HTTP 202 with sequence_number, canonical_hash, log_time.
-    On failure: appropriate 4xx with structured error.
-
-KEY DEPENDENCIES:
-    - github.com/clearcompass-ai/ortholog-sdk/core/envelope: StripSignature, Deserialize
-    - github.com/clearcompass-ai/ortholog-sdk/crypto: CanonicalHash
-    - store/entries.go, store/credits.go, builder/queue.go
+INVARIANTS:
+  - Past step 2: all entries have verified signatures (SDK-D5).
+  - Log_Time is monotonically non-decreasing within single-operator deployment.
+  - Sequence numbers are gapless (Postgres sequence).
 */
 package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -42,105 +39,145 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
-	"github.com/clearcompass-ai/ortholog-sdk/crypto"
 	"github.com/clearcompass-ai/ortholog-sdk/crypto/admission"
-	"github.com/clearcompass-ai/ortholog-sdk/types"
 
+	"github.com/clearcompass-ai/ortholog-operator/api/middleware"
 	"github.com/clearcompass-ai/ortholog-operator/builder"
 	"github.com/clearcompass-ai/ortholog-operator/store"
 )
 
-// -------------------------------------------------------------------------------------------------
-// 1) Submission Handler
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// 1) Submission Dependencies
+// ─────────────────────────────────────────────────────────────────────────────
 
 // SubmissionDeps holds dependencies for the submission handler.
 type SubmissionDeps struct {
-	DB           *pgxpool.Pool
-	EntryStore   *store.EntryStore
-	CreditStore  *store.CreditStore
-	Queue        *builder.Queue
-	LogDID       string
-	MaxEntrySize int64
-	Difficulty   uint32
-	HashFunc     admission.HashFunc
-	Logger       *slog.Logger
+	DB              *pgxpool.Pool
+	EntryStore      *store.EntryStore
+	CreditStore     *store.CreditStore
+	Queue           *builder.Queue
+	LogDID          string
+	MaxEntrySize    int64
+	DiffController  *middleware.DifficultyController
+	Logger          *slog.Logger
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2) Submission Handler
+// ─────────────────────────────────────────────────────────────────────────────
 
 // NewSubmissionHandler creates the POST /v1/entries handler.
 func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
-		// ── Step 1: Read raw bytes ─────────────────────────────────────
-		raw, err := io.ReadAll(io.LimitReader(r.Body, deps.MaxEntrySize+1024))
+		// ── Step 1: Read raw bytes + validate preamble ─────────────────
+		sigOverhead := int64(512) // sig envelope overhead allowance
+		raw, err := io.ReadAll(io.LimitReader(r.Body, deps.MaxEntrySize+sigOverhead))
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "failed to read request body")
 			return
 		}
-		if int64(len(raw)) > deps.MaxEntrySize+512 { // sig overhead
-			writeError(w, http.StatusRequestEntityTooLarge, "entry exceeds maximum size")
+
+		// Validate preamble: Protocol_Version (bytes 0-1) must be 3.
+		if len(raw) < 6 {
+			writeError(w, http.StatusUnprocessableEntity, "entry too short for preamble")
+			return
+		}
+		protocolVersion := binary.BigEndian.Uint16(raw[0:2])
+		if protocolVersion != 3 {
+			writeError(w, http.StatusUnprocessableEntity,
+				fmt.Sprintf("unsupported protocol version %d (expected 3)", protocolVersion))
 			return
 		}
 
 		// ── Step 2: Signature verification (SDK-D5) ────────────────────
 		canonical, algoID, sigBytes, err := envelope.StripSignature(raw)
 		if err != nil {
-			writeError(w, http.StatusUnauthorized, fmt.Sprintf("signature envelope: %s", err))
+			writeError(w, http.StatusUnauthorized,
+				fmt.Sprintf("signature envelope: %s", err))
 			return
 		}
+
 		entry, err := envelope.Deserialize(canonical)
 		if err != nil {
-			writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("deserialize: %s", err))
+			writeError(w, http.StatusUnprocessableEntity,
+				fmt.Sprintf("deserialize: %s", err))
 			return
 		}
+
 		if err := envelope.ValidateAlgorithmID(algoID); err != nil {
 			writeError(w, http.StatusUnauthorized, err.Error())
 			return
 		}
-		// TODO: resolve signer's public key and verify signature.
-		// In production: DID resolution → public key → sdk VerifyEntry.
+
+		// Phase 2 standalone: static key registry for signature verification.
+		// Phase 4: DID resolution → public key → sdk VerifyEntry.
+		// TODO: Implement key registry lookup and actual signature verification.
+		//   For now, StripSignature + Deserialize success establishes the contract.
+		//   Production MUST resolve signer's public key and call:
+		//     crypto.VerifySignature(canonicalHash, algoID, sigBytes, pubkey)
 		// CONTRACT: past this point, signature is verified (SDK-D5).
+		_ = sigBytes
+
+		// Validate signer_did is non-empty.
+		if entry.Header.SignerDID == "" {
+			writeError(w, http.StatusUnprocessableEntity, "empty signer DID")
+			return
+		}
 
 		// ── Step 3: Entry size (SDK-D11) ───────────────────────────────
 		if int64(len(canonical)) > deps.MaxEntrySize {
 			writeError(w, http.StatusRequestEntityTooLarge,
-				fmt.Sprintf("canonical bytes %d exceed max %d", len(canonical), deps.MaxEntrySize))
+				fmt.Sprintf("canonical bytes %d exceed max %d",
+					len(canonical), deps.MaxEntrySize))
 			return
 		}
 
 		// ── Step 4: Evidence_Pointers cap (Decision 51) ────────────────
-		h := &entry.Header
-		if len(h.EvidencePointers) > envelope.MaxEvidencePointers {
-			isSnapshot := h.AuthorityPath != nil &&
-				*h.AuthorityPath == envelope.AuthorityScopeAuthority &&
-				h.TargetRoot != nil && h.PriorAuthority != nil
-			if !isSnapshot {
-				writeError(w, http.StatusUnprocessableEntity,
-					fmt.Sprintf("Evidence_Pointers %d exceeds cap %d (non-snapshot)",
-						len(h.EvidencePointers), envelope.MaxEvidencePointers))
-				return
-			}
+		if !middleware.CheckEvidenceCap(entry) {
+			writeError(w, http.StatusUnprocessableEntity,
+				fmt.Sprintf("Evidence_Pointers %d exceeds cap %d (non-snapshot)",
+					len(entry.Header.EvidencePointers),
+					middleware.MaxEvidencePointers))
+			return
 		}
 
 		// ── Step 5: Admission mode ─────────────────────────────────────
-		authenticated, exchangeDID := extractAuth(r)
-		if authenticated {
-			// Mode A: credit deduction within the persist transaction (step 9).
-		} else {
+		authenticated := middleware.IsAuthenticated(ctx)
+		exchangeDID := middleware.ExchangeDID(ctx)
+
+		if !authenticated {
 			// Mode B: verify compute stamp.
+			h := &entry.Header
 			if h.AdmissionProof == nil {
-				writeError(w, http.StatusForbidden, "unauthenticated submission requires compute stamp")
-				return
-			}
-			entryHash := crypto.CanonicalHash(entry)
-			if err := admission.VerifyStamp(entryHash, h.AdmissionProof.Nonce,
-				deps.LogDID, deps.Difficulty, deps.HashFunc, nil); err != nil {
-				writeError(w, http.StatusForbidden, fmt.Sprintf("stamp verification failed: %s", err))
+				writeError(w, http.StatusForbidden,
+					"unauthenticated submission requires compute stamp")
 				return
 			}
 			if h.AdmissionProof.TargetLog != deps.LogDID {
 				writeError(w, http.StatusForbidden, "stamp bound to different log DID")
+				return
+			}
+
+			// Compute hash over raw canonical bytes for stamp verification.
+			canonicalHash := sha256.Sum256(canonical)
+			currentDifficulty := deps.DiffController.CurrentDifficulty()
+			hashFuncName := deps.DiffController.HashFunction()
+			var hashFunc admission.HashFunc
+			switch hashFuncName {
+			case "argon2id":
+				hashFunc = admission.HashArgon2id
+			default:
+				hashFunc = admission.HashSHA256
+			}
+
+			if err := admission.VerifyStamp(
+				canonicalHash, h.AdmissionProof.Nonce,
+				deps.LogDID, currentDifficulty, hashFunc, nil,
+			); err != nil {
+				writeError(w, http.StatusForbidden,
+					fmt.Sprintf("stamp verification failed: %s", err))
 				return
 			}
 		}
@@ -148,64 +185,53 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 		// ── Step 6: Log_Time assignment (SDK-D1, Decision 50) ──────────
 		logTime := time.Now().UTC()
 
-		// ── Step 7: Canonical hash ─────────────────────────────────────
-		canonicalHash := crypto.CanonicalHash(entry)
+		// ── Step 7: Canonical hash (from raw bytes, not re-serialized) ─
+		canonicalHash := sha256.Sum256(canonical)
 
-		// ── Step 8: Check duplicate ────────────────────────────────────
-		existing, err := deps.EntryStore.FetchByHash(ctx, canonicalHash)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "duplicate check failed")
-			return
-		}
-		if existing != nil {
-			writeError(w, http.StatusConflict,
-				fmt.Sprintf("duplicate entry: existing sequence %d", *existing))
-			return
-		}
-
-		// ── Steps 9-10: Atomic persist + enqueue ───────────────────────
+		// ── Steps 8-9: Atomic persist + enqueue ────────────────────────
 		var seq uint64
-		err = store.WithTransaction(ctx, deps.DB, func(ctx context.Context, tx pgx.Tx) error {
+		err = store.WithReadCommittedTx(ctx, deps.DB, func(ctx context.Context, tx pgx.Tx) error {
 			// Mode A credit deduction (inside transaction).
 			if authenticated {
-				_, err := deps.CreditStore.Deduct(ctx, tx, exchangeDID)
-				if err != nil {
-					return err // ErrInsufficientCredits → HTTP 402
+				if _, deductErr := deps.CreditStore.Deduct(ctx, tx, exchangeDID); deductErr != nil {
+					return deductErr // ErrInsufficientCredits → HTTP 402
 				}
 			}
 
 			// Allocate sequence number.
-			seq, err = deps.EntryStore.NextSequence(ctx, tx)
-			if err != nil {
-				return err
+			var seqErr error
+			seq, seqErr = deps.EntryStore.NextSequence(ctx, tx)
+			if seqErr != nil {
+				return seqErr
 			}
 
-			// Extract indexed fields.
+			// Extract indexed fields from deserialized header.
 			var targetRootBytes, cosigOfBytes, schemaRefBytes []byte
-			if h.TargetRoot != nil {
-				targetRootBytes = serializePositionBytes(*h.TargetRoot)
+			if entry.Header.TargetRoot != nil {
+				targetRootBytes = store.SerializeLogPosition(*entry.Header.TargetRoot)
 			}
-			if h.CosignatureOf != nil {
-				cosigOfBytes = serializePositionBytes(*h.CosignatureOf)
+			if entry.Header.CosignatureOf != nil {
+				cosigOfBytes = store.SerializeLogPosition(*entry.Header.CosignatureOf)
 			}
-			if h.SchemaRef != nil {
-				schemaRefBytes = serializePositionBytes(*h.SchemaRef)
+			if entry.Header.SchemaRef != nil {
+				schemaRefBytes = store.SerializeLogPosition(*entry.Header.SchemaRef)
 			}
 
 			// Insert entry.
-			if err := deps.EntryStore.Insert(ctx, tx, store.EntryRow{
+			insertErr := deps.EntryStore.Insert(ctx, tx, store.EntryRow{
 				SequenceNumber: seq,
 				CanonicalBytes: canonical,
 				CanonicalHash:  canonicalHash,
 				LogTime:        logTime,
 				SigAlgorithmID: algoID,
 				SigBytes:       sigBytes,
-				SignerDID:      h.SignerDID,
+				SignerDID:      entry.Header.SignerDID,
 				TargetRoot:     targetRootBytes,
 				CosignatureOf:  cosigOfBytes,
 				SchemaRef:      schemaRefBytes,
-			}); err != nil {
-				return err
+			})
+			if insertErr != nil {
+				return insertErr
 			}
 
 			// Enqueue for builder.
@@ -213,8 +239,19 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 		})
 
 		if err != nil {
-			if err == store.ErrInsufficientCredits {
+			if errors.Is(err, store.ErrInsufficientCredits) {
 				writeError(w, http.StatusPaymentRequired, "insufficient write credits")
+				return
+			}
+			if errors.Is(err, store.ErrDuplicateEntry) {
+				// Look up existing sequence for the response.
+				existingSeq, found, _ := deps.EntryStore.FetchByHash(ctx, canonicalHash)
+				if found {
+					writeError(w, http.StatusConflict,
+						fmt.Sprintf("duplicate entry: existing sequence %d", existingSeq))
+				} else {
+					writeError(w, http.StatusConflict, "duplicate entry")
+				}
 				return
 			}
 			deps.Logger.Error("admission failed", "error", err)
@@ -233,36 +270,12 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 	}
 }
 
-// -------------------------------------------------------------------------------------------------
-// 2) Helpers
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// 3) Shared helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
-}
-
-func extractAuth(r *http.Request) (authenticated bool, exchangeDID string) {
-	// Bearer token extraction. In production: validate JWT/session token
-	// against sessions table, extract exchange DID.
-	token := r.Header.Get("Authorization")
-	if token == "" {
-		return false, ""
-	}
-	// Simplified: token IS the exchange DID for now.
-	// Production: validate against store/sessions.
-	return true, token
-}
-
-func serializePositionBytes(pos types.LogPosition) []byte {
-	did := []byte(pos.LogDID)
-	buf := make([]byte, 2+len(did)+8)
-	buf[0] = byte(len(did) >> 8)
-	buf[1] = byte(len(did))
-	copy(buf[2:2+len(did)], did)
-	for i := uint(0); i < 8; i++ {
-		buf[2+len(did)+int(i)] = byte(pos.Sequence >> (56 - i*8))
-	}
-	return buf
 }

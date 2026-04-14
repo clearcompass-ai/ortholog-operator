@@ -1,25 +1,14 @@
 /*
-FILE PATH:
-    api/tree.go
+FILE PATH: api/tree.go
 
-DESCRIPTION:
-    Tree head distribution and Merkle proof endpoints. Serves cosigned
-    tree heads, inclusion proofs, and consistency proofs via the Tessera
-    proof adapter.
+Tree head distribution and Merkle proof endpoints. Serves cosigned tree heads,
+inclusion proofs, and consistency proofs via the TesseraAdapter.
 
 KEY ARCHITECTURAL DECISIONS:
-    - Cache-Control + ETag on tree/head: clients poll efficiently
-    - Inclusion proofs compatible with sdk verify.VerifyMerkleInclusion
-    - Consistency proofs for witness append-only verification
-
-OVERVIEW:
-    GET /v1/tree/head → latest CosignedTreeHead JSON
-    GET /v1/tree/inclusion/:seq → MerkleInclusionProof
-    GET /v1/tree/consistency/:old/:new → ConsistencyProof
-
-KEY DEPENDENCIES:
-    - store/tree_heads.go: cosigned tree head persistence
-    - tessera/proof_adapter.go: Merkle proof generation
+  - Cache-Control: max-age=5 on tree/head (spec-compliant).
+  - ETag: tree_size (monotonic) for conditional polling.
+  - Inclusion proofs compatible with sdk verify.VerifyMerkleInclusion.
+  - ConsistencyProver is a separate interface (not part of sdk MerkleTree).
 */
 package api
 
@@ -32,17 +21,23 @@ import (
 	"strconv"
 
 	"github.com/clearcompass-ai/ortholog-operator/store"
-	"github.com/clearcompass-ai/ortholog-operator/tessera"
 )
 
-// -------------------------------------------------------------------------------------------------
-// 1) Tree Head Handler
-// -------------------------------------------------------------------------------------------------
+// ConsistencyProver generates consistency proofs (concrete method on TesseraAdapter).
+type ConsistencyProver interface {
+	ConsistencyProof(oldSize, newSize uint64) (any, error)
+}
+
+// InclusionProver generates inclusion proofs.
+type InclusionProver interface {
+	InclusionProof(position, treeSize uint64) (any, error)
+}
 
 // TreeDeps holds dependencies for tree handlers.
 type TreeDeps struct {
 	TreeHeadStore *store.TreeHeadStore
-	ProofAdapter  *tessera.ProofAdapter
+	Inclusion     InclusionProver
+	Consistency   ConsistencyProver
 	Logger        *slog.Logger
 }
 
@@ -62,7 +57,7 @@ func NewTreeHeadHandler(deps *TreeDeps) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, head.TreeSize))
-		w.Header().Set("Cache-Control", "public, max-age=10")
+		w.Header().Set("Cache-Control", "public, max-age=5")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"tree_size":    head.TreeSize,
 			"root_hash":    hex.EncodeToString(head.RootHash[:]),
@@ -71,10 +66,6 @@ func NewTreeHeadHandler(deps *TreeDeps) http.HandlerFunc {
 		})
 	}
 }
-
-// -------------------------------------------------------------------------------------------------
-// 2) Inclusion Proof Handler
-// -------------------------------------------------------------------------------------------------
 
 // NewTreeInclusionHandler creates GET /v1/tree/inclusion/{seq}.
 func NewTreeInclusionHandler(deps *TreeDeps) http.HandlerFunc {
@@ -92,9 +83,15 @@ func NewTreeInclusionHandler(deps *TreeDeps) http.HandlerFunc {
 			return
 		}
 
-		proof, err := deps.ProofAdapter.InclusionProof(seq, head.TreeSize)
+		if deps.Inclusion == nil {
+			writeError(w, http.StatusServiceUnavailable, "inclusion proofs not available")
+			return
+		}
+
+		proof, err := deps.Inclusion.InclusionProof(seq, head.TreeSize)
 		if err != nil {
-			writeError(w, http.StatusNotFound, fmt.Sprintf("inclusion proof: %s", err))
+			writeError(w, http.StatusNotFound,
+				fmt.Sprintf("inclusion proof: %s", err))
 			return
 		}
 
@@ -102,10 +99,6 @@ func NewTreeInclusionHandler(deps *TreeDeps) http.HandlerFunc {
 		_ = json.NewEncoder(w).Encode(proof)
 	}
 }
-
-// -------------------------------------------------------------------------------------------------
-// 3) Consistency Proof Handler
-// -------------------------------------------------------------------------------------------------
 
 // NewTreeConsistencyHandler creates GET /v1/tree/consistency/{old}/{new}.
 func NewTreeConsistencyHandler(deps *TreeDeps) http.HandlerFunc {
@@ -123,9 +116,15 @@ func NewTreeConsistencyHandler(deps *TreeDeps) http.HandlerFunc {
 			return
 		}
 
-		proof, err := deps.ProofAdapter.ConsistencyProof(oldSize, newSize)
+		if deps.Consistency == nil {
+			writeError(w, http.StatusServiceUnavailable, "consistency proofs not available")
+			return
+		}
+
+		proof, err := deps.Consistency.ConsistencyProof(oldSize, newSize)
 		if err != nil {
-			writeError(w, http.StatusNotFound, fmt.Sprintf("consistency proof: %s", err))
+			writeError(w, http.StatusNotFound,
+				fmt.Sprintf("consistency proof: %s", err))
 			return
 		}
 

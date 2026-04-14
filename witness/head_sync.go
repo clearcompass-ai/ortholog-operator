@@ -1,25 +1,14 @@
 /*
-FILE PATH:
-    witness/head_sync.go
+FILE PATH: witness/head_sync.go
 
-DESCRIPTION:
-    Requests K-of-N cosignatures from witnesses after each builder cycle.
-    Sends tree head to witness endpoints in parallel, collects K valid
-    signatures, assembles CosignedTreeHead, persists to tree_heads table.
+Requests K-of-N cosignatures from witnesses after each builder cycle.
+Implements builder.WitnessCosigner interface.
 
 KEY ARCHITECTURAL DECISIONS:
-    - Parallel requests with per-witness timeout (30s default)
-    - First-K strategy: once K valid sigs collected, cancel remaining
-    - Assembled CosignedTreeHead verified locally before persistence
-    - Failure to reach K → log warning, retry on next cycle. Never block.
-
-OVERVIEW:
-    RequestCosignatures(head) → CosignedTreeHead or error.
-    Called by builder/loop.go after each batch commit.
-
-KEY DEPENDENCIES:
-    - github.com/clearcompass-ai/ortholog-sdk/types: TreeHead, CosignedTreeHead
-    - store/tree_heads.go: persistence
+  - Parallel requests with per-witness timeout (30s default).
+  - First-K strategy: once K valid sigs collected, cancel remaining.
+  - Assembled CosignedTreeHead persisted to tree_heads table.
+  - Failure to reach K → log warning, non-fatal. Never blocks builder.
 */
 package witness
 
@@ -39,19 +28,16 @@ import (
 	"github.com/clearcompass-ai/ortholog-operator/store"
 )
 
-// -------------------------------------------------------------------------------------------------
-// 1) HeadSync
-// -------------------------------------------------------------------------------------------------
-
 // HeadSyncConfig configures witness cosignature collection.
 type HeadSyncConfig struct {
-	WitnessEndpoints []string      // HTTP endpoints for cosign requests
-	QuorumK          int           // Minimum valid signatures required
+	WitnessEndpoints  []string
+	QuorumK           int
 	PerWitnessTimeout time.Duration
-	SchemeTag        byte
+	SchemeTag         byte
 }
 
 // HeadSync manages tree head cosignature collection.
+// Implements builder.WitnessCosigner.
 type HeadSync struct {
 	cfg    HeadSyncConfig
 	client *http.Client
@@ -62,20 +48,21 @@ type HeadSync struct {
 // NewHeadSync creates a head sync manager.
 func NewHeadSync(cfg HeadSyncConfig, treeStore *store.TreeHeadStore, logger *slog.Logger) *HeadSync {
 	return &HeadSync{
-		cfg: cfg,
-		client: &http.Client{
-			Timeout: cfg.PerWitnessTimeout,
-		},
+		cfg:    cfg,
+		client: &http.Client{Timeout: cfg.PerWitnessTimeout},
 		store:  treeStore,
 		logger: logger,
 	}
 }
 
-// RequestCosignatures requests K-of-N cosignatures for a tree head.
-// Returns the assembled CosignedTreeHead or error if quorum not reached.
-func (hs *HeadSync) RequestCosignatures(ctx context.Context, head types.TreeHead) (*types.CosignedTreeHead, error) {
+// RequestCosignatures implements builder.WitnessCosigner.
+// Requests K-of-N cosignatures and persists the cosigned tree head.
+func (hs *HeadSync) RequestCosignatures(ctx context.Context, head types.TreeHead) error {
+	if len(hs.cfg.WitnessEndpoints) == 0 {
+		return nil // No witnesses configured.
+	}
 	if len(hs.cfg.WitnessEndpoints) < hs.cfg.QuorumK {
-		return nil, fmt.Errorf("witness/head_sync: %d endpoints < quorum %d",
+		return fmt.Errorf("witness/head_sync: %d endpoints < quorum %d",
 			len(hs.cfg.WitnessEndpoints), hs.cfg.QuorumK)
 	}
 
@@ -85,17 +72,19 @@ func (hs *HeadSync) RequestCosignatures(ctx context.Context, head types.TreeHead
 	}
 
 	results := make(chan sigResult, len(hs.cfg.WitnessEndpoints))
-	ctx, cancel := context.WithCancel(ctx)
+	reqCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Request cosignatures in parallel.
 	var wg sync.WaitGroup
 	for _, endpoint := range hs.cfg.WitnessEndpoints {
 		wg.Add(1)
 		go func(ep string) {
 			defer wg.Done()
-			sig, err := hs.requestSingle(ctx, ep, head)
-			results <- sigResult{sig: sig, err: err}
+			sig, err := hs.requestSingle(reqCtx, ep, head)
+			select {
+			case results <- sigResult{sig: sig, err: err}:
+			case <-reqCtx.Done():
+			}
 		}(endpoint)
 	}
 
@@ -104,7 +93,6 @@ func (hs *HeadSync) RequestCosignatures(ctx context.Context, head types.TreeHead
 		close(results)
 	}()
 
-	// Collect first K valid signatures.
 	var sigs []types.WitnessSignature
 	for res := range results {
 		if res.err != nil {
@@ -119,37 +107,30 @@ func (hs *HeadSync) RequestCosignatures(ctx context.Context, head types.TreeHead
 	}
 
 	if len(sigs) < hs.cfg.QuorumK {
-		return nil, fmt.Errorf("witness/head_sync: got %d sigs, need %d", len(sigs), hs.cfg.QuorumK)
+		return fmt.Errorf("witness/head_sync: got %d sigs, need %d",
+			len(sigs), hs.cfg.QuorumK)
 	}
 
-	cosigned := &types.CosignedTreeHead{
-		TreeHead:   head,
-		SchemeTag:  hs.cfg.SchemeTag,
-		Signatures: sigs,
-	}
-
-	// Persist.
+	// Persist cosigned head.
+	cosigBytes, _ := json.Marshal(sigs)
 	if err := hs.store.Insert(ctx, store.TreeHeadRow{
 		TreeSize:     head.TreeSize,
 		RootHash:     head.RootHash,
 		SchemeTag:    hs.cfg.SchemeTag,
-		Cosignatures: serializeCosignatures(sigs),
+		Cosignatures: cosigBytes,
 	}); err != nil {
-		return nil, fmt.Errorf("witness/head_sync: persist: %w", err)
+		return fmt.Errorf("witness/head_sync: persist: %w", err)
 	}
 
 	hs.logger.Info("cosigned tree head",
-		"tree_size", head.TreeSize,
-		"signatures", len(sigs),
-	)
-
-	return cosigned, nil
+		"tree_size", head.TreeSize, "signatures", len(sigs))
+	return nil
 }
 
 func (hs *HeadSync) requestSingle(ctx context.Context, endpoint string, head types.TreeHead) (types.WitnessSignature, error) {
 	body, _ := json.Marshal(map[string]any{
 		"tree_size": head.TreeSize,
-		"root_hash": head.RootHash,
+		"root_hash": fmt.Sprintf("%x", head.RootHash),
 	})
 
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint+"/v1/cosign", bytes.NewReader(body))
@@ -178,9 +159,4 @@ func (hs *HeadSync) requestSingle(ctx context.Context, endpoint string, head typ
 		return types.WitnessSignature{}, fmt.Errorf("unmarshal witness sig: %w", err)
 	}
 	return sig, nil
-}
-
-func serializeCosignatures(sigs []types.WitnessSignature) []byte {
-	data, _ := json.Marshal(sigs)
-	return data
 }

@@ -1,19 +1,13 @@
 /*
-FILE PATH:
-    store/tree_heads.go
+FILE PATH: store/tree_heads.go
 
-DESCRIPTION:
-    Cosigned tree head persistence. Stores every cosigned head for
-    historical consistency proofs. Latest() serves GET /v1/tree/head.
+Cosigned tree head persistence. Stores every cosigned head for
+historical consistency proofs and equivocation detection.
 
 KEY ARCHITECTURAL DECISIONS:
-    - tree_size as PK: monotonically increasing, one head per size
-    - cosignatures stored as opaque BYTEA: scheme-tagged, parsed by SDK
-    - Two tree_heads with same size but different roots = equivocation
-
-KEY DEPENDENCIES:
-    - github.com/clearcompass-ai/ortholog-sdk/types: CosignedTreeHead
-    - github.com/jackc/pgx/v5/pgxpool
+  - tree_size as PK: monotonically increasing, one head per size.
+  - cosignatures stored as opaque BYTEA: scheme-tagged, parsed by SDK.
+  - Latest() cached in memory, invalidated on new insert.
 */
 package store
 
@@ -21,18 +15,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// -------------------------------------------------------------------------------------------------
-// 1) Tree Head Store
-// -------------------------------------------------------------------------------------------------
-
 // TreeHeadStore manages cosigned tree head persistence.
 type TreeHeadStore struct {
-	db *pgxpool.Pool
+	db     *pgxpool.Pool
+	mu     sync.RWMutex
+	latest *TreeHeadRow // In-memory cache of latest head.
 }
 
 // NewTreeHeadStore creates a tree head store.
@@ -45,10 +38,10 @@ type TreeHeadRow struct {
 	TreeSize     uint64
 	RootHash     [32]byte
 	SchemeTag    byte
-	Cosignatures []byte // Opaque: scheme-tagged witness signatures.
+	Cosignatures []byte
 }
 
-// Insert stores a new cosigned tree head. Rejects duplicates at same size.
+// Insert stores a new cosigned tree head. Invalidates the latest cache.
 func (s *TreeHeadStore) Insert(ctx context.Context, row TreeHeadRow) error {
 	_, err := s.db.Exec(ctx, `
 		INSERT INTO tree_heads (tree_size, root_hash, scheme_tag, cosignatures)
@@ -58,11 +51,34 @@ func (s *TreeHeadStore) Insert(ctx context.Context, row TreeHeadRow) error {
 	if err != nil {
 		return fmt.Errorf("store/tree_heads: insert size=%d: %w", row.TreeSize, err)
 	}
+	s.mu.Lock()
+	s.latest = &row
+	s.mu.Unlock()
 	return nil
 }
 
 // Latest returns the most recent cosigned tree head. Nil if none exist.
 func (s *TreeHeadStore) Latest(ctx context.Context) (*TreeHeadRow, error) {
+	s.mu.RLock()
+	cached := s.latest
+	s.mu.RUnlock()
+	if cached != nil {
+		return cached, nil
+	}
+
+	row, err := s.fetchLatest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if row != nil {
+		s.mu.Lock()
+		s.latest = row
+		s.mu.Unlock()
+	}
+	return row, nil
+}
+
+func (s *TreeHeadStore) fetchLatest(ctx context.Context) (*TreeHeadRow, error) {
 	var (
 		treeSize  uint64
 		rootHash  []byte
@@ -91,7 +107,7 @@ func (s *TreeHeadStore) Latest(ctx context.Context) (*TreeHeadRow, error) {
 	return row, nil
 }
 
-// GetBySize returns the tree head at a specific size. For consistency proofs.
+// GetBySize returns the tree head at a specific size.
 func (s *TreeHeadStore) GetBySize(ctx context.Context, size uint64) (*TreeHeadRow, error) {
 	var (
 		rootHash  []byte

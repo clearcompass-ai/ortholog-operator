@@ -1,20 +1,19 @@
 /*
-FILE PATH:
-    builder/commitment_publisher.go
+FILE PATH: builder/commitment_publisher.go
 
-DESCRIPTION:
-    Publishes SMT derivation commitments as commentary entries on the log.
-    Commentary: Target_Root=null, Authority_Path=null → zero SMT impact
-    (Fix 1 discriminator). Operator DID signs.
+Publishes SMT derivation commitments as commentary entries on the log.
+Commentary: Target_Root=null, Authority_Path=null → zero SMT impact (Fix 1).
 
 KEY ARCHITECTURAL DECISIONS:
-    - Commentary entry: no SMT leaf created or modified
-    - Commitment in Domain Payload: serialized SMTDerivationCommitment
-    - Frequency configurable: default every batch (production: 1000 entries or 1hr)
+  - Commentary entry: no SMT leaf created or modified.
+  - Frequency controlled: every N entries OR every T duration, whichever first.
+  - Commitment serialized as JSON in Domain Payload.
+  - In production: entry is signed by operator DID and submitted through
+    the local admission pipeline.
 
-KEY DEPENDENCIES:
-    - github.com/clearcompass-ai/ortholog-sdk/builder: GenerateBatchCommitment
-    - github.com/clearcompass-ai/ortholog-sdk/core/envelope: NewEntry
+INVARIANTS:
+  - Commitment post_root matches batch result's NewRoot.
+  - Every entry range is eventually covered by a commitment.
 */
 package builder
 
@@ -22,27 +21,101 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
+	"time"
 
 	sdkbuilder "github.com/clearcompass-ai/ortholog-sdk/builder"
 	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
 	"github.com/clearcompass-ai/ortholog-sdk/types"
 )
 
+// CommitmentPublisherConfig configures commitment frequency.
+type CommitmentPublisherConfig struct {
+	IntervalEntries int           // Entries between commitments (default 1000).
+	IntervalTime    time.Duration // Max time between commitments (default 1h).
+}
+
 // CommitmentPublisher publishes derivation commitments.
 type CommitmentPublisher struct {
 	operatorDID string
+	cfg         CommitmentPublisherConfig
 	logger      *slog.Logger
-	// In production: submits back through the admission pipeline.
-	// Here: logs the commitment for integration with the submission flow.
+	mu          sync.Mutex
+	lastPublish time.Time
+	entriesSince int
+	// submitFn is the callback to submit the signed commitment entry.
+	// In production: signs and POSTs to local /v1/entries.
+	// In tests: captures the entry for verification.
+	submitFn func(entry *envelope.Entry) error
 }
 
 // NewCommitmentPublisher creates a commitment publisher.
-func NewCommitmentPublisher(operatorDID string, logger *slog.Logger) *CommitmentPublisher {
-	return &CommitmentPublisher{operatorDID: operatorDID, logger: logger}
+func NewCommitmentPublisher(
+	operatorDID string,
+	cfg CommitmentPublisherConfig,
+	submitFn func(entry *envelope.Entry) error,
+	logger *slog.Logger,
+) *CommitmentPublisher {
+	if cfg.IntervalEntries <= 0 {
+		cfg.IntervalEntries = 1000
+	}
+	if cfg.IntervalTime <= 0 {
+		cfg.IntervalTime = 1 * time.Hour
+	}
+	return &CommitmentPublisher{
+		operatorDID: operatorDID,
+		cfg:         cfg,
+		submitFn:    submitFn,
+		logger:      logger,
+		lastPublish: time.Now(),
+	}
 }
 
-// Publish generates and logs a derivation commitment for a processed batch.
-func (cp *CommitmentPublisher) Publish(
+// MaybePublish checks if a commitment should be published based on frequency,
+// and publishes if thresholds are exceeded. Called after each batch.
+func (cp *CommitmentPublisher) MaybePublish(
+	ctx context.Context,
+	batchSize int,
+	rangeStart, rangeEnd types.LogPosition,
+	priorRoot [32]byte,
+	result *sdkbuilder.BatchResult,
+) {
+	cp.mu.Lock()
+	cp.entriesSince += batchSize
+	shouldPublish := cp.entriesSince >= cp.cfg.IntervalEntries ||
+		time.Since(cp.lastPublish) >= cp.cfg.IntervalTime
+	if shouldPublish {
+		cp.entriesSince = 0
+		cp.lastPublish = time.Now()
+	}
+	cp.mu.Unlock()
+
+	if !shouldPublish || result == nil || len(result.Mutations) == 0 {
+		return
+	}
+
+	cp.publish(ctx, rangeStart, rangeEnd, priorRoot, result)
+}
+
+// ForcePublish publishes a commitment unconditionally (e.g., at shutdown).
+func (cp *CommitmentPublisher) ForcePublish(
+	ctx context.Context,
+	rangeStart, rangeEnd types.LogPosition,
+	priorRoot [32]byte,
+	result *sdkbuilder.BatchResult,
+) {
+	if result == nil || len(result.Mutations) == 0 {
+		return
+	}
+	cp.mu.Lock()
+	cp.entriesSince = 0
+	cp.lastPublish = time.Now()
+	cp.mu.Unlock()
+
+	cp.publish(ctx, rangeStart, rangeEnd, priorRoot, result)
+}
+
+func (cp *CommitmentPublisher) publish(
 	ctx context.Context,
 	rangeStart, rangeEnd types.LogPosition,
 	priorRoot [32]byte,
@@ -50,24 +123,28 @@ func (cp *CommitmentPublisher) Publish(
 ) {
 	commitment := sdkbuilder.GenerateBatchCommitment(rangeStart, rangeEnd, priorRoot, result)
 
-	// Serialize commitment as Domain Payload.
 	payload, err := json.Marshal(commitment)
 	if err != nil {
 		cp.logger.Error("commitment serialization failed", "error", err)
 		return
 	}
 
-	// Build commentary entry: Target_Root=null, Authority_Path=null.
+	// Build commentary entry: Target_Root=null, Authority_Path=null → Fix 1.
 	entry, err := envelope.NewEntry(envelope.ControlHeader{
 		SignerDID: cp.operatorDID,
-		// All structural fields null → commentary (Fix 1).
 	}, payload)
 	if err != nil {
 		cp.logger.Error("commitment entry creation failed", "error", err)
 		return
 	}
 
-	_ = entry // In production: submit through operator's own admission pipeline.
+	if cp.submitFn != nil {
+		if err := cp.submitFn(entry); err != nil {
+			cp.logger.Error("commitment submission failed", "error", err)
+			return
+		}
+	}
+
 	cp.logger.Info("derivation commitment published",
 		"range_start", rangeStart.String(),
 		"range_end", rangeEnd.String(),

@@ -1,20 +1,19 @@
 /*
-FILE PATH:
-    builder/delta_buffer.go
+FILE PATH: builder/delta_buffer.go
 
-DESCRIPTION:
-    Postgres persistence of the delta-window authority history buffer.
-    Survives operator restarts. Empty on cold start → strict OCC (SDK-D9).
-    Reconstructable from ScanFromPosition if lost entirely.
+Postgres persistence of the delta-window authority history buffer.
+Survives operator restarts. Empty on cold start → strict OCC (SDK-D9).
 
 KEY ARCHITECTURAL DECISIONS:
-    - UPSERT per leaf: only modified leaves persisted per batch
-    - tip_history as BYTEA: serialized []LogPosition (compact)
-    - Load/Save symmetry: Load → sdk DeltaWindowBuffer, Save → Postgres
+  - Load/Save symmetry: Load → sdk DeltaWindowBuffer, Save → Postgres.
+  - Save is called INSIDE the atomic commit transaction — buffer and
+    leaf mutations are committed together.
+  - Tip history serialized as compact BYTEA: [count][pos1][pos2]...
+  - Reconstructable from ScanFromPosition if table is lost.
 
-KEY DEPENDENCIES:
-    - github.com/clearcompass-ai/ortholog-sdk/builder: DeltaWindowBuffer
-    - github.com/clearcompass-ai/ortholog-sdk/types: LogPosition
+INVARIANTS:
+  - Empty table = cold start = strict OCC (SDK-D9).
+  - Save persists only modified leaves (batch delta).
 */
 package builder
 
@@ -22,7 +21,9 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	sdkbuilder "github.com/clearcompass-ai/ortholog-sdk/builder"
@@ -33,14 +34,15 @@ import (
 type DeltaBufferStore struct {
 	db         *pgxpool.Pool
 	windowSize int
+	logger     *slog.Logger
 }
 
 // NewDeltaBufferStore creates a buffer store.
-func NewDeltaBufferStore(db *pgxpool.Pool, windowSize int) *DeltaBufferStore {
+func NewDeltaBufferStore(db *pgxpool.Pool, windowSize int, logger *slog.Logger) *DeltaBufferStore {
 	if windowSize < 1 {
 		windowSize = 10
 	}
-	return &DeltaBufferStore{db: db, windowSize: windowSize}
+	return &DeltaBufferStore{db: db, windowSize: windowSize, logger: logger}
 }
 
 // Load reads the persisted buffer into an SDK DeltaWindowBuffer.
@@ -56,12 +58,14 @@ func (s *DeltaBufferStore) Load(ctx context.Context) (*sdkbuilder.DeltaWindowBuf
 	}
 	defer rows.Close()
 
+	loaded := 0
 	for rows.Next() {
 		var keyBytes, histBytes []byte
 		if err := rows.Scan(&keyBytes, &histBytes); err != nil {
 			return buf, fmt.Errorf("builder/delta_buffer: scan: %w", err)
 		}
 		if len(keyBytes) != 32 {
+			s.logger.Warn("delta_buffer: skipping corrupt key", "len", len(keyBytes))
 			continue
 		}
 		var key [32]byte
@@ -69,35 +73,76 @@ func (s *DeltaBufferStore) Load(ctx context.Context) (*sdkbuilder.DeltaWindowBuf
 
 		tips, err := deserializeTipHistory(histBytes)
 		if err != nil {
-			continue // Skip corrupt entries, buffer is reconstructable.
+			s.logger.Warn("delta_buffer: skipping corrupt history",
+				"key", fmt.Sprintf("%x", key[:8]), "error", err)
+			continue
 		}
 		buf.SetHistory(key, tips)
+		loaded++
 	}
-	return buf, rows.Err()
+	if err := rows.Err(); err != nil {
+		return buf, fmt.Errorf("builder/delta_buffer: rows: %w", err)
+	}
+
+	s.logger.Info("delta buffer loaded", "leaves", loaded)
+	return buf, nil
 }
 
-// Save persists the current buffer state. Called after each batch commit.
-func (s *DeltaBufferStore) Save(ctx context.Context, buf *sdkbuilder.DeltaWindowBuffer) error {
-	// In production, batch UPSERT only modified leaves.
-	// For correctness, persist the full buffer.
-	// The buffer is small: typically < 100 active leaves.
-	return nil // Buffer save integrated into the atomic commit transaction.
+// SaveTx persists the current buffer state within a transaction.
+// Called as part of the builder's atomic commit.
+func (s *DeltaBufferStore) SaveTx(ctx context.Context, tx pgx.Tx, buf *sdkbuilder.DeltaWindowBuffer) error {
+	modifiedKeys := buf.ModifiedKeys()
+	if len(modifiedKeys) == 0 {
+		return nil
+	}
+
+	for _, key := range modifiedKeys {
+		tips := buf.History(key)
+		if len(tips) == 0 {
+			// Remove entries with empty history.
+			_, err := tx.Exec(ctx,
+				"DELETE FROM delta_window_buffers WHERE leaf_key = $1", key[:])
+			if err != nil {
+				return fmt.Errorf("builder/delta_buffer: delete: %w", err)
+			}
+			continue
+		}
+
+		// Trim to window size.
+		if len(tips) > s.windowSize {
+			tips = tips[len(tips)-s.windowSize:]
+		}
+
+		histBytes := serializeTipHistory(tips)
+		_, err := tx.Exec(ctx, `
+			INSERT INTO delta_window_buffers (leaf_key, tip_history, updated_at)
+			VALUES ($1, $2, NOW())
+			ON CONFLICT (leaf_key) DO UPDATE SET
+				tip_history = EXCLUDED.tip_history,
+				updated_at = NOW()`,
+			key[:], histBytes,
+		)
+		if err != nil {
+			return fmt.Errorf("builder/delta_buffer: upsert: %w", err)
+		}
+	}
+
+	return nil
 }
 
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 // Tip history serialization: [count uint16][pos1][pos2]...
 // Each pos: [didLen uint16][did bytes][seq uint64]
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 
 func serializeTipHistory(tips []types.LogPosition) []byte {
-	var buf []byte
-	b := make([]byte, 2)
-	binary.BigEndian.PutUint16(b, uint16(len(tips)))
-	buf = append(buf, b...)
+	buf := make([]byte, 2)
+	binary.BigEndian.PutUint16(buf, uint16(len(tips)))
 	for _, tip := range tips {
 		did := []byte(tip.LogDID)
-		binary.BigEndian.PutUint16(b, uint16(len(did)))
-		buf = append(buf, b...)
+		dl := make([]byte, 2)
+		binary.BigEndian.PutUint16(dl, uint16(len(did)))
+		buf = append(buf, dl...)
 		buf = append(buf, did...)
 		s := make([]byte, 8)
 		binary.BigEndian.PutUint64(s, tip.Sequence)

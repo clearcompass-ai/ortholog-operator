@@ -1,32 +1,21 @@
 /*
-FILE PATH:
-    witness/equivocation_monitor.go
+FILE PATH: witness/equivocation_monitor.go
 
-DESCRIPTION:
-    Compares external tree heads against stored heads. Same tree_size +
-    different root = equivocation proof. Persists proof and fires alert.
+Compares external tree heads against stored heads. Same tree_size +
+different root = equivocation proof. Persists proof and fires alert.
 
 KEY ARCHITECTURAL DECISIONS:
-    - Periodic poll of witness/peer endpoints for external tree heads
-    - Cryptographic equivocation proof: two validly signed heads with
-      same size and different roots is unforgeable evidence of operator
-      misbehavior
-    - Stored proofs immutable — append-only equivocation_proofs table
-
-OVERVIEW:
-    Run(ctx) loops periodically. For each known peer:
-      Fetch their latest tree head.
-      Compare against our stored head at same tree_size.
-      If roots differ: store EquivocationProof, fire alert callback.
-
-KEY DEPENDENCIES:
-    - store/tree_heads.go: local tree head lookup
-    - github.com/jackc/pgx/v5/pgxpool: proof persistence
+  - Cryptographic equivocation proof: two validly signed heads with same
+    size and different roots is unforgeable evidence of operator misbehavior.
+  - Stored proofs immutable — append-only equivocation_proofs table.
+  - HeadA populated with local head bytes (complete proof).
+  - Uses encoding/hex for proper hex decoding (not manual nibble parsing).
 */
 package witness
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,24 +28,20 @@ import (
 	"github.com/clearcompass-ai/ortholog-operator/store"
 )
 
-// -------------------------------------------------------------------------------------------------
-// 1) EquivocationMonitor
-// -------------------------------------------------------------------------------------------------
-
 // EquivocationMonitorConfig configures the equivocation monitor.
 type EquivocationMonitorConfig struct {
 	PeerEndpoints []string
 	PollInterval  time.Duration
-	AlertCallback func(proof EquivocationProof) // Called on detection. Nil = log only.
+	AlertCallback func(proof EquivocationProof)
 }
 
 // EquivocationProof is cryptographic evidence of log fork.
 type EquivocationProof struct {
 	TreeSize  uint64
-	RootHashA [32]byte // Our root.
-	RootHashB [32]byte // Peer's root.
-	HeadA     []byte   // Our serialized head.
-	HeadB     []byte   // Peer's serialized head.
+	RootHashA [32]byte
+	RootHashB [32]byte
+	HeadA     []byte // Local serialized head.
+	HeadB     []byte // Peer's serialized head.
 }
 
 // EquivocationMonitor detects log forks.
@@ -86,6 +71,11 @@ func NewEquivocationMonitor(
 
 // Run starts the equivocation monitoring loop.
 func (em *EquivocationMonitor) Run(ctx context.Context) {
+	if len(em.cfg.PeerEndpoints) == 0 {
+		em.logger.Info("equivocation: no peers configured, exiting")
+		return
+	}
+
 	ticker := time.NewTicker(em.cfg.PollInterval)
 	defer ticker.Stop()
 
@@ -103,20 +93,28 @@ func (em *EquivocationMonitor) check(ctx context.Context) {
 	for _, endpoint := range em.cfg.PeerEndpoints {
 		peerHead, peerBytes, err := em.fetchPeerHead(ctx, endpoint)
 		if err != nil {
-			em.logger.Warn("equivocation: peer fetch failed", "endpoint", endpoint, "error", err)
+			em.logger.Warn("equivocation: peer fetch failed",
+				"endpoint", endpoint, "error", err)
 			continue
 		}
 
 		localHead, err := em.headStore.GetBySize(ctx, peerHead.TreeSize)
 		if err != nil || localHead == nil {
-			continue // We don't have a head at this size. Not comparable.
+			continue
 		}
 
 		if localHead.RootHash != peerHead.RootHash {
+			// Serialize local head for complete proof.
+			localBytes, _ := json.Marshal(map[string]any{
+				"tree_size": localHead.TreeSize,
+				"root_hash": fmt.Sprintf("%x", localHead.RootHash),
+			})
+
 			proof := EquivocationProof{
 				TreeSize:  peerHead.TreeSize,
 				RootHashA: localHead.RootHash,
 				RootHashB: peerHead.RootHash,
+				HeadA:     localBytes,
 				HeadB:     peerBytes,
 			}
 
@@ -160,30 +158,11 @@ func (em *EquivocationMonitor) fetchPeerHead(ctx context.Context, endpoint strin
 	}
 
 	row := &store.TreeHeadRow{TreeSize: parsed.TreeSize}
-	// Parse root hash from hex.
-	if len(parsed.RootHash) == 64 {
-		for i := 0; i < 32; i++ {
-			row.RootHash[i] = hexByte(parsed.RootHash[i*2], parsed.RootHash[i*2+1])
-		}
+	rootBytes, err := hex.DecodeString(parsed.RootHash)
+	if err == nil && len(rootBytes) == 32 {
+		copy(row.RootHash[:], rootBytes)
 	}
 	return row, body, nil
-}
-
-func hexByte(hi, lo byte) byte {
-	return (hexNibble(hi) << 4) | hexNibble(lo)
-}
-
-func hexNibble(b byte) byte {
-	switch {
-	case b >= '0' && b <= '9':
-		return b - '0'
-	case b >= 'a' && b <= 'f':
-		return b - 'a' + 10
-	case b >= 'A' && b <= 'F':
-		return b - 'A' + 10
-	default:
-		return 0
-	}
 }
 
 func (em *EquivocationMonitor) persistProof(ctx context.Context, proof EquivocationProof) {

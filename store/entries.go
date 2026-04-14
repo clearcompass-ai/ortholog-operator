@@ -1,30 +1,22 @@
 /*
-FILE PATH:
-    store/entries.go
+FILE PATH: store/entries.go
 
-DESCRIPTION:
-    Entry persistence and the PostgresEntryFetcher — the concrete
-    implementation of sdk builder.EntryFetcher. Every entry returned
-    by Fetch has had its signature verified at admission (SDK-D5 contract).
+Entry persistence and the PostgresEntryFetcher — the concrete implementation
+of sdk builder.EntryFetcher. Every entry returned by Fetch has had its
+signature verified at admission (SDK-D5 contract).
 
 KEY ARCHITECTURAL DECISIONS:
-    - Sequence number as primary key: gapless, monotonic, determined at
-      admission. The builder processes entries in this order.
-    - Canonical hash stored separately from bytes: UNIQUE constraint
-      prevents duplicate entries without deserialization.
-    - Indexed columns (signer_did, target_root, cosignature_of, schema_ref)
-      extracted at admission time — no runtime parsing for queries.
-    - Log_Time stored as TIMESTAMPTZ alongside entry but NOT in canonical
-      bytes (SDK-D1, Decision 50).
+  - Sequence number as primary key: gapless, monotonic, determined at admission.
+  - Canonical hash stored separately: UNIQUE constraint prevents duplicates.
+  - Indexed columns extracted at admission time — no runtime parsing for queries.
+  - Log_Time stored as TIMESTAMPTZ alongside entry but NOT in canonical bytes
+    (SDK-D1, Decision 50).
+  - Context propagated on all operations (not context.Background()).
 
-OVERVIEW:
-    Insert: called by submission.go after admission. Atomic with queue enqueue.
-    Fetch: implements builder.EntryFetcher. Returns EntryWithMetadata.
-    FetchByHash: secondary lookup for deduplication checks.
-
-KEY DEPENDENCIES:
-    - github.com/clearcompass-ai/ortholog-sdk/types: EntryWithMetadata, LogPosition
-    - github.com/jackc/pgx/v5: Postgres driver
+INVARIANTS:
+  - SDK-D5: all returned entries have verified signatures.
+  - Decision 47: Fetch returns nil for foreign log DIDs.
+  - Duplicate canonical_hash → ErrDuplicateEntry (mapped to HTTP 409).
 */
 package store
 
@@ -32,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -40,9 +33,9 @@ import (
 	"github.com/clearcompass-ai/ortholog-sdk/types"
 )
 
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 // 1) Entry Storage
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 
 // EntryStore handles entry persistence.
 type EntryStore struct {
@@ -69,7 +62,7 @@ type EntryRow struct {
 }
 
 // Insert persists an entry. Called within the admission transaction.
-// Fails on duplicate hash (UNIQUE constraint) — no silent overwrite.
+// Returns ErrDuplicateEntry on hash collision (UNIQUE constraint).
 func (s *EntryStore) Insert(ctx context.Context, tx pgx.Tx, row EntryRow) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO entries (
@@ -82,6 +75,10 @@ func (s *EntryStore) Insert(ctx context.Context, tx pgx.Tx, row EntryRow) error 
 		row.TargetRoot, row.CosignatureOf, row.SchemaRef,
 	)
 	if err != nil {
+		// Detect unique violation on canonical_hash.
+		if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
+			return ErrDuplicateEntry
+		}
 		return fmt.Errorf("store/entries: insert seq=%d: %w", row.SequenceNumber, err)
 	}
 	return nil
@@ -97,15 +94,34 @@ func (s *EntryStore) NextSequence(ctx context.Context, tx pgx.Tx) (uint64, error
 	return seq, nil
 }
 
-// -------------------------------------------------------------------------------------------------
+// FetchByHash checks if an entry with the given canonical hash exists.
+// Returns (sequenceNumber, true) if found, (0, false) if not.
+func (s *EntryStore) FetchByHash(ctx context.Context, hash [32]byte) (uint64, bool, error) {
+	var seq uint64
+	err := s.db.QueryRow(ctx,
+		"SELECT sequence_number FROM entries WHERE canonical_hash = $1", hash[:],
+	).Scan(&seq)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("store/entries: fetch by hash: %w", err)
+	}
+	return seq, true, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 2) PostgresEntryFetcher — implements sdk builder.EntryFetcher
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 
 // PostgresEntryFetcher implements builder.EntryFetcher.
-// CONTRACT: all returned entries have verified signatures (SDK-D5).
-// This invariant is established at admission (api/submission.go) and
-// preserved by the database — entries only reach the database after
-// signature verification passes.
+//
+// CONTRACT (SDK-D5): all returned entries have verified signatures.
+// This invariant is established at admission (api/submission.go step 2)
+// and preserved by the database.
+//
+// CONTRACT (Decision 47): returns nil for foreign log DIDs.
 type PostgresEntryFetcher struct {
 	db     *pgxpool.Pool
 	logDID string
@@ -117,19 +133,20 @@ func NewPostgresEntryFetcher(db *pgxpool.Pool, logDID string) *PostgresEntryFetc
 }
 
 // Fetch retrieves an entry by LogPosition. Returns nil if not found.
-// Only fetches entries on the local log (builder is local-only, Decision 47).
+// Only fetches entries on the local log (Decision 47: builder is local-only).
 func (f *PostgresEntryFetcher) Fetch(pos types.LogPosition) (*types.EntryWithMetadata, error) {
 	if pos.LogDID != f.logDID {
 		return nil, nil // Foreign log — not found locally (Decision 47).
 	}
 
+	ctx := context.TODO() // SDK interface doesn't accept context; use TODO.
 	var (
 		canonical []byte
 		logTime   time.Time
 		algoID    int16
 		sigBytes  []byte
 	)
-	err := f.db.QueryRow(context.Background(), `
+	err := f.db.QueryRow(ctx, `
 		SELECT canonical_bytes, log_time, sig_algorithm_id, sig_bytes
 		FROM entries WHERE sequence_number = $1`,
 		pos.Sequence,
@@ -143,31 +160,10 @@ func (f *PostgresEntryFetcher) Fetch(pos types.LogPosition) (*types.EntryWithMet
 	}
 
 	return &types.EntryWithMetadata{
-		CanonicalBytes: canonical,
-		LogTime:        logTime,
-		Position:       pos,
+		CanonicalBytes:  canonical,
+		LogTime:         logTime,
+		Position:        pos,
 		SignatureAlgoID: uint16(algoID),
 		SignatureBytes:  sigBytes,
 	}, nil
-}
-
-// -------------------------------------------------------------------------------------------------
-// 3) FetchByHash — deduplication support
-// -------------------------------------------------------------------------------------------------
-
-// FetchByHash checks if an entry with the given canonical hash already exists.
-// Used by submission.go to reject duplicate submissions before enqueuing.
-func (s *EntryStore) FetchByHash(ctx context.Context, hash [32]byte) (*uint64, error) {
-	var seq uint64
-	err := s.db.QueryRow(ctx,
-		"SELECT sequence_number FROM entries WHERE canonical_hash = $1", hash[:],
-	).Scan(&seq)
-
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("store/entries: fetch by hash: %w", err)
-	}
-	return &seq, nil
 }

@@ -1,23 +1,15 @@
 /*
-FILE PATH:
-    api/proofs.go
+FILE PATH: api/proofs.go
 
-DESCRIPTION:
-    SMT proof endpoints. Single membership/non-membership proofs, batch
-    multiproofs with SDK-D13 canonical ordering, and current root query.
+SMT proof endpoints. Single membership/non-membership proofs, batch
+multiproofs with SDK-D13 canonical ordering, and current root query.
 
 KEY ARCHITECTURAL DECISIONS:
-    - Proof generation uses sdk smt.Tree directly (same instance as builder)
-    - Batch proof uses SDK-D13 canonical key ordering
-    - Root endpoint includes latest commitment reference for auditability
-
-OVERVIEW:
-    GET /v1/smt/proof/:key → single proof (membership or non-membership)
-    POST /v1/smt/batch_proof → batch proof for multiple keys
-    GET /v1/smt/root → current SMT root hash
-
-KEY DEPENDENCIES:
-    - github.com/clearcompass-ai/ortholog-sdk/core/smt: proof generation
+  - Proof generation uses sdk smt.Tree (shared with builder — callers
+    should be aware of concurrent mutations; snapshot isolation is
+    recommended for production via read-replica or tree snapshot).
+  - Batch proof uses SDK-D13 canonical key ordering.
+  - Root endpoint includes leaf count for monitoring.
 */
 package api
 
@@ -31,19 +23,11 @@ import (
 	"github.com/clearcompass-ai/ortholog-sdk/core/smt"
 )
 
-// -------------------------------------------------------------------------------------------------
-// 1) SMT Proof Dependencies
-// -------------------------------------------------------------------------------------------------
-
 // SMTDeps holds dependencies for SMT proof handlers.
 type SMTDeps struct {
 	Tree   *smt.Tree
 	Logger *slog.Logger
 }
-
-// -------------------------------------------------------------------------------------------------
-// 2) Single Proof Handler
-// -------------------------------------------------------------------------------------------------
 
 // NewSMTProofHandler creates GET /v1/smt/proof/{key}.
 func NewSMTProofHandler(deps *SMTDeps) http.HandlerFunc {
@@ -58,7 +42,6 @@ func NewSMTProofHandler(deps *SMTDeps) http.HandlerFunc {
 		var key [32]byte
 		copy(key[:], keyBytes)
 
-		// Try membership first.
 		leaf, _ := deps.Tree.GetLeaf(key)
 		if leaf != nil {
 			proof, err := deps.Tree.GenerateMembershipProof(key)
@@ -75,10 +58,9 @@ func NewSMTProofHandler(deps *SMTDeps) http.HandlerFunc {
 			return
 		}
 
-		// Non-membership.
 		proof, err := deps.Tree.GenerateNonMembershipProof(key)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "non-membership proof generation failed")
+			writeError(w, http.StatusInternalServerError, "non-membership proof failed")
 			deps.Logger.Error("non-membership proof", "error", err)
 			return
 		}
@@ -89,10 +71,6 @@ func NewSMTProofHandler(deps *SMTDeps) http.HandlerFunc {
 		})
 	}
 }
-
-// -------------------------------------------------------------------------------------------------
-// 3) Batch Proof Handler
-// -------------------------------------------------------------------------------------------------
 
 // NewSMTBatchProofHandler creates POST /v1/smt/batch_proof.
 func NewSMTBatchProofHandler(deps *SMTDeps) http.HandlerFunc {
@@ -137,10 +115,6 @@ func NewSMTBatchProofHandler(deps *SMTDeps) http.HandlerFunc {
 	}
 }
 
-// -------------------------------------------------------------------------------------------------
-// 4) Root Handler
-// -------------------------------------------------------------------------------------------------
-
 // NewSMTRootHandler creates GET /v1/smt/root.
 func NewSMTRootHandler(deps *SMTDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -150,9 +124,11 @@ func NewSMTRootHandler(deps *SMTDeps) http.HandlerFunc {
 			deps.Logger.Error("smt root", "error", err)
 			return
 		}
+		leafCount, _ := deps.Tree.LeafCount()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"root": hex.EncodeToString(root[:]),
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"root":       hex.EncodeToString(root[:]),
+			"leaf_count": leafCount,
 		})
 	}
 }

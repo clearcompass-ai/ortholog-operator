@@ -1,19 +1,13 @@
 /*
-FILE PATH:
-    api/middleware/auth.go
+FILE PATH: api/middleware/auth.go
 
-DESCRIPTION:
-    Exchange session authentication middleware. Validates Bearer tokens
-    against the sessions table. Sets authenticated + exchangeDID in context.
-    Unauthenticated requests proceed as Mode B (compute stamp required).
+Exchange session authentication. Validates Bearer tokens against sessions table.
+Sets authenticated + exchangeDID in context.
 
 KEY ARCHITECTURAL DECISIONS:
-    - Context-based propagation: no globals, no thread-locals
-    - Token validation failure = unauthenticated (Mode B), NOT rejected
-    - Sessions table: token PK, exchange_did, expires_at
-
-KEY DEPENDENCIES:
-    - github.com/jackc/pgx/v5/pgxpool: session lookup
+  - Missing token → unauthenticated (Mode B). No error.
+  - Invalid/expired token → HTTP 401 (not silent fallthrough to Mode B).
+  - Valid token → context carries exchangeDID + authenticated=true.
 */
 package middleware
 
@@ -27,10 +21,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-// -------------------------------------------------------------------------------------------------
-// 1) Context Keys
-// -------------------------------------------------------------------------------------------------
 
 type contextKey string
 
@@ -51,16 +41,14 @@ func ExchangeDID(ctx context.Context) string {
 	return v
 }
 
-// -------------------------------------------------------------------------------------------------
-// 2) Auth Middleware
-// -------------------------------------------------------------------------------------------------
-
-// Auth validates Bearer tokens. Invalid/missing → unauthenticated context.
+// Auth validates Bearer tokens. Missing token → unauthenticated (Mode B).
+// Invalid/expired token → HTTP 401 (rejected, not Mode B fallthrough).
 func Auth(db *pgxpool.Pool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		token := extractBearerToken(r)
 		if token == "" {
+			// No token: proceed as unauthenticated (Mode B).
 			ctx = context.WithValue(ctx, ctxAuthenticated, false)
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
@@ -73,14 +61,16 @@ func Auth(db *pgxpool.Pool, next http.Handler) http.Handler {
 			token,
 		).Scan(&exchangeDID, &expiresAt)
 
-		if errors.Is(err, pgx.ErrNoRows) || (err == nil && time.Now().After(expiresAt)) {
-			ctx = context.WithValue(ctx, ctxAuthenticated, false)
-			next.ServeHTTP(w, r.WithContext(ctx))
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, `{"error":"invalid session token"}`, http.StatusUnauthorized)
 			return
 		}
 		if err != nil {
-			ctx = context.WithValue(ctx, ctxAuthenticated, false)
-			next.ServeHTTP(w, r.WithContext(ctx))
+			http.Error(w, `{"error":"session lookup failed"}`, http.StatusInternalServerError)
+			return
+		}
+		if time.Now().After(expiresAt) {
+			http.Error(w, `{"error":"session expired"}`, http.StatusUnauthorized)
 			return
 		}
 

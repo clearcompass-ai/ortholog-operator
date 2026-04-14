@@ -1,9 +1,7 @@
 /*
-FILE PATH:
-    store/indexes/schema_ref.go
+FILE PATH: store/indexes/schema_ref.go
 
-DESCRIPTION:
-    QueryBySchemaRef — all entries governed by a specific schema.
+QueryBySchemaRef — all entries governed by a specific schema.
 */
 package indexes
 
@@ -11,29 +9,22 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/clearcompass-ai/ortholog-sdk/types"
+
+	"github.com/clearcompass-ai/ortholog-operator/store"
 )
 
-type SchemaRefIndex struct {
-	db     *pgxpool.Pool
-	logDID string
-}
-
-func NewSchemaRefIndex(db *pgxpool.Pool, logDID string) *SchemaRefIndex {
-	return &SchemaRefIndex{db: db, logDID: logDID}
-}
-
-func (idx *SchemaRefIndex) Query(ctx context.Context, posBytes []byte) ([]types.EntryWithMetadata, error) {
-	rows, err := idx.db.Query(ctx, `
+// QueryBySchemaRef returns entries referencing the given schema position.
+func (q *PostgresQueryAPI) QueryBySchemaRef(pos types.LogPosition) ([]types.EntryWithMetadata, error) {
+	ctx := context.TODO()
+	posBytes := store.SerializeLogPosition(pos)
+	rows, err := q.db.Query(ctx, `
 		SELECT sequence_number, canonical_bytes, log_time, sig_algorithm_id, sig_bytes
-		FROM entries WHERE schema_ref = $1 ORDER BY sequence_number`,
+		FROM entries WHERE schema_ref = $1 ORDER BY sequence_number ASC`,
 		posBytes,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store/indexes/schema_ref: %w", err)
 	}
-	defer rows.Close()
-	return scanEntries(rows, idx.logDID)
+	return scanEntries(ctx, rows, q.logDID)
 }

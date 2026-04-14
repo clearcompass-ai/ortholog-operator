@@ -1,28 +1,22 @@
 /*
-FILE PATH:
-    store/postgres.go
+Package store provides Postgres persistence for the Ortholog operator.
 
-DESCRIPTION:
-    Postgres connection pool, embedded DDL migrations, transaction manager,
-    and advisory locking for builder exclusivity. Single source of truth
-    for the database schema.
+FILE PATH: store/postgres.go
+
+Connection pool, embedded DDL migrations, transaction manager, and advisory
+locking for builder exclusivity. Single source of truth for the database schema.
 
 KEY ARCHITECTURAL DECISIONS:
-    - pgxpool for connection pooling: native Postgres wire protocol, no CGo
-    - Migrations embedded as Go constants: single-binary deployment, no
-      external migration tool dependency
-    - Advisory lock (pg_advisory_lock) prevents concurrent builder instances
-      on the same log — determinism requires exactly one builder per log
-    - All schema changes are additive (new tables/columns only) to match
-      the protocol's additive-only evolution guarantee
+  - pgxpool for connection pooling: native Postgres wire protocol, no CGo.
+  - Migrations embedded as Go constants: single-binary deployment.
+  - Advisory lock prevents concurrent builder instances per log.
+  - All schema changes additive (new tables/columns only).
 
-OVERVIEW:
-    InitPool → RunMigrations → AcquireBuilderLock → ready.
-    TransactionManager wraps pgx.Tx for atomic multi-table commits
-    (builder loop commits leaf mutations + buffer + queue status atomically).
-
-KEY DEPENDENCIES:
-    - github.com/jackc/pgx/v5/pgxpool: connection pooling
+INVARIANTS:
+  - BuilderLockID ensures exactly one builder per database.
+  - Migrations are idempotent and ordered.
+  - WithTransaction uses Serializable for builder commits, ReadCommitted
+    for admission (configurable via TxOptions parameter).
 */
 package store
 
@@ -35,11 +29,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 // 1) Connection Pool
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 
-// Pool wraps pgxpool.Pool with operator-specific lifecycle.
+// Pool wraps pgxpool.Pool with operator lifecycle.
 type Pool struct {
 	DB  *pgxpool.Pool
 	cfg PoolConfig
@@ -71,7 +65,6 @@ func InitPool(ctx context.Context, cfg PoolConfig) (*Pool, error) {
 		return nil, fmt.Errorf("store: pool creation failed: %w", err)
 	}
 
-	// Validate connectivity immediately. No lazy init.
 	if err := db.Ping(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: database unreachable: %w", err)
@@ -80,122 +73,124 @@ func InitPool(ctx context.Context, cfg PoolConfig) (*Pool, error) {
 	return &Pool{DB: db, cfg: cfg}, nil
 }
 
-// Close shuts down the pool. Call during graceful shutdown.
-func (p *Pool) Close() {
-	p.DB.Close()
-}
+// Close shuts down the pool.
+func (p *Pool) Close() { p.DB.Close() }
 
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 // 2) Migrations — embedded DDL, executed sequentially on startup
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 
-// migrations is the ordered list of DDL statements. Each runs in its own
-// transaction. Index is the migration version number.
-var migrations = []string{
-	// v0: migration tracking table
-	`CREATE TABLE IF NOT EXISTS schema_migrations (
-		version  INT PRIMARY KEY,
-		applied  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	)`,
-
-	// v1: entries table — core log storage
-	`CREATE TABLE IF NOT EXISTS entries (
-		sequence_number  BIGINT       PRIMARY KEY,
-		canonical_bytes  BYTEA        NOT NULL,
-		canonical_hash   BYTEA        NOT NULL UNIQUE,
-		log_time         TIMESTAMPTZ  NOT NULL,
-		sig_algorithm_id SMALLINT     NOT NULL,
-		sig_bytes        BYTEA        NOT NULL,
-		signer_did       TEXT         NOT NULL,
-		target_root      BYTEA,
-		cosignature_of   BYTEA,
-		schema_ref       BYTEA
-	)`,
-
-	// v2: entry indexes — all 5 query interfaces
-	`CREATE INDEX IF NOT EXISTS idx_signer_did ON entries (signer_did);
-	 CREATE INDEX IF NOT EXISTS idx_target_root ON entries (target_root) WHERE target_root IS NOT NULL;
-	 CREATE INDEX IF NOT EXISTS idx_cosignature_of ON entries (cosignature_of) WHERE cosignature_of IS NOT NULL;
-	 CREATE INDEX IF NOT EXISTS idx_schema_ref ON entries (schema_ref) WHERE schema_ref IS NOT NULL`,
-
-	// v3: SMT state persistence
-	`CREATE TABLE IF NOT EXISTS smt_leaves (
-		leaf_key      BYTEA    PRIMARY KEY,
-		origin_tip    BYTEA    NOT NULL,
-		authority_tip BYTEA    NOT NULL,
-		updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE TABLE IF NOT EXISTS smt_nodes (
-		path_key   BYTEA    PRIMARY KEY,
-		hash       BYTEA    NOT NULL,
-		depth      INT      NOT NULL,
-		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	)`,
-
-	// v4: credits, tree heads, delta buffers
-	`CREATE TABLE IF NOT EXISTS credits (
-		exchange_did    TEXT    PRIMARY KEY,
-		balance         BIGINT NOT NULL DEFAULT 0,
-		total_purchased BIGINT NOT NULL DEFAULT 0,
-		total_consumed  BIGINT NOT NULL DEFAULT 0,
-		updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE TABLE IF NOT EXISTS tree_heads (
-		tree_size    BIGINT   PRIMARY KEY,
-		root_hash    BYTEA    NOT NULL,
-		scheme_tag   SMALLINT NOT NULL,
-		cosignatures BYTEA    NOT NULL,
-		created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE TABLE IF NOT EXISTS delta_window_buffers (
-		leaf_key    BYTEA   PRIMARY KEY,
-		tip_history BYTEA   NOT NULL,
-		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	)`,
-
-	// v5: builder queue, witness sets, equivocation proofs, sessions
-	`CREATE TABLE IF NOT EXISTS builder_queue (
-		sequence_number BIGINT      PRIMARY KEY,
-		status          SMALLINT    NOT NULL DEFAULT 0,
-		enqueued_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE TABLE IF NOT EXISTS witness_sets (
-		version     SERIAL   PRIMARY KEY,
-		set_hash    BYTEA    NOT NULL,
-		keys_json   BYTEA    NOT NULL,
-		scheme_tag  SMALLINT NOT NULL,
-		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE TABLE IF NOT EXISTS equivocation_proofs (
-		id         SERIAL      PRIMARY KEY,
-		head_a     BYTEA       NOT NULL,
-		head_b     BYTEA       NOT NULL,
-		tree_size  BIGINT      NOT NULL,
-		detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE TABLE IF NOT EXISTS sessions (
-		token       TEXT        PRIMARY KEY,
-		exchange_did TEXT       NOT NULL,
-		expires_at  TIMESTAMPTZ NOT NULL,
-		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	)`,
-
-	// v6: sequence counter for gapless assignment
-	`CREATE SEQUENCE IF NOT EXISTS entry_sequence START 1 NO CYCLE`,
+var migrations = []struct {
+	version int
+	stmts   []string
+}{
+	{0, []string{
+		`CREATE TABLE IF NOT EXISTS schema_migrations (
+			version  INT PRIMARY KEY,
+			applied  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+	}},
+	{1, []string{
+		`CREATE TABLE IF NOT EXISTS entries (
+			sequence_number  BIGINT       PRIMARY KEY,
+			canonical_bytes  BYTEA        NOT NULL,
+			canonical_hash   BYTEA        NOT NULL UNIQUE,
+			log_time         TIMESTAMPTZ  NOT NULL,
+			sig_algorithm_id SMALLINT     NOT NULL,
+			sig_bytes        BYTEA        NOT NULL,
+			signer_did       TEXT         NOT NULL CHECK (signer_did <> ''),
+			target_root      BYTEA,
+			cosignature_of   BYTEA,
+			schema_ref       BYTEA
+		)`,
+	}},
+	{2, []string{
+		`CREATE INDEX IF NOT EXISTS idx_signer_did ON entries (signer_did)`,
+		`CREATE INDEX IF NOT EXISTS idx_target_root ON entries (target_root) WHERE target_root IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_cosignature_of ON entries (cosignature_of) WHERE cosignature_of IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_schema_ref ON entries (schema_ref) WHERE schema_ref IS NOT NULL`,
+	}},
+	{3, []string{
+		`CREATE TABLE IF NOT EXISTS smt_leaves (
+			leaf_key      BYTEA    PRIMARY KEY,
+			origin_tip    BYTEA    NOT NULL,
+			authority_tip BYTEA    NOT NULL,
+			updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS smt_nodes (
+			path_key   BYTEA    PRIMARY KEY,
+			hash       BYTEA    NOT NULL,
+			depth      INT      NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+	}},
+	{4, []string{
+		`CREATE TABLE IF NOT EXISTS credits (
+			exchange_did    TEXT    PRIMARY KEY,
+			balance         BIGINT NOT NULL DEFAULT 0,
+			total_purchased BIGINT NOT NULL DEFAULT 0,
+			total_consumed  BIGINT NOT NULL DEFAULT 0,
+			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS tree_heads (
+			tree_size    BIGINT   PRIMARY KEY,
+			root_hash    BYTEA    NOT NULL,
+			scheme_tag   SMALLINT NOT NULL,
+			cosignatures BYTEA    NOT NULL,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS delta_window_buffers (
+			leaf_key    BYTEA   PRIMARY KEY,
+			tip_history BYTEA   NOT NULL,
+			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+	}},
+	{5, []string{
+		`CREATE TABLE IF NOT EXISTS builder_queue (
+			sequence_number BIGINT      PRIMARY KEY,
+			status          SMALLINT    NOT NULL DEFAULT 0,
+			enqueued_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			processed_at    TIMESTAMPTZ
+		)`,
+		`CREATE TABLE IF NOT EXISTS witness_sets (
+			version     SERIAL   PRIMARY KEY,
+			set_hash    BYTEA    NOT NULL,
+			keys_json   BYTEA    NOT NULL,
+			scheme_tag  SMALLINT NOT NULL,
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS equivocation_proofs (
+			id         SERIAL      PRIMARY KEY,
+			head_a     BYTEA       NOT NULL,
+			head_b     BYTEA       NOT NULL,
+			tree_size  BIGINT      NOT NULL,
+			detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS sessions (
+			token       TEXT        PRIMARY KEY,
+			exchange_did TEXT       NOT NULL,
+			expires_at  TIMESTAMPTZ NOT NULL,
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+	}},
+	{6, []string{
+		`CREATE SEQUENCE IF NOT EXISTS entry_sequence START 1 NO CYCLE`,
+	}},
 }
 
-// RunMigrations executes all pending migrations. Each migration is atomic.
-// Fails on any error — no partial migration state.
+// RunMigrations executes all pending migrations. Each statement is atomic.
 func RunMigrations(ctx context.Context, db *pgxpool.Pool) error {
 	// Ensure migration table exists (migration v0).
-	if _, err := db.Exec(ctx, migrations[0]); err != nil {
-		return fmt.Errorf("store: migration v0 failed: %w", err)
+	for _, stmt := range migrations[0].stmts {
+		if _, err := db.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("store: migration v0 failed: %w", err)
+		}
 	}
 
-	for i := 1; i < len(migrations); i++ {
-		applied, err := isMigrationApplied(ctx, db, i)
+	for _, m := range migrations[1:] {
+		applied, err := isMigrationApplied(ctx, db, m.version)
 		if err != nil {
-			return fmt.Errorf("store: checking migration v%d: %w", i, err)
+			return fmt.Errorf("store: checking migration v%d: %w", m.version, err)
 		}
 		if applied {
 			continue
@@ -203,21 +198,23 @@ func RunMigrations(ctx context.Context, db *pgxpool.Pool) error {
 
 		tx, err := db.Begin(ctx)
 		if err != nil {
-			return fmt.Errorf("store: begin migration v%d: %w", i, err)
+			return fmt.Errorf("store: begin migration v%d: %w", m.version, err)
 		}
 
-		if _, err := tx.Exec(ctx, migrations[i]); err != nil {
-			_ = tx.Rollback(ctx)
-			return fmt.Errorf("store: migration v%d failed: %w", i, err)
+		for _, stmt := range m.stmts {
+			if _, err := tx.Exec(ctx, stmt); err != nil {
+				_ = tx.Rollback(ctx)
+				return fmt.Errorf("store: migration v%d stmt failed: %w", m.version, err)
+			}
 		}
 
-		if _, err := tx.Exec(ctx, "INSERT INTO schema_migrations (version) VALUES ($1)", i); err != nil {
+		if _, err := tx.Exec(ctx, "INSERT INTO schema_migrations (version) VALUES ($1)", m.version); err != nil {
 			_ = tx.Rollback(ctx)
-			return fmt.Errorf("store: recording migration v%d: %w", i, err)
+			return fmt.Errorf("store: recording migration v%d: %w", m.version, err)
 		}
 
 		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("store: commit migration v%d: %w", i, err)
+			return fmt.Errorf("store: commit migration v%d: %w", m.version, err)
 		}
 	}
 	return nil
@@ -225,13 +222,15 @@ func RunMigrations(ctx context.Context, db *pgxpool.Pool) error {
 
 func isMigrationApplied(ctx context.Context, db *pgxpool.Pool, version int) (bool, error) {
 	var exists bool
-	err := db.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)", version).Scan(&exists)
+	err := db.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)", version,
+	).Scan(&exists)
 	return exists, err
 }
 
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 // 3) Advisory Lock — builder exclusivity
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 
 // BuilderLockID is the Postgres advisory lock key for builder exclusivity.
 // One builder per log. Concurrent builders produce non-deterministic state.
@@ -255,17 +254,17 @@ func AcquireBuilderLock(ctx context.Context, db *pgxpool.Pool) (release func(), 
 	}, nil
 }
 
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 // 4) Transaction Manager
-// -------------------------------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 
 // TxFunc is a function executed within a transaction.
 type TxFunc func(ctx context.Context, tx pgx.Tx) error
 
-// WithTransaction executes fn within a serializable transaction.
-// Commits on success, rolls back on error. No partial commits.
-func WithTransaction(ctx context.Context, db *pgxpool.Pool, fn TxFunc) error {
-	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+// WithTransaction executes fn within a transaction at the given isolation level.
+// Commits on success, rolls back on error.
+func WithTransaction(ctx context.Context, db *pgxpool.Pool, iso pgx.TxIsoLevel, fn TxFunc) error {
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: iso})
 	if err != nil {
 		return fmt.Errorf("store: begin tx: %w", err)
 	}
@@ -282,3 +281,23 @@ func WithTransaction(ctx context.Context, db *pgxpool.Pool, fn TxFunc) error {
 	}
 	return nil
 }
+
+// WithSerializableTx is a convenience for Serializable isolation.
+func WithSerializableTx(ctx context.Context, db *pgxpool.Pool, fn TxFunc) error {
+	return WithTransaction(ctx, db, pgx.Serializable, fn)
+}
+
+// WithReadCommittedTx is a convenience for ReadCommitted isolation (admission).
+func WithReadCommittedTx(ctx context.Context, db *pgxpool.Pool, fn TxFunc) error {
+	return WithTransaction(ctx, db, pgx.ReadCommitted, fn)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5) Errors
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ErrInsufficientCredits signals balance = 0. Upstream returns HTTP 402.
+var ErrInsufficientCredits = fmt.Errorf("store/credits: insufficient credits")
+
+// ErrDuplicateEntry signals a UNIQUE constraint violation on canonical_hash.
+var ErrDuplicateEntry = fmt.Errorf("store/entries: duplicate entry")

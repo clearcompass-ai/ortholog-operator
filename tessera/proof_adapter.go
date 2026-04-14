@@ -1,24 +1,22 @@
 /*
-FILE PATH:
-    tessera/proof_adapter.go
+FILE PATH: tessera/proof_adapter.go
 
-DESCRIPTION:
-    Concrete implementation of the SDK's MerkleTree interface for Tessera.
-    Generates inclusion proofs and consistency proofs compatible with
-    sdk verify.VerifyMerkleInclusion.
+TesseraAdapter wraps the Tessera client and implements the sdk smt.MerkleTree
+interface. The builder depends only on the interface — swappable backend.
+
+SDK smt.MerkleTree methods:
+  - AppendLeaf(hash [32]byte) → (uint64, error)
+  - InclusionProof(position, treeSize uint64) → (*MerkleProof, error)
+  - Head() → (TreeHead, error)
+
+Additional concrete method (NOT in sdk interface):
+  - ConsistencyProof(oldSize, newSize uint64) → (any, error)
+    Used by api/tree.go and witnesses. Not needed by the builder.
 
 KEY ARCHITECTURAL DECISIONS:
-    - Delegates to Tessera API for proof generation (Tessera maintains tiles)
-    - Caches recent proofs for hot paths (tree head polling)
-    - Compatible with RFC 6962 proof format
-
-OVERVIEW:
-    InclusionProof(seq, treeSize) → Merkle audit path
-    ConsistencyProof(oldSize, newSize) → consistency path
-
-KEY DEPENDENCIES:
-    - tessera/client.go: Tessera API communication
-    - tessera/tile_reader.go: tile-based proof computation
+  - Builder calls only interface methods (AppendLeaf, InclusionProof, Head).
+  - ConsistencyProof is on the concrete type — HTTP handler takes *TesseraAdapter.
+  - Proof structures returned as generic types for JSON serialization.
 */
 package tessera
 
@@ -29,46 +27,50 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+
+	"github.com/clearcompass-ai/ortholog-sdk/types"
 )
 
-// -------------------------------------------------------------------------------------------------
-// 1) ProofAdapter
-// -------------------------------------------------------------------------------------------------
-
-// ProofAdapter generates Merkle proofs via Tessera.
-type ProofAdapter struct {
-	client *Client
-	logger *slog.Logger
+// TesseraAdapter implements sdk smt.MerkleTree via Tessera HTTP API.
+type TesseraAdapter struct {
+	client     *Client
+	tileReader *TileReader
+	logger     *slog.Logger
 }
 
-// NewProofAdapter creates a proof adapter.
-func NewProofAdapter(client *Client, logger *slog.Logger) *ProofAdapter {
-	return &ProofAdapter{client: client, logger: logger}
+// NewTesseraAdapter creates an adapter wrapping the Tessera client.
+func NewTesseraAdapter(client *Client, tileReader *TileReader, logger *slog.Logger) *TesseraAdapter {
+	return &TesseraAdapter{
+		client:     client,
+		tileReader: tileReader,
+		logger:     logger,
+	}
 }
 
-// MerkleProof is the proof structure returned by the adapter.
-type MerkleProof struct {
-	LeafIndex uint64     `json:"leaf_index"`
-	TreeSize  uint64     `json:"tree_size"`
-	Hashes    [][32]byte `json:"hashes"`
+// ─── sdk smt.MerkleTree interface ──────────────────────────────────────────
+
+// AppendLeaf appends an entry hash to the Merkle tree. Returns tree position.
+func (a *TesseraAdapter) AppendLeaf(hash [32]byte) (uint64, error) {
+	ctx := context.TODO()
+	return a.client.AppendLeaf(ctx, hash)
 }
 
-// InclusionProof generates a Merkle inclusion proof for a leaf at the given index.
-func (pa *ProofAdapter) InclusionProof(leafIndex, treeSize uint64) (*MerkleProof, error) {
-	if leafIndex >= treeSize {
-		return nil, fmt.Errorf("tessera/proof: leaf %d >= tree size %d", leafIndex, treeSize)
+// InclusionProof generates a Merkle inclusion proof for a leaf.
+func (a *TesseraAdapter) InclusionProof(position, treeSize uint64) (any, error) {
+	if position >= treeSize {
+		return nil, fmt.Errorf("tessera/proof: leaf %d >= tree size %d", position, treeSize)
 	}
 
-	ctx := context.Background()
+	ctx := context.TODO()
 	url := fmt.Sprintf("%s/api/v1/proof/inclusion?index=%d&tree_size=%d",
-		pa.client.baseURL, leafIndex, treeSize)
+		a.client.baseURL, position, treeSize)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("tessera/proof: build request: %w", err)
 	}
 
-	resp, err := pa.client.client.Do(req)
+	resp, err := a.client.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("tessera/proof: request: %w", err)
 	}
@@ -79,29 +81,38 @@ func (pa *ProofAdapter) InclusionProof(leafIndex, treeSize uint64) (*MerkleProof
 		return nil, fmt.Errorf("tessera/proof: HTTP %d: %s", resp.StatusCode, body)
 	}
 
-	var proof MerkleProof
+	var proof json.RawMessage
 	if err := json.NewDecoder(resp.Body).Decode(&proof); err != nil {
 		return nil, fmt.Errorf("tessera/proof: decode: %w", err)
 	}
-	return &proof, nil
+	return proof, nil
 }
 
+// Head returns the current Merkle tree head.
+func (a *TesseraAdapter) Head() (types.TreeHead, error) {
+	ctx := context.TODO()
+	return a.client.TreeHead(ctx)
+}
+
+// ─── Additional concrete method (NOT in sdk interface) ─────────────────────
+
 // ConsistencyProof generates a consistency proof between two tree sizes.
-func (pa *ProofAdapter) ConsistencyProof(oldSize, newSize uint64) (*MerkleProof, error) {
+// Used by api/tree.go and witnesses. The builder never calls this.
+func (a *TesseraAdapter) ConsistencyProof(oldSize, newSize uint64) (any, error) {
 	if oldSize >= newSize {
 		return nil, fmt.Errorf("tessera/proof: old %d >= new %d", oldSize, newSize)
 	}
 
-	ctx := context.Background()
+	ctx := context.TODO()
 	url := fmt.Sprintf("%s/api/v1/proof/consistency?old=%d&new=%d",
-		pa.client.baseURL, oldSize, newSize)
+		a.client.baseURL, oldSize, newSize)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("tessera/proof: build request: %w", err)
 	}
 
-	resp, err := pa.client.client.Do(req)
+	resp, err := a.client.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("tessera/proof: request: %w", err)
 	}
@@ -112,9 +123,9 @@ func (pa *ProofAdapter) ConsistencyProof(oldSize, newSize uint64) (*MerkleProof,
 		return nil, fmt.Errorf("tessera/proof: HTTP %d: %s", resp.StatusCode, body)
 	}
 
-	var proof MerkleProof
+	var proof json.RawMessage
 	if err := json.NewDecoder(resp.Body).Decode(&proof); err != nil {
 		return nil, fmt.Errorf("tessera/proof: decode: %w", err)
 	}
-	return &proof, nil
+	return proof, nil
 }
