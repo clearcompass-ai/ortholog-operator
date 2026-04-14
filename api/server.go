@@ -9,6 +9,7 @@ KEY ARCHITECTURAL DECISIONS:
   - Middleware chain: size_limit → auth → handler (for submission).
   - All handlers receive dependencies via closure (no globals).
   - Readiness flag is atomic for thread-safe shutdown signaling.
+  - WitnessCosign route registered only when this operator serves as a witness.
 */
 package api
 
@@ -63,19 +64,24 @@ type Server struct {
 
 // Handlers holds all registered handler functions.
 type Handlers struct {
-	Submission     http.HandlerFunc
-	TreeHead       http.HandlerFunc
-	TreeInclusion  http.HandlerFunc
+	Submission      http.HandlerFunc
+	TreeHead        http.HandlerFunc
+	TreeInclusion   http.HandlerFunc
 	TreeConsistency http.HandlerFunc
-	SMTProof       http.HandlerFunc
-	SMTBatchProof  http.HandlerFunc
-	SMTRoot        http.HandlerFunc
-	CosignatureOf  http.HandlerFunc
-	TargetRoot     http.HandlerFunc
-	SignerDID      http.HandlerFunc
-	SchemaRef      http.HandlerFunc
-	Scan           http.HandlerFunc
-	Difficulty     http.HandlerFunc
+	SMTProof        http.HandlerFunc
+	SMTBatchProof   http.HandlerFunc
+	SMTRoot         http.HandlerFunc
+	CosignatureOf   http.HandlerFunc
+	TargetRoot      http.HandlerFunc
+	SignerDID       http.HandlerFunc
+	SchemaRef       http.HandlerFunc
+	Scan            http.HandlerFunc
+	Difficulty      http.HandlerFunc
+
+	// WitnessCosign handles POST /v1/cosign requests from peer operators.
+	// nil if this operator does not serve as a witness.
+	// Set to witness.NewCosignHandler(...) when witness key is configured.
+	WitnessCosign http.Handler
 }
 
 // NewServer creates the HTTP server with all routes and middleware applied.
@@ -108,11 +114,13 @@ func NewServer(
 	// ── Submission — with full middleware chain ─────────────────────────
 	// Chain: SizeLimit → Auth → submission handler.
 	// Auth sets context values; submission reads them.
-	submissionChain := middleware.SizeLimit(
-		cfg.MaxEntrySize+1024, // sig overhead
-		middleware.Auth(db, handlers.Submission),
-	)
-	mux.Handle("POST /v1/entries", submissionChain)
+	if handlers.Submission != nil {
+		submissionChain := middleware.SizeLimit(
+			cfg.MaxEntrySize+1024, // sig overhead
+			middleware.Auth(db, handlers.Submission),
+		)
+		mux.Handle("POST /v1/entries", submissionChain)
+	}
 
 	// ── Tree head + proofs (read-only, no auth required) ───────────────
 	mux.HandleFunc("GET /v1/tree/head", handlers.TreeHead)
@@ -133,6 +141,13 @@ func NewServer(
 
 	// ── Admission info (read-only) ─────────────────────────────────────
 	mux.HandleFunc("GET /v1/admission/difficulty", handlers.Difficulty)
+
+	// ── Witness cosign endpoint (optional) ─────────────────────────────
+	// Registered only when this operator is configured to serve as a
+	// witness for peer operators. nil = not a witness.
+	if handlers.WitnessCosign != nil {
+		mux.Handle("POST /v1/cosign", handlers.WitnessCosign)
+	}
 
 	s.httpServer = &http.Server{
 		Addr:         cfg.Addr,

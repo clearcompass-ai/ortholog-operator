@@ -21,6 +21,7 @@ WHAT'S MISSING vs cmd/operator/main.go:
   - No anchor publisher, no equivocation monitor.
   - No write pool — connects to replica_dsn only.
   - Difficulty served from config (static, not queue-adaptive).
+  - No witness cosign endpoint (read-only instances don't sign).
 */
 package main
 
@@ -156,6 +157,7 @@ func run(logger *slog.Logger) error {
 		SchemaRef:       api.NewQuerySchemaRefHandler(queryDeps),
 		Scan:            api.NewQueryScanHandler(queryDeps),
 		Difficulty:      api.NewDifficultyHandler(queryDeps),
+		WitnessCosign:   nil, // Read-only instances never serve as witnesses.
 	}
 
 	serverCfg := api.DefaultServerConfig()

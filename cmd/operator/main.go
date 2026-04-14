@@ -11,6 +11,8 @@ KEY ARCHITECTURAL DECISIONS:
   - Graceful shutdown: SIGTERM → drain → exit 0.
   - TesseraAdapter implements sdk MerkleTree; injected into builder loop.
   - InMemoryEntryStore for entry bytes (production: TesseraEntryReader).
+  - DIDResolver: nil until Phase 4 DID resolution is deployed.
+  - WitnessCosign: nil until witness key is configured.
 */
 package main
 
@@ -242,6 +244,10 @@ func run(logger *slog.Logger) error {
 		MaxEntrySize:   int64(cfg.MaxEntrySize),
 		DiffController: diffController,
 		Logger:         logger,
+
+		// Phase 4: replace with did.NewResolver(httpClient) when DID
+		// resolution infrastructure is deployed. nil = Phase 2 trust model.
+		DIDResolver: nil,
 	}
 
 	treeDeps := &api.TreeDeps{
@@ -273,6 +279,15 @@ func run(logger *slog.Logger) error {
 		SchemaRef:       api.NewQuerySchemaRefHandler(queryDeps),
 		Scan:            api.NewQueryScanHandler(queryDeps),
 		Difficulty:      api.NewDifficultyHandler(queryDeps),
+
+		// Witness cosign endpoint: nil until witness key is configured.
+		// When this operator serves as a witness for peer logs:
+		//   witnessKey := loadWitnessKey(cfg)
+		//   handlers.WitnessCosign = witness.NewCosignHandler(witness.ServeConfig{
+		//       WitnessKey: witnessKey,
+		//       Logger:     logger,
+		//   })
+		WitnessCosign: nil,
 	}
 
 	serverCfg := api.DefaultServerConfig()

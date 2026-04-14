@@ -14,6 +14,8 @@ KEY ARCHITECTURAL DECISIONS:
   - Protocol version validated at step 1 (preamble check).
   - Canonical hash computed from RAW canonical bytes (not re-serialized).
   - Duplicate hash mapped to HTTP 409 (not generic 500).
+  - DIDResolver: nil = Phase 2 wire format trust model.
+                  set = Phase 4 full DID→pubkey→VerifyEntry.
 
 INVARIANTS:
   - Past step 2: all entries have verified signatures (SDK-D5).
@@ -24,6 +26,7 @@ package api
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -40,6 +43,7 @@ import (
 
 	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
 	"github.com/clearcompass-ai/ortholog-sdk/crypto/admission"
+	"github.com/clearcompass-ai/ortholog-sdk/crypto/signatures"
 
 	"github.com/clearcompass-ai/ortholog-operator/api/middleware"
 	"github.com/clearcompass-ai/ortholog-operator/builder"
@@ -48,7 +52,20 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1) Submission Dependencies
+// 1) DID Resolution Interface (Phase 4 signature verification)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// DIDResolver resolves a signer DID to its current secp256k1 public key.
+// Phase 4 SDK provides the concrete implementation (did/resolver.go).
+//
+// nil = Phase 2 trust model (wire format integrity only).
+// set = Phase 4 full verification (DID → pubkey → sdk VerifyEntry).
+type DIDResolver interface {
+	ResolvePublicKey(ctx context.Context, did string) (*ecdsa.PublicKey, error)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2) Submission Dependencies
 // ─────────────────────────────────────────────────────────────────────────────
 
 // SubmissionDeps holds dependencies for the submission handler.
@@ -62,10 +79,16 @@ type SubmissionDeps struct {
 	MaxEntrySize    int64
 	DiffController  *middleware.DifficultyController
 	Logger          *slog.Logger
+
+	// DIDResolver resolves signer DIDs to public keys for signature verification.
+	// nil = Phase 2 trust model (wire format integrity only, no cryptographic
+	//       verification — StripSignature + Deserialize establishes format).
+	// set = Phase 4 full verification (DID → pubkey → VerifyEntry).
+	DIDResolver DIDResolver
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2) Submission Handler
+// 3) Submission Handler
 // ─────────────────────────────────────────────────────────────────────────────
 
 // NewSubmissionHandler creates the POST /v1/entries handler.
@@ -113,17 +136,34 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 			return
 		}
 
-		// Signature verification: Phase 2 trusts the admission pipeline.
-		// Mode A: the exchange has already verified the signer's identity.
-		// Mode B: the PoW stamp proves computational commitment.
-		// Phase 4 adds DID resolution → public key lookup → sdk VerifyEntry.
-		// StripSignature + Deserialize success establishes wire format integrity.
-		_ = sigBytes
-
 		// Validate signer_did is non-empty.
 		if entry.Header.SignerDID == "" {
 			writeError(w, http.StatusUnprocessableEntity, "empty signer DID")
 			return
+		}
+
+		// Signature verification dispatch:
+		if deps.DIDResolver != nil {
+			// Phase 4: full cryptographic verification.
+			// DID → public key → sdk VerifyEntry.
+			pubkey, resolveErr := deps.DIDResolver.ResolvePublicKey(ctx, entry.Header.SignerDID)
+			if resolveErr != nil {
+				writeError(w, http.StatusUnauthorized,
+					fmt.Sprintf("DID resolution failed for %s: %s", entry.Header.SignerDID, resolveErr))
+				return
+			}
+			canonicalHash := sha256.Sum256(canonical)
+			if verifyErr := signatures.VerifyEntry(canonicalHash, sigBytes, pubkey); verifyErr != nil {
+				writeError(w, http.StatusUnauthorized,
+					fmt.Sprintf("signature verification failed: %s", verifyErr))
+				return
+			}
+		} else {
+			// Phase 2 trust model: wire format integrity only.
+			// Mode A: the exchange has already verified the signer's identity.
+			// Mode B: the PoW stamp proves computational commitment.
+			// StripSignature + Deserialize success establishes wire format integrity.
+			_ = sigBytes
 		}
 
 		// ── Step 3: Entry size (SDK-D11) ───────────────────────────────
@@ -276,7 +316,7 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3) Shared helpers
+// 4) Shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 func writeError(w http.ResponseWriter, status int, msg string) {

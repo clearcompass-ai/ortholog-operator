@@ -9,6 +9,9 @@ KEY ARCHITECTURAL DECISIONS:
   - ETag: tree_size (monotonic) for conditional polling.
   - Inclusion proofs compatible with sdk verify.VerifyMerkleInclusion.
   - ConsistencyProver is a separate interface (not part of sdk MerkleTree).
+  - InclusionProver uses RawInclusionProof (returns any for JSON passthrough).
+    Phase 4 cross-log verification uses TypedInclusionProof on the concrete
+    TesseraAdapter (returns *types.MerkleProof).
 */
 package api
 
@@ -28,9 +31,12 @@ type ConsistencyProver interface {
 	ConsistencyProof(oldSize, newSize uint64) (any, error)
 }
 
-// InclusionProver generates inclusion proofs.
+// InclusionProver generates inclusion proofs for HTTP passthrough.
+// Returns raw JSON (any) — not parsed into types.MerkleProof.
+// Phase 4 cross-log verification uses TesseraAdapter.TypedInclusionProof
+// directly (returns *types.MerkleProof for smt.VerifyMerkleInclusion).
 type InclusionProver interface {
-	InclusionProof(position, treeSize uint64) (any, error)
+	RawInclusionProof(position, treeSize uint64) (any, error)
 }
 
 // TreeDeps holds dependencies for tree handlers.
@@ -99,7 +105,7 @@ func NewTreeInclusionHandler(deps *TreeDeps) http.HandlerFunc {
 			return
 		}
 
-		proof, err := deps.Inclusion.InclusionProof(seq, head.TreeSize)
+		proof, err := deps.Inclusion.RawInclusionProof(seq, head.TreeSize)
 		if err != nil {
 			writeError(w, http.StatusNotFound,
 				fmt.Sprintf("inclusion proof: %s", err))

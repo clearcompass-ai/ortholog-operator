@@ -134,6 +134,7 @@ func startTestOperator(t *testing.T) *testOperator {
 		CreditStore: creditStore,
 		Queue: queue, LogDID: testLogDID, MaxEntrySize: 1 << 20,
 		DiffController: diffController, Logger: logger,
+		DIDResolver: nil, // Phase 2 trust model in tests.
 	}
 	treeDeps := &api.TreeDeps{
 		TreeHeadStore: treeHeadStore, Inclusion: merkle,
@@ -158,6 +159,7 @@ func startTestOperator(t *testing.T) *testOperator {
 		SchemaRef:       api.NewQuerySchemaRefHandler(queryDeps),
 		Scan:            api.NewQueryScanHandler(queryDeps),
 		Difficulty:      api.NewDifficultyHandler(queryDeps),
+		WitnessCosign:   nil, // No witness serving in tests.
 	}
 
 	serverCfg := api.DefaultServerConfig()
@@ -243,7 +245,9 @@ func (s *stubMerkleAppender) Head() (types.TreeHead, error) {
 	return s.mt.Head()
 }
 
-func (s *stubMerkleAppender) InclusionProof(position, treeSize uint64) (any, error) {
+// RawInclusionProof satisfies the api.InclusionProver interface.
+// Returns raw proof data for JSON passthrough in HTTP handlers.
+func (s *stubMerkleAppender) RawInclusionProof(position, treeSize uint64) (any, error) {
 	return s.mt.InclusionProof(position, treeSize)
 }
 
