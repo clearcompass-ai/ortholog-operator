@@ -30,7 +30,7 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1) Connection Pool
+// 1) Connection Pools
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Pool wraps pgxpool.Pool with operator lifecycle.
@@ -75,6 +75,53 @@ func InitPool(ctx context.Context, cfg PoolConfig) (*Pool, error) {
 
 // Close shuts down the pool.
 func (p *Pool) Close() { p.DB.Close() }
+
+// Pools holds separate write and read connection pools.
+// Write pool connects to the primary (builder, submission, queue).
+// Read pool connects to a replica (all GET queries). Falls back to
+// Write pool if no replica is configured.
+//
+// DESIGN RULE: Writes go to Pools.Write. Reads go to Pools.Read.
+// The builder loop, submission handler, and queue use Write.
+// PostgresEntryFetcher, PostgresQueryAPI, and all GET handlers use Read.
+type Pools struct {
+	Write *pgxpool.Pool // Primary — mutations only.
+	Read  *pgxpool.Pool // Replica — queries only. Same as Write if no replica.
+}
+
+// InitPools creates write and read pools. If replicaDSN is empty,
+// the read pool reuses the write pool (single-instance deployment).
+func InitPools(ctx context.Context, writeCfg PoolConfig, replicaDSN string) (*Pools, error) {
+	writePool, err := InitPool(ctx, writeCfg)
+	if err != nil {
+		return nil, fmt.Errorf("store: write pool: %w", err)
+	}
+
+	if replicaDSN == "" {
+		// No replica configured — read pool is the write pool.
+		return &Pools{Write: writePool.DB, Read: writePool.DB}, nil
+	}
+
+	readCfg := writeCfg
+	readCfg.DSN = replicaDSN
+	readPool, err := InitPool(ctx, readCfg)
+	if err != nil {
+		writePool.Close()
+		return nil, fmt.Errorf("store: read pool (replica): %w", err)
+	}
+
+	return &Pools{Write: writePool.DB, Read: readPool.DB}, nil
+}
+
+// Close shuts down both pools. Safe to call if Read == Write (single pool).
+func (p *Pools) Close() {
+	if p.Read != nil && p.Read != p.Write {
+		p.Read.Close()
+	}
+	if p.Write != nil {
+		p.Write.Close()
+	}
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 2) Migrations — embedded DDL, executed sequentially on startup

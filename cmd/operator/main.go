@@ -1,18 +1,16 @@
 /*
 FILE PATH: cmd/operator/main.go
 
-Entry point for the Ortholog log operator. Executes the 16-step startup
-sequence, manages goroutine lifecycle, and handles graceful shutdown.
+Entry point for the Ortholog log operator (read-write mode).
+Executes the startup sequence, manages goroutine lifecycle, handles shutdown.
 
 KEY ARCHITECTURAL DECISIONS:
-  - Fail-fast: any initialization failure terminates immediately.
+  - Pools.Write for builder, submission, queue (primary).
+  - Pools.Read for all GET queries (replica, falls back to primary).
   - Advisory lock before builder start: exactly one builder per log.
-  - Graceful shutdown: SIGTERM → readiness fails → drain → exit 0.
-  - All goroutines governed by a single context.
-  - Middleware chain applied in server.go (SizeLimit → Auth → handler).
+  - Graceful shutdown: SIGTERM → drain → exit 0.
   - TesseraAdapter implements sdk MerkleTree; injected into builder loop.
-  - HeadSync implements builder.WitnessCosigner; injected into builder loop.
-  - DifficultyController read live per-request (not snapshot).
+  - InMemoryEntryStore for entry bytes (production: TesseraEntryReader).
 */
 package main
 
@@ -56,22 +54,26 @@ func run(logger *slog.Logger) error {
 	cfg := loadConfig()
 	logger.Info("config loaded", "log_did", cfg.LogDID, "addr", cfg.ServerAddr)
 
-	// ── Step 2: Initialize Postgres pool ───────────────────────────────
-	pool, err := store.InitPool(ctx, store.PoolConfig{
+	// ── Step 2: Initialize Postgres pools (write + read) ───────────────
+	pools, err := store.InitPools(ctx, store.PoolConfig{
 		DSN:             cfg.PostgresDSN,
 		MaxConns:        int32(cfg.MaxConns),
 		MinConns:        int32(cfg.MinConns),
 		MaxConnLifetime: 30 * time.Minute,
 		MaxConnIdleTime: 5 * time.Minute,
-	})
+	}, cfg.ReplicaDSN)
 	if err != nil {
 		return fmt.Errorf("step 2: %w", err)
 	}
-	defer pool.Close()
-	logger.Info("postgres pool initialized")
+	defer pools.Close()
+	if cfg.ReplicaDSN != "" {
+		logger.Info("postgres pools initialized (primary + replica)")
+	} else {
+		logger.Info("postgres pool initialized (single instance)")
+	}
 
-	// ── Step 3: Run migrations ─────────────────────────────────────────
-	if err := store.RunMigrations(ctx, pool.DB); err != nil {
+	// ── Step 3: Run migrations (on primary only) ────────────────────────
+	if err := store.RunMigrations(ctx, pools.Write); err != nil {
 		return fmt.Errorf("step 3: %w", err)
 	}
 	logger.Info("migrations complete")
@@ -88,9 +90,15 @@ func run(logger *slog.Logger) error {
 	// ── Step 5: Initialize TesseraAdapter (sdk MerkleTree interface) ───
 	tesseraAdapter := tessera.NewTesseraAdapter(tesseraClient, tileReader, logger)
 
+	// ── Entry byte store (source of truth for entry bytes) ─────────────
+	// Production: TesseraEntryReader reads from entry tiles.
+	// For now: InMemoryEntryStore (same as tests — swap when Tessera
+	// entry tile format is wired).
+	entryBytes := tessera.NewInMemoryEntryStore()
+
 	// ── Step 6: Initialize SMT with Postgres backends ──────────────────
-	leafStore := store.NewPostgresLeafStore(pool.DB)
-	nodeCache := store.NewPostgresNodeCache(pool.DB, cfg.SMTCacheSize)
+	leafStore := store.NewPostgresLeafStore(pools.Write)
+	nodeCache := store.NewPostgresNodeCache(pools.Write, cfg.SMTCacheSize)
 	tree := smt.NewTree(leafStore, nodeCache)
 	logger.Info("SMT initialized")
 
@@ -102,7 +110,7 @@ func run(logger *slog.Logger) error {
 	}
 
 	// ── Step 8: Load delta-window buffer ───────────────────────────────
-	bufferStore := opbuilder.NewDeltaBufferStore(pool.DB, cfg.DeltaWindowSize, logger)
+	bufferStore := opbuilder.NewDeltaBufferStore(pools.Write, cfg.DeltaWindowSize, logger)
 	deltaBuffer, err := bufferStore.Load(ctx)
 	if err != nil {
 		logger.Warn("delta buffer load failed (cold start)", "error", err)
@@ -110,7 +118,7 @@ func run(logger *slog.Logger) error {
 	logger.Info("delta buffer loaded")
 
 	// ── Step 9: Load current witness set ───────────────────────────────
-	witnessKeys, schemeTag, err := witness.LoadCurrentSet(ctx, pool.DB)
+	witnessKeys, schemeTag, err := witness.LoadCurrentSet(ctx, pools.Read)
 	if err != nil {
 		logger.Warn("witness set not found (genesis deployment)", "error", err)
 		witnessKeys = nil
@@ -118,8 +126,8 @@ func run(logger *slog.Logger) error {
 	}
 	logger.Info("witness set loaded", "keys", len(witnessKeys), "scheme", schemeTag)
 
-	// ── Acquire builder advisory lock ──────────────────────────────────
-	releaseLock, err := store.AcquireBuilderLock(ctx, pool.DB)
+	// ── Acquire builder advisory lock (on primary) ─────────────────────
+	releaseLock, err := store.AcquireBuilderLock(ctx, pools.Write)
 	if err != nil {
 		return fmt.Errorf("builder lock: %w", err)
 	}
@@ -127,12 +135,11 @@ func run(logger *slog.Logger) error {
 	logger.Info("builder advisory lock acquired")
 
 	// ── Step 10: Start builder loop goroutine ──────────────────────────
-	entryStore := store.NewEntryStore(pool.DB)
-	fetcher := store.NewPostgresEntryFetcher(pool.DB, cfg.LogDID)
-	queue := opbuilder.NewQueue(pool.DB)
-	treeHeadStore := store.NewTreeHeadStore(pool.DB)
+	entryStore := store.NewEntryStore(pools.Write)
+	fetcher := store.NewPostgresEntryFetcher(pools.Read, entryBytes, cfg.LogDID)
+	queue := opbuilder.NewQueue(pools.Write)
+	treeHeadStore := store.NewTreeHeadStore(pools.Read)
 
-	// Witness cosigner (implements builder.WitnessCosigner).
 	headSync := witness.NewHeadSync(witness.HeadSyncConfig{
 		WitnessEndpoints:  cfg.WitnessEndpoints,
 		QuorumK:           cfg.WitnessQuorumK,
@@ -140,26 +147,20 @@ func run(logger *slog.Logger) error {
 		SchemeTag:         schemeTag,
 	}, treeHeadStore, logger)
 
-	// Commitment publisher with frequency control.
 	commitPub := opbuilder.NewCommitmentPublisher(
 		cfg.OperatorDID,
 		opbuilder.CommitmentPublisherConfig{
 			IntervalEntries: cfg.CommitmentInterval,
 			IntervalTime:    cfg.CommitmentMaxAge,
 		},
-		nil, // submitFn: TODO wire to local admission in production.
-		logger,
+		nil, logger,
 	)
 
 	builderLoop := opbuilder.NewBuilderLoop(
 		opbuilder.DefaultLoopConfig(cfg.LogDID),
-		pool.DB, tree, leafStore, nodeCache,
-		queue, fetcher,
-		nil, // SchemaResolver: nil → all schemas default to strict OCC.
-		deltaBuffer, bufferStore, commitPub,
-		tesseraAdapter, // MerkleAppender (sdk MerkleTree)
-		headSync,       // WitnessCosigner
-		logger,
+		pools.Write, tree, leafStore, nodeCache,
+		queue, fetcher, nil, deltaBuffer, bufferStore, commitPub,
+		tesseraAdapter, headSync, logger,
 	)
 
 	var wg sync.WaitGroup
@@ -179,7 +180,7 @@ func run(logger *slog.Logger) error {
 				PeerEndpoints: cfg.PeerEndpoints,
 				PollInterval:  5 * time.Minute,
 			},
-			pool.DB, treeHeadStore, logger,
+			pools.Write, treeHeadStore, logger,
 		)
 		wg.Add(1)
 		go func() {
@@ -210,7 +211,7 @@ func run(logger *slog.Logger) error {
 	}
 
 	// ── Step 13: Start difficulty controller goroutine ──────────────────
-	creditStore := store.NewCreditStore(pool.DB)
+	creditStore := store.NewCreditStore(pools.Write)
 	diffController := middleware.NewDifficultyController(
 		queue, middleware.DifficultyConfig{
 			InitialDifficulty: uint32(cfg.InitialDifficulty),
@@ -228,11 +229,13 @@ func run(logger *slog.Logger) error {
 	}()
 
 	// ── Step 14: Start HTTP server ─────────────────────────────────────
-	queryAPI := indexes.NewPostgresQueryAPI(pool.DB, cfg.LogDID)
+	// Queries use Read pool. Submission uses Write pool.
+	queryAPI := indexes.NewPostgresQueryAPI(pools.Read, entryBytes, cfg.LogDID)
 
 	submissionDeps := &api.SubmissionDeps{
-		DB:             pool.DB,
+		DB:             pools.Write,
 		EntryStore:     entryStore,
+		EntryWriter:    entryBytes,
 		CreditStore:    creditStore,
 		Queue:          queue,
 		LogDID:         cfg.LogDID,
@@ -276,7 +279,7 @@ func run(logger *slog.Logger) error {
 	serverCfg.Addr = cfg.ServerAddr
 	serverCfg.MaxEntrySize = int64(cfg.MaxEntrySize)
 
-	server := api.NewServer(serverCfg, pool.DB, handlers, logger)
+	server := api.NewServer(serverCfg, pools.Write, handlers, logger)
 
 	wg.Add(1)
 	go func() {
@@ -314,6 +317,7 @@ type operatorConfig struct {
 	LogDID             string
 	OperatorDID        string
 	PostgresDSN        string
+	ReplicaDSN         string // optional — GET queries use this if set
 	MaxConns           int
 	MinConns           int
 	ServerAddr         string
@@ -343,6 +347,7 @@ func loadConfig() operatorConfig {
 		LogDID:             envOr("ORTHOLOG_LOG_DID", "did:ortholog:operator:001"),
 		OperatorDID:        envOr("ORTHOLOG_OPERATOR_DID", "did:ortholog:operator:001:signer"),
 		PostgresDSN:        envOr("ORTHOLOG_POSTGRES_DSN", "postgres://ortholog:ortholog@localhost:5432/ortholog?sslmode=disable"),
+		ReplicaDSN:         envOr("ORTHOLOG_REPLICA_DSN", ""),
 		MaxConns:           20,
 		MinConns:           5,
 		ServerAddr:         envOr("ORTHOLOG_SERVER_ADDR", ":8080"),

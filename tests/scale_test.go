@@ -126,8 +126,9 @@ func TestScale_SequenceAllocation_Concurrent(t *testing.T) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 func TestScale_BulkInsert(t *testing.T) {
-	pool := skipIfNoPostgres(t)
+	pool := connectPostgres(t) // No cleanup clean — QueryIndex reads this data.
 	ctx := context.Background()
+	cleanTables(t, pool) // Clean at start only.
 	N := getScaleN()
 
 	t.Logf("inserting %d entries into Postgres...", N)
@@ -179,7 +180,7 @@ func TestScale_BulkInsert(t *testing.T) {
 		if totalInserted%reportEvery == 0 {
 			elapsed := time.Since(start)
 			rate := float64(totalInserted) / elapsed.Seconds()
-			t.Logf("  %d/%d inserted (%.0f entries/sec)", totalInserted, N, rate)
+			t.Logf("  %d/%d inserted (%.0f entries/sec, %s elapsed)", totalInserted, N, rate, elapsed.Round(time.Second))
 		}
 	}
 
@@ -229,7 +230,7 @@ func TestScale_BulkInsert(t *testing.T) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 func TestScale_QueryIndex(t *testing.T) {
-	pool := skipIfNoPostgres(t)
+	pool := connectPostgres(t) // NO clean — reads BulkInsert data
 	ctx := context.Background()
 
 	var count int64
@@ -320,6 +321,9 @@ func TestScale_BuilderThroughput(t *testing.T) {
 
 	cleanTables(t, pool)
 
+	// Entry byte store — created BEFORE seeding because seeding writes bytes here.
+	entryBytes := optessera.NewInMemoryEntryStore()
+
 	t.Logf("seeding %d entries + queue...", N)
 
 	const batchSize = 10_000
@@ -353,7 +357,9 @@ func TestScale_BuilderThroughput(t *testing.T) {
 		seeded += batchSize
 
 		if seeded%(N/10) == 0 {
-			t.Logf("  seeded %d/%d", seeded, N)
+			elapsed := time.Since(seedStart)
+			rate := float64(seeded) / elapsed.Seconds()
+			t.Logf("  seeded %d/%d (%.0f entries/sec, %s elapsed)", seeded, N, rate, elapsed.Round(time.Second))
 		}
 	}
 
@@ -391,8 +397,7 @@ func TestScale_BuilderThroughput(t *testing.T) {
 	pool.QueryRow(ctx, "SELECT COUNT(*) FROM builder_queue WHERE status = 0").Scan(&queueCount)
 	t.Logf("queue pending: %d", queueCount)
 
-	// Wire up builder — entry bytes stored in memory (not Postgres).
-	entryBytes := optessera.NewInMemoryEntryStore()
+	// Wire up builder — entryBytes already created above during seeding.
 	leafStore := store.NewPostgresLeafStore(pool)
 	nodeCache := store.NewPostgresNodeCache(pool, 100_000)
 	tree := smt.NewTree(leafStore, nodeCache)
@@ -517,9 +522,11 @@ func TestScale_SDKProcessBatch(t *testing.T) {
 		float64(N)/time.Since(genStart).Seconds())
 
 	f := newMockFetcher()
+	t.Log("populating mock fetcher...")
 	for i, e := range entries {
 		f.storeEntry(positions[i], e)
 	}
+	t.Logf("mock fetcher populated: %d entries", N)
 
 	// Benchmark at different batch sizes.
 	for _, bs := range []int{1_000, 10_000, 100_000} {
@@ -529,8 +536,11 @@ func TestScale_SDKProcessBatch(t *testing.T) {
 		treeCopy := smt.NewTree(smt.NewInMemoryLeafStore(), smt.NewInMemoryNodeCache())
 		bufCopy := sdkbuilder.NewDeltaWindowBuffer(10)
 
+		t.Logf("  starting batch_size=%d (%d iterations)...", bs, (N+bs-1)/bs)
 		start := time.Now()
+		lastLog := start
 		totalLeaves := 0
+		processed := 0
 		for offset := 0; offset < N; offset += bs {
 			end := offset + bs
 			if end > N {
@@ -546,6 +556,13 @@ func TestScale_SDKProcessBatch(t *testing.T) {
 			totalLeaves += result.NewLeafCounts
 			if result.UpdatedBuffer != nil {
 				bufCopy = result.UpdatedBuffer
+			}
+			processed += end - offset
+
+			if time.Since(lastLog) > 5*time.Second {
+				rate := float64(processed) / time.Since(start).Seconds()
+				t.Logf("    batch=%d: %d/%d processed (%.0f entries/sec)", bs, processed, N, rate)
+				lastLog = time.Now()
 			}
 		}
 		elapsed := time.Since(start)

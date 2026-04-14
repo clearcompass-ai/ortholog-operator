@@ -20,6 +20,8 @@ operator:
 # Postgres connection
 postgres:
   dsn: "postgres://ortholog:ortholog@localhost:5432/ortholog?sslmode=disable"
+  replica_dsn: ""                # optional — GET queries use this if set
+                                 # empty = read from primary (single-instance)
   max_conns: 20
   min_conns: 5
   max_conn_lifetime: "30m"

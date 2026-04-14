@@ -321,7 +321,21 @@ func runSDKBuilder(t *testing.T, entries []*envelope.Entry, positions []types.Lo
 // ─────────────────────────────────────────────────────────────────────────────
 
 // skipIfNoPostgres checks for ORTHOLOG_TEST_DSN. Returns a pool or skips the test.
+// Cleans all tables for isolation.
 func skipIfNoPostgres(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	pool := connectPostgres(t)
+	cleanTables(t, pool)
+	t.Cleanup(func() {
+		cleanTables(t, pool)
+		pool.Close()
+	})
+	return pool
+}
+
+// connectPostgres returns a pool WITHOUT cleaning tables.
+// Use for tests that depend on data from a prior test (e.g., QueryIndex after BulkInsert).
+func connectPostgres(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("ORTHOLOG_TEST_DSN")
 	if dsn == "" {
@@ -333,26 +347,15 @@ func skipIfNoPostgres(t *testing.T) *pgxpool.Pool {
 	if err != nil {
 		t.Fatalf("connect to test database: %v", err)
 	}
-
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
 		t.Fatalf("ping test database: %v", err)
 	}
-
-	// Run migrations.
 	if err := store.RunMigrations(ctx, pool); err != nil {
 		pool.Close()
 		t.Fatalf("run migrations: %v", err)
 	}
-
-	// Clean all tables for test isolation.
-	cleanTables(t, pool)
-
-	t.Cleanup(func() {
-		cleanTables(t, pool)
-		pool.Close()
-	})
-
+	t.Cleanup(func() { pool.Close() })
 	return pool
 }
 
