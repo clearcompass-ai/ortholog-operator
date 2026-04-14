@@ -25,8 +25,9 @@ import (
 
 // SMTDeps holds dependencies for SMT proof handlers.
 type SMTDeps struct {
-	Tree   *smt.Tree
-	Logger *slog.Logger
+	Tree      *smt.Tree
+	LeafStore smt.LeafStore
+	Logger    *slog.Logger
 }
 
 // NewSMTProofHandler creates GET /v1/smt/proof/{key}.
@@ -124,7 +125,7 @@ func NewSMTRootHandler(deps *SMTDeps) http.HandlerFunc {
 			deps.Logger.Error("smt root", "error", err)
 			return
 		}
-		leafCount, _ := deps.Tree.LeafCount()
+		leafCount, _ := deps.LeafStore.Count()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"root":       hex.EncodeToString(root[:]),

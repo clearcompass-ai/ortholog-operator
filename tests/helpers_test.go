@@ -25,6 +25,7 @@ import (
 	"github.com/clearcompass-ai/ortholog-sdk/types"
 
 	"github.com/clearcompass-ai/ortholog-operator/store"
+	optessera "github.com/clearcompass-ai/ortholog-operator/tessera"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -32,6 +33,11 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 const testLogDID = "did:ortholog:test:integration"
+
+// testEntryBytes is the package-level InMemoryEntryStore shared by all
+// Postgres-backed query tests. Reset in cleanTables. This is the ONLY
+// source of entry bytes in the test suite (Postgres stores index only).
+var testEntryBytes = optessera.NewInMemoryEntryStore()
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Position helpers
@@ -354,7 +360,7 @@ func cleanTables(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
 	tables := []string{
-		"builder_queue", "entries", "smt_leaves", "smt_nodes",
+		"builder_queue", "entry_index", "smt_leaves", "smt_nodes",
 		"credits", "tree_heads", "delta_window_buffers",
 		"witness_sets", "equivocation_proofs", "sessions",
 	}
@@ -365,6 +371,9 @@ func cleanTables(t *testing.T, pool *pgxpool.Pool) {
 	}
 	// Reset sequence.
 	_, _ = pool.Exec(ctx, "ALTER SEQUENCE entry_sequence RESTART WITH 1")
+
+	// Reset package-level entry byte store.
+	testEntryBytes = optessera.NewInMemoryEntryStore()
 }
 
 // insertTestEntry directly inserts an entry into Postgres for query testing.
@@ -386,16 +395,22 @@ func insertTestEntry(t *testing.T, pool *pgxpool.Pool, seq uint64, entry *envelo
 		schemaRef = store.SerializeLogPosition(*entry.Header.SchemaRef)
 	}
 
+	// Index in Postgres (no bytes).
 	_, err := pool.Exec(ctx, `
-		INSERT INTO entries (sequence_number, canonical_bytes, canonical_hash, log_time,
-			sig_algorithm_id, sig_bytes, signer_did, target_root, cosignature_of, schema_ref)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-		seq, canonical, hash[:], logTime,
-		uint16(1), []byte("test-sig"), entry.Header.SignerDID,
+		INSERT INTO entry_index (sequence_number, canonical_hash, log_time,
+			sig_algorithm_id, signer_did, target_root, cosignature_of, schema_ref)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		seq, hash[:], logTime,
+		uint16(1), entry.Header.SignerDID,
 		targetRoot, cosigOf, schemaRef,
 	)
 	if err != nil {
 		t.Fatalf("insert test entry seq=%d: %v", seq, err)
+	}
+
+	// Bytes in testEntryBytes (the ONLY source of entry bytes).
+	if err := testEntryBytes.WriteEntry(seq, canonical, []byte("test-sig")); err != nil {
+		t.Fatalf("write entry bytes seq=%d: %v", seq, err)
 	}
 }
 

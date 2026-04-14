@@ -3,7 +3,6 @@ FILE PATH: store/indexes/cosignature_of.go
 
 QueryByCosignatureOf — certification-required per governance spec.
 Returns all entries whose Cosignature_Of field matches the given position.
-Primary consumer: exchange lifecycle compiling Evidence_Pointers.
 */
 package indexes
 
@@ -21,12 +20,12 @@ func (q *PostgresQueryAPI) QueryByCosignatureOf(pos types.LogPosition) ([]types.
 	ctx := context.TODO()
 	posBytes := store.SerializeLogPosition(pos)
 	rows, err := q.db.Query(ctx, `
-		SELECT sequence_number, canonical_bytes, log_time, sig_algorithm_id, sig_bytes
-		FROM entries WHERE cosignature_of = $1 ORDER BY sequence_number ASC`,
+		SELECT sequence_number, log_time, sig_algorithm_id
+		FROM entry_index WHERE cosignature_of = $1 ORDER BY sequence_number ASC`,
 		posBytes,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store/indexes/cosignature_of: %w", err)
 	}
-	return scanEntries(ctx, rows, q.logDID)
+	return q.scanAndHydrate(ctx, rows)
 }

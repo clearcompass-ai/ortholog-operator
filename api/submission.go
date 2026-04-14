@@ -44,6 +44,7 @@ import (
 	"github.com/clearcompass-ai/ortholog-operator/api/middleware"
 	"github.com/clearcompass-ai/ortholog-operator/builder"
 	"github.com/clearcompass-ai/ortholog-operator/store"
+	"github.com/clearcompass-ai/ortholog-operator/tessera"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -54,6 +55,7 @@ import (
 type SubmissionDeps struct {
 	DB              *pgxpool.Pool
 	EntryStore      *store.EntryStore
+	EntryWriter     tessera.EntryWriter // Bytes go here, not Postgres.
 	CreditStore     *store.CreditStore
 	Queue           *builder.Queue
 	LogDID          string
@@ -217,14 +219,12 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 				schemaRefBytes = store.SerializeLogPosition(*entry.Header.SchemaRef)
 			}
 
-			// Insert entry.
+			// Insert entry index (metadata only — no bytes in Postgres).
 			insertErr := deps.EntryStore.Insert(ctx, tx, store.EntryRow{
 				SequenceNumber: seq,
-				CanonicalBytes: canonical,
 				CanonicalHash:  canonicalHash,
 				LogTime:        logTime,
 				SigAlgorithmID: algoID,
-				SigBytes:       sigBytes,
 				SignerDID:      entry.Header.SignerDID,
 				TargetRoot:     targetRootBytes,
 				CosignatureOf:  cosigOfBytes,
@@ -232,6 +232,13 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 			})
 			if insertErr != nil {
 				return insertErr
+			}
+
+			// Write bytes to Tessera (source of truth for entry bytes).
+			if deps.EntryWriter != nil {
+				if writeErr := deps.EntryWriter.WriteEntry(seq, canonical, sigBytes); writeErr != nil {
+					return fmt.Errorf("write entry bytes: %w", writeErr)
+				}
 			}
 
 			// Enqueue for builder.

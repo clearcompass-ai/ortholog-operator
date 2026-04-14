@@ -1,11 +1,11 @@
 /*
-FILE PATH: builder/loop.go
-
-Continuous builder loop. THE core operational loop of the operator.
-Dequeues admitted entries, calls SDK ProcessBatch, commits state atomically,
-appends to Merkle tree, publishes commitments, requests witness cosignatures.
+Package builder — loop.go is the continuous builder loop. THE core operational
+loop of the operator. Dequeues admitted entries, calls SDK ProcessBatch, commits
+state atomically, appends to Merkle tree, publishes commitments, requests
+witness cosignatures.
 
 KEY ARCHITECTURAL DECISIONS:
+
   - Single goroutine: determinism requires exactly one builder per log.
     Advisory lock prevents concurrent instances.
   - Atomic commit: leaf mutations + delta buffer + queue status in ONE
@@ -15,19 +15,27 @@ KEY ARCHITECTURAL DECISIONS:
   - Idempotent: replaying the same batch produces identical state.
   - SDK LeafMutation is a diff format: carries tip positions, not a full
     SMTLeaf. The operator reconstructs the leaf from mutation fields.
+  - Context-aware: every Postgres call checks ctx.Done() first. Shutdown
+    never produces spurious ERROR logs.
 
 INVARIANTS:
+
   - processBatch either fully commits or fully rolls back.
   - Crash between commit and Tessera append → on restart, re-append is
     idempotent (Tessera deduplicates by leaf hash).
   - Empty batch → no mutations, no commitment, no cosig request.
+  - Context cancellation → clean exit, no error logged.
 */
 package builder
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -36,7 +44,6 @@ import (
 	sdkbuilder "github.com/clearcompass-ai/ortholog-sdk/builder"
 	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
 	"github.com/clearcompass-ai/ortholog-sdk/core/smt"
-	"github.com/clearcompass-ai/ortholog-sdk/crypto"
 	"github.com/clearcompass-ai/ortholog-sdk/types"
 
 	"github.com/clearcompass-ai/ortholog-operator/store"
@@ -99,6 +106,12 @@ type BuilderLoop struct {
 	merkle      MerkleAppender
 	witness     WitnessCosigner
 	logger      *slog.Logger
+
+	// Observability counters (atomic, lock-free).
+	totalBatches   atomic.Int64
+	totalEntries   atomic.Int64
+	totalErrors    atomic.Int64
+	consecutiveErr atomic.Int32
 }
 
 // NewBuilderLoop creates a builder loop with all dependencies.
@@ -136,17 +149,45 @@ func NewBuilderLoop(
 	}
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 4) Run — main loop with clean shutdown and panic recovery
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Run executes the builder loop until ctx is cancelled.
 // MUST be called from a single goroutine.
-func (bl *BuilderLoop) Run(ctx context.Context) error {
+//
+// Shutdown behavior: context cancellation produces a clean INFO log and nil
+// return. No ERROR logs on shutdown. Panics are recovered with a stack trace.
+func (bl *BuilderLoop) Run(ctx context.Context) (retErr error) {
+	// Panic recovery — builder goroutine death must be diagnosable.
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			bl.logger.Error("builder loop panic recovered",
+				"panic", fmt.Sprintf("%v", r),
+				"stack", string(buf[:n]),
+			)
+			retErr = fmt.Errorf("builder/loop: panic: %v", r)
+		}
+	}()
+
 	bl.logger.Info("builder loop started",
 		"log_did", bl.cfg.LogDID,
 		"batch_size", bl.cfg.BatchSize,
+		"poll_interval", bl.cfg.PollInterval,
 	)
 
 	// Recover stale processing entries from prior crash.
+	if err := ctx.Err(); err != nil {
+		return nil // Already cancelled before we started.
+	}
 	recovered, err := bl.queue.RecoverStale(ctx)
 	if err != nil {
+		if isContextError(err) {
+			bl.logger.Info("builder loop stopped during recovery")
+			return nil
+		}
 		return fmt.Errorf("builder/loop: recover stale: %w", err)
 	}
 	if recovered > 0 {
@@ -154,36 +195,75 @@ func (bl *BuilderLoop) Run(ctx context.Context) error {
 	}
 
 	for {
-		select {
-		case <-ctx.Done():
-			bl.logger.Info("builder loop shutting down")
+		// ── Check context BEFORE any work ─────────────────────────────
+		if err := ctx.Err(); err != nil {
+			bl.logger.Info("builder loop stopped",
+				"batches", bl.totalBatches.Load(),
+				"entries", bl.totalEntries.Load(),
+				"errors", bl.totalErrors.Load(),
+			)
 			return nil
-		default:
 		}
 
 		processed, err := bl.processBatch(ctx)
+
 		if err != nil {
-			bl.logger.Error("batch processing failed", "error", err)
+			// Context cancellation is not an error — it's a clean shutdown.
+			if isContextError(err) {
+				bl.logger.Info("builder loop stopped",
+					"batches", bl.totalBatches.Load(),
+					"entries", bl.totalEntries.Load(),
+				)
+				return nil
+			}
+
+			bl.totalErrors.Add(1)
+			consecutive := bl.consecutiveErr.Add(1)
+
+			bl.logger.Error("batch processing failed",
+				"error", err,
+				"consecutive_errors", consecutive,
+			)
+
+			// Back off on repeated errors to avoid tight error loops.
+			backoff := bl.cfg.PollInterval * time.Duration(min(int(consecutive), 10))
 			select {
 			case <-ctx.Done():
 				return nil
-			case <-time.After(bl.cfg.PollInterval):
+			case <-time.After(backoff):
 			}
 			continue
 		}
 
-		if processed == 0 {
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(bl.cfg.PollInterval):
-			}
+		// Success — reset consecutive error counter.
+		bl.consecutiveErr.Store(0)
+
+		if processed > 0 {
+			bl.totalBatches.Add(1)
+			bl.totalEntries.Add(int64(processed))
+			// Non-empty batch: loop immediately for throughput.
+			continue
 		}
-		// Non-empty batch: loop immediately for throughput.
+
+		// Empty queue — wait before polling again.
+		select {
+		case <-ctx.Done():
+			bl.logger.Info("builder loop stopped",
+				"batches", bl.totalBatches.Load(),
+				"entries", bl.totalEntries.Load(),
+			)
+			return nil
+		case <-time.After(bl.cfg.PollInterval):
+		}
 	}
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 5) processBatch — one builder cycle, fully atomic
+// ─────────────────────────────────────────────────────────────────────────────
+
 // processBatch executes one builder cycle. Returns entries processed.
+// Context cancellation at any step returns a context error (not logged as ERROR).
 func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	// Capture prior root for commitment.
 	priorRoot, err := bl.tree.Root()
@@ -192,6 +272,10 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	}
 
 	// ── Step 1: Dequeue batch ─────────────────────────────────────────
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
 	var seqs []uint64
 	err = store.WithReadCommittedTx(ctx, bl.db, func(ctx context.Context, tx pgx.Tx) error {
 		var dqErr error
@@ -206,10 +290,14 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	}
 
 	// ── Step 2: Fetch entries in sequence order ───────────────────────
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
 	metas := make([]*types.EntryWithMetadata, 0, len(seqs))
 	for _, seq := range seqs {
-		pos := types.LogPosition{LogDID: bl.cfg.LogDID, Sequence: seq}
-		meta, fetchErr := bl.fetcher.Fetch(pos)
+		p := types.LogPosition{LogDID: bl.cfg.LogDID, Sequence: seq}
+		meta, fetchErr := bl.fetcher.Fetch(p)
 		if fetchErr != nil || meta == nil {
 			return 0, fmt.Errorf("fetch seq=%d: not found or error: %w", seq, fetchErr)
 		}
@@ -217,8 +305,6 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	}
 
 	// ── Step 3: Split EntryWithMetadata → entries + positions ─────────
-	// SDK ProcessBatch takes deserialized entries and separate positions,
-	// not EntryWithMetadata directly. The operator is responsible for split.
 	entries := make([]*envelope.Entry, len(metas))
 	positions := make([]types.LogPosition, len(metas))
 	for i, ewm := range metas {
@@ -244,13 +330,13 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	//   - Leaf mutations → smt_leaves (reconstructed from diff)
 	//   - Delta buffer → delta_window_buffers
 	//   - Queue status → builder_queue (mark done)
-	//
-	// SDK LeafMutation is a diff format carrying tip positions, not a
-	// full SMTLeaf. The operator reconstructs the leaf:
-	//   types.SMTLeaf{Key: mut.LeafKey, OriginTip: mut.NewOriginTip,
-	//                 AuthorityTip: mut.NewAuthorityTip}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
 	err = store.WithSerializableTx(ctx, bl.db, func(ctx context.Context, tx pgx.Tx) error {
-		// Write leaf mutations.
+		// Write leaf mutations. SDK LeafMutation is a diff format —
+		// the operator reconstructs the full leaf from tip positions.
 		for _, mut := range result.Mutations {
 			leaf := types.SMTLeaf{
 				Key:          mut.LeafKey,
@@ -280,26 +366,27 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("atomic commit: %w", err)
 	}
 
+	// ──────────────────────────────────────────────────────────────────
+	// POST-COMMIT: Steps 6-8 are best-effort. The atomic state is safe.
+	// Failures here are non-fatal — the next cycle will catch up.
+	// ──────────────────────────────────────────────────────────────────
+
 	// ── Step 6: Append to Merkle tree (post-commit) ──────────────────
 	// Tessera append is idempotent: same hash → same position.
 	// Crash here → re-append on restart is safe.
+	// Hash from raw canonical bytes (not re-serialized through the SDK).
 	if bl.merkle != nil {
 		for _, ewm := range metas {
-			entry, desErr := envelope.Deserialize(ewm.CanonicalBytes)
-			if desErr != nil || entry == nil {
-				continue
-			}
-			entryHash := crypto.CanonicalHash(entry)
+			entryHash := sha256.Sum256(ewm.CanonicalBytes)
 			if _, appendErr := bl.merkle.AppendLeaf(entryHash); appendErr != nil {
 				bl.logger.Error("Tessera append failed",
 					"seq", ewm.Position.Sequence, "error", appendErr)
-				// Non-fatal: Merkle tree will catch up on next cycle.
 			}
 		}
 	}
 
 	// ── Step 7: Publish derivation commitment ─────────────────────────
-	if bl.commitPub != nil {
+	if bl.commitPub != nil && len(positions) > 0 {
 		bl.commitPub.MaybePublish(ctx, len(seqs),
 			positions[0], positions[len(positions)-1],
 			priorRoot, result)
@@ -308,10 +395,11 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	// ── Step 8: Request witness cosignatures ──────────────────────────
 	if bl.merkle != nil && bl.witness != nil {
 		head, headErr := bl.merkle.Head()
-		if headErr == nil {
+		if headErr == nil && head.TreeSize > 0 {
 			if cosigErr := bl.witness.RequestCosignatures(ctx, head); cosigErr != nil {
-				bl.logger.Warn("witness cosignature request failed", "error", cosigErr)
-				// Non-fatal: retry on next cycle.
+				if !isContextError(cosigErr) {
+					bl.logger.Warn("witness cosignature request failed", "error", cosigErr)
+				}
 			}
 		}
 	}
@@ -332,4 +420,23 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	)
 
 	return len(seqs), nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6) Observability
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Stats returns current builder loop counters.
+func (bl *BuilderLoop) Stats() (batches, entries, errs int64) {
+	return bl.totalBatches.Load(), bl.totalEntries.Load(), bl.totalErrors.Load()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7) Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// isContextError returns true if err is caused by context cancellation or
+// deadline exceeded. Used to distinguish clean shutdown from real failures.
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }

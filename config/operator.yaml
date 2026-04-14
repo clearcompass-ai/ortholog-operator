@@ -53,9 +53,22 @@ admission:
 
 # Tessera integration
 tessera:
-  base_url: "http://localhost:2024"
+  endpoint: "http://localhost:2024"
   timeout: "30s"
   tile_cache_size: 10000
+
+  # Tile storage — immutable 8 KB files. Two families:
+  tile_storage: object          # object | filesystem
+
+  object:                       # Any S3-compatible API (cloud or self-hosted)
+    endpoint: ""                # empty = cloud default (GCS, AWS S3)
+                                # self-hosted: "https://minio.internal:9000"
+    bucket: davidson-cases-tiles
+    region: us-east-1
+    path_style: false           # true for self-hosted (MinIO, Ceph, R2, DO Spaces)
+
+  filesystem:                   # Local POSIX path, serve via nginx/caddy
+    root: /var/lib/tessera/tiles
 
 # Witness configuration
 witness:

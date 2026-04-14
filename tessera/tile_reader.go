@@ -1,11 +1,14 @@
 /*
 FILE PATH: tessera/tile_reader.go
 
-Tile-based storage backend for Merkle tree data. Read-through LRU cache
-minimizes backend calls. Tiles are immutable once written (append-only tree).
+Object store / filesystem tile reader. Reads immutable Merkle tree tiles
+from tile storage. Read-through LRU cache minimizes backend calls.
 
 KEY ARCHITECTURAL DECISIONS:
-  - Backend interface: swappable for GCS/S3/local.
+  - Object store: any provider implementing the standard object storage API
+    (cloud: GCS, AWS S3; self-hosted: MinIO, Ceph RGW, R2, DO Spaces).
+  - Filesystem: local POSIX path, served via HTTP (nginx/caddy in front).
+  - Tiles are 8 KB immutable files — cache indefinitely once read.
   - LRU with access-counter eviction (not random).
   - Tile path convention: "tiles/{level}/{offset}" (Tessera standard).
   - No write path: Tessera manages writes. Operator only reads.
@@ -113,7 +116,7 @@ func (tr *TileReader) evictLRU() {
 
 // ─── HTTP Tile Backend ─────────────────────────────────────────────────────
 
-// HTTPTileBackend reads tiles from an HTTP endpoint (GCS/S3 public URLs).
+// HTTPTileBackend reads tiles from an HTTP endpoint (object store or filesystem served via HTTP).
 type HTTPTileBackend struct {
 	baseURL string
 	client  *http.Client

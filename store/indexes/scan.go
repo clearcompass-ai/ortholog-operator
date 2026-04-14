@@ -1,13 +1,14 @@
 /*
 FILE PATH: store/indexes/scan.go
 
-ScanFromPosition — sequential iteration using the entries table primary key.
+ScanFromPosition — sequential iteration using the entry_index primary key.
 For monitoring, load accounting, mirror consistency, delta buffer reconstruction.
 
 KEY ARCHITECTURAL DECISIONS:
   - Uses sequence_number PK directly: no secondary index needed.
   - Strict ascending order: deterministic pagination.
   - Hard cap at MaxScanCount: prevents unbounded result sets.
+  - Bytes hydrated from EntryReader, not stored in Postgres.
 */
 package indexes
 
@@ -29,12 +30,12 @@ func (q *PostgresQueryAPI) ScanFromPosition(startPos uint64, count int) ([]types
 		count = MaxScanCount
 	}
 	rows, err := q.db.Query(ctx, `
-		SELECT sequence_number, canonical_bytes, log_time, sig_algorithm_id, sig_bytes
-		FROM entries WHERE sequence_number >= $1 ORDER BY sequence_number ASC LIMIT $2`,
+		SELECT sequence_number, log_time, sig_algorithm_id
+		FROM entry_index WHERE sequence_number >= $1 ORDER BY sequence_number ASC LIMIT $2`,
 		startPos, count,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store/indexes/scan: %w", err)
 	}
-	return scanEntries(ctx, rows, q.logDID)
+	return q.scanAndHydrate(ctx, rows)
 }

@@ -91,13 +91,11 @@ var migrations = []struct {
 		)`,
 	}},
 	{1, []string{
-		`CREATE TABLE IF NOT EXISTS entries (
+		`CREATE TABLE IF NOT EXISTS entry_index (
 			sequence_number  BIGINT       PRIMARY KEY,
-			canonical_bytes  BYTEA        NOT NULL,
 			canonical_hash   BYTEA        NOT NULL UNIQUE,
 			log_time         TIMESTAMPTZ  NOT NULL,
 			sig_algorithm_id SMALLINT     NOT NULL,
-			sig_bytes        BYTEA        NOT NULL,
 			signer_did       TEXT         NOT NULL CHECK (signer_did <> ''),
 			target_root      BYTEA,
 			cosignature_of   BYTEA,
@@ -105,10 +103,10 @@ var migrations = []struct {
 		)`,
 	}},
 	{2, []string{
-		`CREATE INDEX IF NOT EXISTS idx_signer_did ON entries (signer_did)`,
-		`CREATE INDEX IF NOT EXISTS idx_target_root ON entries (target_root) WHERE target_root IS NOT NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_cosignature_of ON entries (cosignature_of) WHERE cosignature_of IS NOT NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_schema_ref ON entries (schema_ref) WHERE schema_ref IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_signer_did ON entry_index (signer_did)`,
+		`CREATE INDEX IF NOT EXISTS idx_target_root ON entry_index (target_root) WHERE target_root IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_cosignature_of ON entry_index (cosignature_of) WHERE cosignature_of IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_schema_ref ON entry_index (schema_ref) WHERE schema_ref IS NOT NULL`,
 	}},
 	{3, []string{
 		`CREATE TABLE IF NOT EXISTS smt_leaves (

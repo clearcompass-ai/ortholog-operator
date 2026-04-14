@@ -3,8 +3,10 @@ FILE PATH: tests/testserver_test.go
 
 Wires up a complete operator HTTP server for integration testing.
 Real Postgres, real middleware chain, real builder loop.
-MerkleAppender and WitnessCosigner use in-process stubs that satisfy
-the builder interfaces without external services.
+
+DESIGN RULE: Postgres is an index. Entry bytes live in EntryReader.
+InMemoryEntryStore satisfies both EntryReader and EntryWriter.
+MerkleAppender and WitnessCosigner use in-process stubs.
 */
 package tests
 
@@ -30,6 +32,7 @@ import (
 	opbuilder "github.com/clearcompass-ai/ortholog-operator/builder"
 	"github.com/clearcompass-ai/ortholog-operator/store"
 	"github.com/clearcompass-ai/ortholog-operator/store/indexes"
+	optessera "github.com/clearcompass-ai/ortholog-operator/tessera"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -42,11 +45,13 @@ type testOperator struct {
 	Queue       *opbuilder.Queue
 	CreditStore *store.CreditStore
 	EntryStore  *store.EntryStore
+	EntryBytes  *optessera.InMemoryEntryStore // Bytes live here, not Postgres.
 	cancel      context.CancelFunc
 }
 
 // startTestOperator creates a fully-wired operator HTTP server on a random
 // port backed by real Postgres and a running builder loop.
+// Entry bytes go to InMemoryEntryStore (not Postgres).
 func startTestOperator(t *testing.T) *testOperator {
 	t.Helper()
 
@@ -71,6 +76,9 @@ func startTestOperator(t *testing.T) *testOperator {
 	}
 	cleanTables(t, pool)
 
+	// ── Entry byte store (source of truth for bytes) ────────────────────
+	entryBytes := optessera.NewInMemoryEntryStore()
+
 	// ── Stores ─────────────────────────────────────────────────────────
 	entryStore := store.NewEntryStore(pool)
 	creditStore := store.NewCreditStore(pool)
@@ -79,7 +87,7 @@ func startTestOperator(t *testing.T) *testOperator {
 	leafStore := store.NewPostgresLeafStore(pool)
 	nodeCache := store.NewPostgresNodeCache(pool, 10000)
 	tree := smt.NewTree(leafStore, nodeCache)
-	fetcher := store.NewPostgresEntryFetcher(pool, testLogDID)
+	fetcher := store.NewPostgresEntryFetcher(pool, entryBytes, testLogDID)
 
 	// ── Delta buffer ───────────────────────────────────────────────────
 	bufferStore := opbuilder.NewDeltaBufferStore(pool, 10, logger)
@@ -118,10 +126,11 @@ func startTestOperator(t *testing.T) *testOperator {
 	)
 
 	// ── HTTP handlers ──────────────────────────────────────────────────
-	queryAPI := indexes.NewPostgresQueryAPI(pool, testLogDID)
+	queryAPI := indexes.NewPostgresQueryAPI(pool, entryBytes, testLogDID)
 
 	submissionDeps := &api.SubmissionDeps{
-		DB: pool, EntryStore: entryStore, CreditStore: creditStore,
+		DB: pool, EntryStore: entryStore, EntryWriter: entryBytes,
+		CreditStore: creditStore,
 		Queue: queue, LogDID: testLogDID, MaxEntrySize: 1 << 20,
 		DiffController: diffController, Logger: logger,
 	}
@@ -129,7 +138,7 @@ func startTestOperator(t *testing.T) *testOperator {
 		TreeHeadStore: treeHeadStore, Inclusion: merkle,
 		Consistency: merkle, Logger: logger,
 	}
-	smtDeps := &api.SMTDeps{Tree: tree, Logger: logger}
+	smtDeps := &api.SMTDeps{Tree: tree, LeafStore: leafStore, Logger: logger}
 	queryDeps := &api.QueryDeps{
 		QueryAPI: queryAPI, DiffController: diffController, Logger: logger,
 	}
@@ -167,7 +176,8 @@ func startTestOperator(t *testing.T) *testOperator {
 
 	op := &testOperator{
 		BaseURL: baseURL, Pool: pool, Queue: queue,
-		CreditStore: creditStore, EntryStore: entryStore, cancel: cancel,
+		CreditStore: creditStore, EntryStore: entryStore,
+		EntryBytes: entryBytes, cancel: cancel,
 	}
 
 	t.Cleanup(func() {

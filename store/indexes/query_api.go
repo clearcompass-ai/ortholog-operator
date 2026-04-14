@@ -3,13 +3,14 @@ FILE PATH: store/indexes/query_api.go
 
 PostgresQueryAPI satisfies sdk log.OperatorQueryAPI. Methods are spread
 across the package files — each file provides one method's SQL query.
-This file holds the struct, constructor, shared row scanner, and constants.
 
-KEY ARCHITECTURAL DECISIONS:
-  - Single struct: all 5 query methods on one type for clean interface satisfaction.
-  - Shared scanEntries: consistent EntryWithMetadata hydration across all queries.
-  - Default pagination limit: 100. Hard max: 10000 (MaxScanCount).
-  - All position parameters use serialized BYTEA (same as entries table columns).
+DESIGN RULE: Postgres is an index. Tessera is the source of truth for
+entry bytes. Always.
+
+  - Queries hit entry_index for sequence numbers + metadata.
+  - Entry bytes hydrated via EntryReader (tessera.EntryReader).
+  - scanEntries: query rows → collect seqs + metadata → batch hydrate.
+  - ReadEntryBatch is tile-aware: entries in the same tile = 1 read.
 */
 package indexes
 
@@ -21,6 +22,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/clearcompass-ai/ortholog-sdk/types"
+
+	"github.com/clearcompass-ai/ortholog-operator/tessera"
 )
 
 // MaxScanCount is the hard upper limit per scan request.
@@ -30,46 +33,76 @@ const MaxScanCount = 10000
 const DefaultScanCount = 100
 
 // PostgresQueryAPI implements sdk log.OperatorQueryAPI.
+// Metadata from entry_index (Postgres). Bytes from EntryReader (Tessera).
 type PostgresQueryAPI struct {
 	db     *pgxpool.Pool
+	reader tessera.EntryReader
 	logDID string
 }
 
 // NewPostgresQueryAPI creates the query API for a log.
-func NewPostgresQueryAPI(db *pgxpool.Pool, logDID string) *PostgresQueryAPI {
-	return &PostgresQueryAPI{db: db, logDID: logDID}
+func NewPostgresQueryAPI(db *pgxpool.Pool, reader tessera.EntryReader, logDID string) *PostgresQueryAPI {
+	return &PostgresQueryAPI{db: db, reader: reader, logDID: logDID}
 }
 
-// scanEntries hydrates []EntryWithMetadata from query rows.
-func scanEntries(ctx context.Context, rows interface {
+// indexMeta holds the metadata columns from entry_index.
+type indexMeta struct {
+	Seq    uint64
+	Time   time.Time
+	AlgoID uint16
+}
+
+// scanAndHydrate queries entry_index for metadata, then batch-hydrates
+// bytes from EntryReader. This is the shared path for all 5 query methods.
+func (q *PostgresQueryAPI) scanAndHydrate(ctx context.Context, rows interface {
 	Next() bool
 	Scan(dest ...any) error
 	Err() error
 	Close()
-}, logDID string) ([]types.EntryWithMetadata, error) {
+}) ([]types.EntryWithMetadata, error) {
 	defer rows.Close()
-	var results []types.EntryWithMetadata
+
+	// (1) Collect sequence numbers + metadata from Postgres.
+	var metas []indexMeta
 	for rows.Next() {
 		var (
-			seq       uint64
-			canonical []byte
-			logTime   time.Time
-			algoID    int16
-			sigBytes  []byte
+			seq    uint64
+			lt     time.Time
+			algoID int16
 		)
-		if err := rows.Scan(&seq, &canonical, &logTime, &algoID, &sigBytes); err != nil {
+		if err := rows.Scan(&seq, &lt, &algoID); err != nil {
 			return nil, fmt.Errorf("store/indexes: scan: %w", err)
 		}
-		results = append(results, types.EntryWithMetadata{
-			CanonicalBytes:  canonical,
-			LogTime:         logTime,
-			Position:        types.LogPosition{LogDID: logDID, Sequence: seq},
-			SignatureAlgoID: uint16(algoID),
-			SignatureBytes:  sigBytes,
-		})
+		metas = append(metas, indexMeta{Seq: seq, Time: lt, AlgoID: uint16(algoID)})
 	}
-	if results == nil {
-		results = []types.EntryWithMetadata{} // Never return nil; always empty slice.
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store/indexes: rows: %w", err)
 	}
-	return results, rows.Err()
+
+	if len(metas) == 0 {
+		return []types.EntryWithMetadata{}, nil
+	}
+
+	// (2) Batch-hydrate bytes from EntryReader (tile-aware).
+	seqs := make([]uint64, len(metas))
+	for i, m := range metas {
+		seqs[i] = m.Seq
+	}
+	rawEntries, err := q.reader.ReadEntryBatch(seqs)
+	if err != nil {
+		return nil, fmt.Errorf("store/indexes: hydrate: %w", err)
+	}
+
+	// (3) Assemble []EntryWithMetadata.
+	results := make([]types.EntryWithMetadata, len(metas))
+	for i, m := range metas {
+		results[i] = types.EntryWithMetadata{
+			CanonicalBytes:  rawEntries[i].CanonicalBytes,
+			LogTime:         m.Time,
+			Position:        types.LogPosition{LogDID: q.logDID, Sequence: m.Seq},
+			SignatureAlgoID: m.AlgoID,
+			SignatureBytes:  rawEntries[i].SigBytes,
+		}
+	}
+	return results, nil
 }

@@ -272,12 +272,12 @@ func TestSMT_DelegationLiveness(t *testing.T) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 func TestQuery_CosignatureOf_Basic(t *testing.T) {
-	if indexes.NewPostgresQueryAPI(nil, testLogDID) == nil { t.Fatal("nil") }
+	if indexes.NewPostgresQueryAPI(nil, testEntryBytes, testLogDID) == nil { t.Fatal("nil") }
 }
 
 func TestQuery_CosignatureOf_Multiple(t *testing.T) {
 	pool := skipIfNoPostgres(t)
-	qapi := indexes.NewPostgresQueryAPI(pool, testLogDID)
+	qapi := indexes.NewPostgresQueryAPI(pool, testEntryBytes, testLogDID)
 	tp := pos(100)
 	for i := uint64(1); i <= 5; i++ {
 		insertTestEntry(t, pool, i, makeEntry(t, envelope.ControlHeader{SignerDID: "did:example:w" + itoa(int(i)), CosignatureOf: ptrTo(tp)}, nil), testLogDID)
@@ -292,13 +292,13 @@ func TestQuery_CosignatureOf_Multiple(t *testing.T) {
 
 func TestQuery_CosignatureOf_Empty(t *testing.T) {
 	pool := skipIfNoPostgres(t)
-	results, _ := indexes.NewPostgresQueryAPI(pool, testLogDID).QueryByCosignatureOf(pos(999))
+	results, _ := indexes.NewPostgresQueryAPI(pool, testEntryBytes, testLogDID).QueryByCosignatureOf(pos(999))
 	if len(results) != 0 { t.Fatal("should be empty") }
 }
 
 func TestQuery_TargetRoot_Multiple(t *testing.T) {
 	pool := skipIfNoPostgres(t)
-	qapi := indexes.NewPostgresQueryAPI(pool, testLogDID)
+	qapi := indexes.NewPostgresQueryAPI(pool, testEntryBytes, testLogDID)
 	insertTestEntry(t, pool, 1, makeEntry(t, envelope.ControlHeader{SignerDID: "did:example:a", AuthorityPath: sameSigner()}, nil), testLogDID)
 	for i := uint64(2); i <= 4; i++ {
 		insertTestEntry(t, pool, i, makeEntry(t, envelope.ControlHeader{SignerDID: "did:example:a", TargetRoot: ptrTo(pos(1)), AuthorityPath: sameSigner()}, []byte{byte(i)}), testLogDID)
@@ -309,7 +309,7 @@ func TestQuery_TargetRoot_Multiple(t *testing.T) {
 
 func TestQuery_TargetRoot_Empty(t *testing.T) {
 	pool := skipIfNoPostgres(t)
-	results, _ := indexes.NewPostgresQueryAPI(pool, testLogDID).QueryByTargetRoot(pos(888))
+	results, _ := indexes.NewPostgresQueryAPI(pool, testEntryBytes, testLogDID).QueryByTargetRoot(pos(888))
 	if len(results) != 0 { t.Fatal("should be empty") }
 }
 
@@ -317,14 +317,14 @@ func TestQuery_SignerDID_Filtered(t *testing.T) {
 	pool := skipIfNoPostgres(t)
 	for i := uint64(1); i <= 3; i++ { insertTestEntry(t, pool, i, makeEntry(t, envelope.ControlHeader{SignerDID: "did:example:alice"}, []byte{byte(i)}), testLogDID) }
 	for i := uint64(4); i <= 6; i++ { insertTestEntry(t, pool, i, makeEntry(t, envelope.ControlHeader{SignerDID: "did:example:bob"}, []byte{byte(i)}), testLogDID) }
-	results, _ := indexes.NewPostgresQueryAPI(pool, testLogDID).QueryBySignerDID("did:example:alice")
+	results, _ := indexes.NewPostgresQueryAPI(pool, testEntryBytes, testLogDID).QueryBySignerDID("did:example:alice")
 	if len(results) != 3 { t.Fatalf("expected 3 alice, got %d", len(results)) }
 }
 
 func TestQuery_SignerDID_Isolation(t *testing.T) {
 	pool := skipIfNoPostgres(t)
 	insertTestEntry(t, pool, 1, makeEntry(t, envelope.ControlHeader{SignerDID: "did:example:unique"}, nil), testLogDID)
-	results, _ := indexes.NewPostgresQueryAPI(pool, testLogDID).QueryBySignerDID("did:example:nonexistent")
+	results, _ := indexes.NewPostgresQueryAPI(pool, testEntryBytes, testLogDID).QueryBySignerDID("did:example:nonexistent")
 	if len(results) != 0 { t.Fatal("nonexistent signer should return empty") }
 }
 
@@ -333,7 +333,7 @@ func TestQuery_SchemaRef_Filtered(t *testing.T) {
 	sa := pos(100)
 	for i := uint64(1); i <= 3; i++ { insertTestEntry(t, pool, i, makeEntry(t, envelope.ControlHeader{SignerDID: "did:example:issuer", SchemaRef: ptrTo(sa)}, []byte{byte(i)}), testLogDID) }
 	insertTestEntry(t, pool, 4, makeEntry(t, envelope.ControlHeader{SignerDID: "did:example:issuer", SchemaRef: ptrTo(pos(200))}, nil), testLogDID)
-	results, _ := indexes.NewPostgresQueryAPI(pool, testLogDID).QueryBySchemaRef(sa)
+	results, _ := indexes.NewPostgresQueryAPI(pool, testEntryBytes, testLogDID).QueryBySchemaRef(sa)
 	if len(results) != 3 { t.Fatalf("expected 3 for schemaA, got %d", len(results)) }
 }
 
@@ -344,7 +344,7 @@ func TestQuery_Scan_Pagination(t *testing.T) {
 
 func TestQuery_Scan_PastEnd(t *testing.T) {
 	pool := skipIfNoPostgres(t)
-	qapi := indexes.NewPostgresQueryAPI(pool, testLogDID)
+	qapi := indexes.NewPostgresQueryAPI(pool, testEntryBytes, testLogDID)
 	for i := uint64(1); i <= 5; i++ { insertTestEntry(t, pool, i, makeEntry(t, envelope.ControlHeader{SignerDID: "did:example:scan"}, []byte{byte(i)}), testLogDID) }
 	r1, _ := qapi.ScanFromPosition(100, 10)
 	if len(r1) != 0 { t.Fatal("past end should be empty") }
@@ -721,7 +721,7 @@ func TestOps_ThreeLogIsolation(t *testing.T) {
 	pool := skipIfNoPostgres(t)
 	insertTestEntry(t, pool, 1, makeEntry(t, envelope.ControlHeader{SignerDID: "did:example:log-a"}, nil), testLogDID)
 	insertTestEntry(t, pool, 2, makeEntry(t, envelope.ControlHeader{SignerDID: "did:example:log-b"}, nil), testLogDID)
-	qapi := indexes.NewPostgresQueryAPI(pool, testLogDID)
+	qapi := indexes.NewPostgresQueryAPI(pool, testEntryBytes, testLogDID)
 	ra, _ := qapi.QueryBySignerDID("did:example:log-a"); rb, _ := qapi.QueryBySignerDID("did:example:log-b")
 	if len(ra) != 1 || len(rb) != 1 { t.Fatal("each signer should have 1") }
 	if ra[0].Position.Sequence == rb[0].Position.Sequence { t.Fatal("different sequences") }

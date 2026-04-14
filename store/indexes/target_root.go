@@ -19,12 +19,12 @@ func (q *PostgresQueryAPI) QueryByTargetRoot(pos types.LogPosition) ([]types.Ent
 	ctx := context.TODO()
 	posBytes := store.SerializeLogPosition(pos)
 	rows, err := q.db.Query(ctx, `
-		SELECT sequence_number, canonical_bytes, log_time, sig_algorithm_id, sig_bytes
-		FROM entries WHERE target_root = $1 ORDER BY sequence_number ASC`,
+		SELECT sequence_number, log_time, sig_algorithm_id
+		FROM entry_index WHERE target_root = $1 ORDER BY sequence_number ASC`,
 		posBytes,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store/indexes/target_root: %w", err)
 	}
-	return scanEntries(ctx, rows, q.logDID)
+	return q.scanAndHydrate(ctx, rows)
 }

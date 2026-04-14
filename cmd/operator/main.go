@@ -248,7 +248,7 @@ func run(logger *slog.Logger) error {
 		Logger:        logger,
 	}
 
-	smtDeps := &api.SMTDeps{Tree: tree, Logger: logger}
+	smtDeps := &api.SMTDeps{Tree: tree, LeafStore: leafStore, Logger: logger}
 
 	queryDeps := &api.QueryDeps{
 		QueryAPI:       queryAPI,

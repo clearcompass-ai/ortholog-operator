@@ -1,17 +1,18 @@
 /*
 FILE PATH: store/entries.go
 
-Entry persistence and the PostgresEntryFetcher — the concrete implementation
-of sdk builder.EntryFetcher. Every entry returned by Fetch has had its
-signature verified at admission (SDK-D5 contract).
+Entry index and the PostgresEntryFetcher — the concrete implementation
+of sdk builder.EntryFetcher.
 
-KEY ARCHITECTURAL DECISIONS:
-  - Sequence number as primary key: gapless, monotonic, determined at admission.
-  - Canonical hash stored separately: UNIQUE constraint prevents duplicates.
-  - Indexed columns extracted at admission time — no runtime parsing for queries.
-  - Log_Time stored as TIMESTAMPTZ alongside entry but NOT in canonical bytes
-    (SDK-D1, Decision 50).
-  - Context propagated on all operations (not context.Background()).
+DESIGN RULE: Postgres is an index. Tessera is the source of truth for
+entry bytes. Always.
+
+  - entry_index stores ~50 bytes/row: sequence, hash, log_time, sig_algo,
+    signer_did, target_root, cosignature_of, schema_ref.
+  - canonical_bytes and sig_bytes are NEVER in Postgres.
+  - EntryReader (tessera.EntryReader) is the ONLY source of entry bytes.
+  - PostgresEntryFetcher combines: metadata from entry_index + bytes from EntryReader.
+  - SDK EntryFetcher interface unchanged: Fetch(pos) → *EntryWithMetadata.
 
 INVARIANTS:
   - SDK-D5: all returned entries have verified signatures.
@@ -31,13 +32,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/clearcompass-ai/ortholog-sdk/types"
+
+	"github.com/clearcompass-ai/ortholog-operator/tessera"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1) Entry Storage
+// 1) Entry Index Storage (Postgres — metadata only, no bytes)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// EntryStore handles entry persistence.
+// EntryStore handles entry index persistence.
 type EntryStore struct {
 	db *pgxpool.Pool
 }
@@ -47,35 +50,33 @@ func NewEntryStore(db *pgxpool.Pool) *EntryStore {
 	return &EntryStore{db: db}
 }
 
-// EntryRow is the complete entry record for insertion.
+// EntryRow is the index record for insertion. No canonical_bytes, no sig_bytes.
 type EntryRow struct {
 	SequenceNumber uint64
-	CanonicalBytes []byte
 	CanonicalHash  [32]byte
 	LogTime        time.Time
 	SigAlgorithmID uint16
-	SigBytes       []byte
 	SignerDID      string
 	TargetRoot     []byte // nil if null
 	CosignatureOf  []byte // nil if null
 	SchemaRef      []byte // nil if null
 }
 
-// Insert persists an entry. Called within the admission transaction.
+// Insert persists an entry's index columns. Called within the admission transaction.
+// Entry bytes go to EntryWriter (Tessera), NOT here.
 // Returns ErrDuplicateEntry on hash collision (UNIQUE constraint).
 func (s *EntryStore) Insert(ctx context.Context, tx pgx.Tx, row EntryRow) error {
 	_, err := tx.Exec(ctx, `
-		INSERT INTO entries (
-			sequence_number, canonical_bytes, canonical_hash, log_time,
-			sig_algorithm_id, sig_bytes, signer_did, target_root,
+		INSERT INTO entry_index (
+			sequence_number, canonical_hash, log_time,
+			sig_algorithm_id, signer_did, target_root,
 			cosignature_of, schema_ref
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-		row.SequenceNumber, row.CanonicalBytes, row.CanonicalHash[:],
-		row.LogTime, row.SigAlgorithmID, row.SigBytes, row.SignerDID,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		row.SequenceNumber, row.CanonicalHash[:],
+		row.LogTime, row.SigAlgorithmID, row.SignerDID,
 		row.TargetRoot, row.CosignatureOf, row.SchemaRef,
 	)
 	if err != nil {
-		// Detect unique violation on canonical_hash.
 		if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
 			return ErrDuplicateEntry
 		}
@@ -95,11 +96,10 @@ func (s *EntryStore) NextSequence(ctx context.Context, tx pgx.Tx) (uint64, error
 }
 
 // FetchByHash checks if an entry with the given canonical hash exists.
-// Returns (sequenceNumber, true) if found, (0, false) if not.
 func (s *EntryStore) FetchByHash(ctx context.Context, hash [32]byte) (uint64, bool, error) {
 	var seq uint64
 	err := s.db.QueryRow(ctx,
-		"SELECT sequence_number FROM entries WHERE canonical_hash = $1", hash[:],
+		"SELECT sequence_number FROM entry_index WHERE canonical_hash = $1", hash[:],
 	).Scan(&seq)
 
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -116,54 +116,60 @@ func (s *EntryStore) FetchByHash(ctx context.Context, hash [32]byte) (uint64, bo
 // ─────────────────────────────────────────────────────────────────────────────
 
 // PostgresEntryFetcher implements builder.EntryFetcher.
+// Metadata from entry_index (Postgres). Bytes from EntryReader (Tessera).
 //
 // CONTRACT (SDK-D5): all returned entries have verified signatures.
-// This invariant is established at admission (api/submission.go step 2)
-// and preserved by the database.
-//
 // CONTRACT (Decision 47): returns nil for foreign log DIDs.
 type PostgresEntryFetcher struct {
 	db     *pgxpool.Pool
+	reader tessera.EntryReader
 	logDID string
 }
 
 // NewPostgresEntryFetcher creates a fetcher for the given log.
-func NewPostgresEntryFetcher(db *pgxpool.Pool, logDID string) *PostgresEntryFetcher {
-	return &PostgresEntryFetcher{db: db, logDID: logDID}
+func NewPostgresEntryFetcher(db *pgxpool.Pool, reader tessera.EntryReader, logDID string) *PostgresEntryFetcher {
+	return &PostgresEntryFetcher{db: db, reader: reader, logDID: logDID}
 }
 
-// Fetch retrieves an entry by LogPosition. Returns nil if not found.
-// Only fetches entries on the local log (Decision 47: builder is local-only).
+// Fetch retrieves an entry by LogPosition.
+// Metadata from Postgres. Bytes from Tessera. Returns nil if not found.
 func (f *PostgresEntryFetcher) Fetch(pos types.LogPosition) (*types.EntryWithMetadata, error) {
 	if pos.LogDID != f.logDID {
 		return nil, nil // Foreign log — not found locally (Decision 47).
 	}
 
-	ctx := context.TODO() // SDK interface doesn't accept context; use TODO.
+	ctx := context.TODO()
+
+	// (1) Metadata from entry_index.
 	var (
-		canonical []byte
-		logTime   time.Time
-		algoID    int16
-		sigBytes  []byte
+		logTime time.Time
+		algoID  int16
 	)
 	err := f.db.QueryRow(ctx, `
-		SELECT canonical_bytes, log_time, sig_algorithm_id, sig_bytes
-		FROM entries WHERE sequence_number = $1`,
+		SELECT log_time, sig_algorithm_id
+		FROM entry_index WHERE sequence_number = $1`,
 		pos.Sequence,
-	).Scan(&canonical, &logTime, &algoID, &sigBytes)
+	).Scan(&logTime, &algoID)
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("store/entries: fetch seq=%d: %w", pos.Sequence, err)
+		return nil, fmt.Errorf("store/entries: fetch index seq=%d: %w", pos.Sequence, err)
 	}
 
+	// (2) Bytes from EntryReader (Tessera tiles).
+	raw, err := f.reader.ReadEntry(pos.Sequence)
+	if err != nil {
+		return nil, fmt.Errorf("store/entries: read bytes seq=%d: %w", pos.Sequence, err)
+	}
+
+	// (3) Assemble — interface unchanged.
 	return &types.EntryWithMetadata{
-		CanonicalBytes:  canonical,
+		CanonicalBytes:  raw.CanonicalBytes,
 		LogTime:         logTime,
 		Position:        pos,
 		SignatureAlgoID: uint16(algoID),
-		SignatureBytes:  sigBytes,
+		SignatureBytes:  raw.SigBytes,
 	}, nil
 }
