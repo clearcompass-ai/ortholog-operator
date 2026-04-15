@@ -1,3 +1,5 @@
+github.com/clearcompass-ai/ortholog-sdk v1.3.0 h1:liueiEDAQ/cwnDEWFteLH0P1J+mXeRgHSrS3P9NhFuI=
+github.com/clearcompass-ai/ortholog-sdk v1.3.0/go.mod h1:nrORla8XriePcWg8T8Q6s9cZFbXuwo7GREMCh4HSnrk=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

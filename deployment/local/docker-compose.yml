@@ -1,0 +1,103 @@
+# deployment/local/docker-compose.yml
+
+services:
+  # 1. PostgreSQL (State, Queues, Indexes)
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ortholog
+      POSTGRES_PASSWORD: orthologpassword
+      POSTGRES_DB: ortholog
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ortholog"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 2. MinIO (Local Object Storage for Tessera Tiles)
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "local-admin"
+      MINIO_ROOT_PASSWORD: "local-password"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 3. MinIO Setup (Creates the 'tessera-tiles' bucket and makes it public)
+  minio-setup:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 local-admin local-password;
+      mc mb local/tessera-tiles || true;
+      mc anonymous set download local/tessera-tiles;
+      exit 0;
+      "
+
+  # 4. Trillian Tessera (The Merkle Tree Writer - AWS/S3 Personality)
+# 4. Trillian Tessera (The Merkle Tree Writer - AWS/S3 Personality)
+  tessera:
+    # FIX: Use the 'tesseract' namespace as published in their GHCR
+    image: ghcr.io/transparency-dev/tesseract/aws:latest
+    environment:
+      - S3_BUCKET=tessera-tiles
+      - S3_ENDPOINT=http://minio:9000
+      - AWS_ACCESS_KEY_ID=local-admin
+      - AWS_SECRET_ACCESS_KEY=local-password
+      - AWS_REGION=us-east-1
+      - S3_FORCE_PATH_STYLE=true
+    ports:
+      - "8081:8080"
+    depends_on:
+      minio-setup:
+        condition: service_completed_successfully
+
+  # 5. Nginx (The Traffic Splitter)
+  tessera-router:
+    image: nginx:alpine
+    volumes:
+      - ./nginx-tessera.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "2024:2024"
+    depends_on:
+      - minio
+      - tessera
+
+  # 6. Ortholog Operator
+  operator:
+    build:
+      context: ../../ # Build from the root of the ortholog-operator repo
+      dockerfile: deployment/local/Dockerfile
+    environment:
+      - ORTHOLOG_LOG_DID=did:ortholog:operator:local:001
+      - ORTHOLOG_POSTGRES_DSN=postgres://ortholog:orthologpassword@postgres:5432/ortholog?sslmode=disable
+      - ORTHOLOG_TESSERA_URL=http://tessera-router:2024
+      - ORTHOLOG_SERVER_ADDR=:8080
+      - LOG_LEVEL=debug
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      tessera-router:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  minio_data:

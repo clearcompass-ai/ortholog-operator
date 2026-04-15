@@ -3,7 +3,7 @@ module github.com/clearcompass-ai/ortholog-operator
 go 1.22
 
 require (
-	github.com/clearcompass-ai/ortholog-sdk v0.1.0
+	github.com/clearcompass-ai/ortholog-sdk v1.3.0
 	github.com/jackc/pgx/v5 v5.7.4
 )
 
@@ -16,6 +16,3 @@ require (
 	golang.org/x/sync v0.10.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
 )
-
-// Development: SDK from local workspace. Remove for release.
-replace github.com/clearcompass-ai/ortholog-sdk => ../ortholog-sdk
