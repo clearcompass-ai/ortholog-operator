@@ -33,24 +33,19 @@ services:
   # The Merkle Tree writer. Hashes entries and writes tiles to your public GCS bucket.
   # ==================================================================================
   tessera:
-    # Uses the GCP-specific image from the transparency-dev repository
     image: ghcr.io/transparency-dev/tesseract/gcp:latest
     environment:
-      - STORAGE=gcp
-      - GCP_PROJECT=legalai-460612
-      # The bucket and folder prefix where tiles will be written
-      - GCS_BUCKET=legalai-tessera-tiles/my-log-prefix
-      # Points the Google Cloud SDK inside the container to your mounted ADC file
+      # Tell the Google SDK where to find the mounted credentials
       - GOOGLE_APPLICATION_CREDENTIALS=/tmp/adc.json
     volumes:
-      # Mount the dummy signing keys required by Tessera (generated via shell script)
-      - ./tessera-private.pem:/keys/private.pem:ro
-      - ./tessera-public.pem:/keys/public.pem:ro
-      # Mount your Mac's local Application Default Credentials file into the container
+      # Mount your Mac's local ADC file directly into the container
       - ~/.config/gcloud/application_default_credentials.json:/tmp/adc.json:ro
     command: 
-      - "--signer_private_key_file=/keys/private.pem"
-      - "--signer_public_key_file=/keys/public.pem"
+      # Point to the GCS bucket
+      - "-bucket=legalai-tessera-tiles/my-log-prefix"
+      # Point to the GCP Secret Manager keys we just uploaded
+      - "-signer_private_key_secret_name=projects/legalai-460612/secrets/tessera-private-key/versions/latest"
+      - "-signer_public_key_secret_name=projects/legalai-460612/secrets/tessera-public-key/versions/latest"
     ports:
       - "8081:8080"
 
