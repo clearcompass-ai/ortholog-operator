@@ -1,20 +1,37 @@
 /*
-FILE PATH: lifecycle/archive_reader.go
+FILE PATH:
+    lifecycle/archive_reader.go
 
-Reads entries from archived (frozen) shards. Resolves shard from sequence
-range, fetches tiles from archive endpoints (cold storage), extracts
-entries, and returns EntryWithMetadata — same interface as the live operator.
+DESCRIPTION:
+    Reads entries from archived (frozen) shards. Resolves shard from sequence
+    range, fetches entry hashes from archive tile endpoints (cold storage) for
+    proof verification, and full entry bytes from the shard's byte archive.
 
-DESIGN RULE: The caller does not know or care if an entry is live or
-archived. ArchiveReader and PostgresEntryFetcher both return
-types.EntryWithMetadata. They're interchangeable behind the
-builder.EntryFetcher interface.
+    With hash-only Tessera tiles (Conflict #1 resolution), entry tiles contain
+    32-byte SHA-256 hashes — NOT full wire bytes. Full entry bytes are stored
+    in a separate byte archive alongside the tiles. Two-step verification:
+      1. Prove hash is in the Merkle tree (tile-based inclusion proof).
+      2. Prove entry data hashes to that value (SHA-256 of fetched bytes).
 
-TILE FORMAT (Option B):
-  Tessera entry tiles store full wire bytes (canonical + sig_envelope)
-  as submitted via AppendLeaf. Each entry is length-prefixed in the tile
-  bundle (c2sp.org/tlog-tiles format). To recover canonical + sig:
-  envelope.StripSignature(wireBytes).
+KEY ARCHITECTURAL DECISIONS:
+    - Hash-only entry tiles: each entry in a tile is exactly 32 bytes.
+      Full wire bytes are in the shard's byte archive (separate endpoint).
+    - ArchiveReader implements builder.EntryFetcher — same Fetch(pos) interface
+      as the live operator's PostgresEntryFetcher. The caller does not know or
+      care if an entry is live or archived.
+    - Byte archive endpoint: {archive_endpoint}/bytes/{seq} returns the full
+      wire bytes for a given sequence number. This is separate from the tile
+      read path.
+    - Shard metadata includes both tile and byte archive endpoints.
+
+OVERVIEW:
+    Fetch(pos) → resolve shard → fetch bytes from byte archive → split → return.
+    FetchHash(pos) → resolve shard → fetch hash from entry tile → return.
+
+KEY DEPENDENCIES:
+    - tessera/entry_reader.go: ParseEntryBundle for tile parsing.
+    - tessera/tile_reader.go: EntryTilePath for c2sp.org path encoding.
+    - github.com/clearcompass-ai/ortholog-sdk/core/envelope: StripSignature.
 */
 package lifecycle
 
@@ -34,24 +51,25 @@ import (
 	"github.com/clearcompass-ai/ortholog-operator/tessera"
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Shard Metadata
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
+// 1) Shard Metadata
+// -------------------------------------------------------------------------------------------------
 
 // ShardMeta describes an archived shard's location and range.
 type ShardMeta struct {
-	ShardDID        string `json:"shard_did"`
-	SequenceStart   uint64 `json:"sequence_start"`
-	SequenceEnd     uint64 `json:"sequence_end"`
-	ArchiveEndpoint string `json:"archive_endpoint"`
-	FinalRootHash   string `json:"final_root_hash"`
-	FinalTreeSize   uint64 `json:"final_tree_size"`
-	ChainPosition   int    `json:"chain_position"`
+	ShardDID             string `json:"shard_did"`
+	SequenceStart        uint64 `json:"sequence_start"`
+	SequenceEnd          uint64 `json:"sequence_end"`
+	TileArchiveEndpoint  string `json:"tile_archive_endpoint"`  // Static tile files (hash-only).
+	ByteArchiveEndpoint  string `json:"byte_archive_endpoint"`  // Full entry bytes.
+	FinalRootHash        string `json:"final_root_hash"`
+	FinalTreeSize        uint64 `json:"final_tree_size"`
+	ChainPosition        int    `json:"chain_position"`
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Archive Reader
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
+// 2) Archive Reader
+// -------------------------------------------------------------------------------------------------
 
 // ArchiveReader fetches entries from archived shards.
 // Implements the same Fetch signature as builder.EntryFetcher.
@@ -110,34 +128,34 @@ func (r *ArchiveReader) AddShard(meta ShardMeta) {
 	r.mu.Unlock()
 }
 
-// Fetch retrieves an entry from an archived shard by its log position.
+// -------------------------------------------------------------------------------------------------
+// 3) Fetch — full entry bytes from byte archive
+// -------------------------------------------------------------------------------------------------
+
+// Fetch retrieves an entry's full bytes from the shard's byte archive.
 // Returns the same types.EntryWithMetadata as the live operator's Fetch.
 //
-// Option B: Tessera tiles contain full wire bytes (canonical + sig_envelope).
-// envelope.StripSignature recovers canonical, algoID, and sigBytes.
+// Hash-only architecture: tiles contain hashes only. Full wire bytes
+// (canonical + sig_envelope) are in the byte archive at a separate endpoint.
 func (r *ArchiveReader) Fetch(pos types.LogPosition) (*types.EntryWithMetadata, error) {
 	shard, err := r.resolveShard(pos)
 	if err != nil {
 		return nil, err
 	}
 
-	tileIndex := pos.Sequence / tessera.EntriesPerTile
-	offset := pos.Sequence % tessera.EntriesPerTile
-
-	tileURL := fmt.Sprintf("%s/tile/0/%d", shard.ArchiveEndpoint, tileIndex)
-	tileData, err := r.fetchTile(tileURL)
-	if err != nil {
-		return nil, fmt.Errorf("lifecycle/archive: fetch tile %d from %s: %w",
-			tileIndex, shard.ShardDID, err)
+	if shard.ByteArchiveEndpoint == "" {
+		return nil, fmt.Errorf("lifecycle/archive: shard %s has no byte archive endpoint", shard.ShardDID)
 	}
 
-	// Extract raw entry data from tile bundle (c2sp.org/tlog-tiles format).
-	wireBytes, err := tessera.ParseEntryBundle(tileData, offset)
+	// Fetch full wire bytes from the byte archive.
+	byteURL := fmt.Sprintf("%s/bytes/%d", shard.ByteArchiveEndpoint, pos.Sequence)
+	wireBytes, err := r.fetchBytes(byteURL)
 	if err != nil {
-		return nil, fmt.Errorf("lifecycle/archive: extract entry seq=%d: %w", pos.Sequence, err)
+		return nil, fmt.Errorf("lifecycle/archive: fetch bytes seq=%d from %s: %w",
+			pos.Sequence, shard.ShardDID, err)
 	}
 
-	// Option B: tile data = full wire bytes. StripSignature splits them.
+	// Split wire bytes into canonical + signature.
 	canonical, algoID, sigBytes, err := envelope.StripSignature(wireBytes)
 	if err != nil {
 		return nil, fmt.Errorf("lifecycle/archive: strip signature seq=%d: %w", pos.Sequence, err)
@@ -151,7 +169,50 @@ func (r *ArchiveReader) Fetch(pos types.LogPosition) (*types.EntryWithMetadata, 
 	}, nil
 }
 
-// FetchBatch retrieves multiple entries.
+// -------------------------------------------------------------------------------------------------
+// 4) FetchHash — entry hash from tile archive (for proof verification)
+// -------------------------------------------------------------------------------------------------
+
+// FetchHash retrieves the 32-byte SHA-256 hash for an entry from the shard's
+// tile archive. Used for Merkle proof verification against frozen shards.
+func (r *ArchiveReader) FetchHash(pos types.LogPosition) ([32]byte, error) {
+	shard, err := r.resolveShard(pos)
+	if err != nil {
+		return [32]byte{}, err
+	}
+
+	tileIndex := pos.Sequence / tessera.EntriesPerTile
+	offset := pos.Sequence % tessera.EntriesPerTile
+
+	// Fetch entry tile from tile archive.
+	tilePath := tessera.EntryTilePath(tileIndex)
+	tileURL := fmt.Sprintf("%s/%s", shard.TileArchiveEndpoint, tilePath)
+	tileData, err := r.fetchBytes(tileURL)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("lifecycle/archive: fetch entry tile %d from %s: %w",
+			tileIndex, shard.ShardDID, err)
+	}
+
+	// Extract 32-byte hash from entry tile.
+	hashBytes, err := tessera.ParseEntryBundle(tileData, offset)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("lifecycle/archive: extract hash seq=%d: %w", pos.Sequence, err)
+	}
+	if len(hashBytes) != 32 {
+		return [32]byte{}, fmt.Errorf("lifecycle/archive: entry at seq=%d is %d bytes, expected 32 (hash-only tile)",
+			pos.Sequence, len(hashBytes))
+	}
+
+	var hash [32]byte
+	copy(hash[:], hashBytes)
+	return hash, nil
+}
+
+// -------------------------------------------------------------------------------------------------
+// 5) Batch Operations
+// -------------------------------------------------------------------------------------------------
+
+// FetchBatch retrieves multiple entries' full bytes.
 func (r *ArchiveReader) FetchBatch(positions []types.LogPosition) ([]*types.EntryWithMetadata, error) {
 	results := make([]*types.EntryWithMetadata, len(positions))
 	for i, pos := range positions {
@@ -184,9 +245,9 @@ func (r *ArchiveReader) Shards() []ShardMeta {
 	return result
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
+// 6) Internal
+// -------------------------------------------------------------------------------------------------
 
 func (r *ArchiveReader) resolveShard(pos types.LogPosition) (*ShardMeta, error) {
 	r.mu.RLock()
@@ -205,7 +266,7 @@ func (r *ArchiveReader) resolveShard(pos types.LogPosition) (*ShardMeta, error) 
 	return nil, fmt.Errorf("lifecycle/archive: no shard found for %s@%d", pos.LogDID, pos.Sequence)
 }
 
-func (r *ArchiveReader) fetchTile(url string) ([]byte, error) {
+func (r *ArchiveReader) fetchBytes(url string) ([]byte, error) {
 	resp, err := r.client.Get(url)
 	if err != nil {
 		return nil, err
@@ -213,9 +274,9 @@ func (r *ArchiveReader) fetchTile(url string) ([]byte, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("tile fetch returned %d", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
 	}
 
-	// Entry tiles: 256 entries × ~1KB avg = ~256KB typical. Cap at 64 MB.
-	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	// Cap at 2MB (1MB max entry + overhead).
+	return io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 }

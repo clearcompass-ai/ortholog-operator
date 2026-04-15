@@ -1,11 +1,21 @@
-# ====================================================================================
-# FILE: deployment/local/docker-compose.yml
+# ======================================================================================
+# FILE PATH: deployment/local/docker-compose.yml
 #
-# PURPOSE: 
-# Local deployment of the Ortholog Operator.
-# Currently configured to use Google Cloud Storage (GCS) via Application Default 
-# Credentials (ADC) for Merkle tree tiles, with local MinIO commented out.
-# ====================================================================================
+# DESCRIPTION:
+#   Local deployment of the Ortholog Operator with the dedicated Tessera personality.
+#   Three services: Postgres (state), Tessera personality (Merkle tree), Operator (protocol).
+#
+# KEY ARCHITECTURAL DECISIONS:
+#   - Dedicated Tessera personality replaces the CT personality (tesseract/gcp) which
+#     required X.509 roots and certificate chains. The Ortholog personality accepts
+#     32-byte SHA-256 hashes and serves the c2sp.org/tlog-tiles static read API.
+#   - No nginx router: the personality serves both writes (POST /add) and reads
+#     (/checkpoint, /tile/*) from a single process. For production, CDN or nginx
+#     goes in front of the GCS tile storage.
+#   - POSIX storage for local dev: tiles written to /data volume. No cloud credentials.
+#   - Ed25519 ephemeral key for checkpoint signing in local dev. Production loads
+#     from --key-path flag.
+# ======================================================================================
 
 services:
   # ==================================================================================
@@ -29,52 +39,44 @@ services:
       retries: 5
 
   # ==================================================================================
-  # 2. TRILLIAN TESSERA (ACTIVE): GCP Personality
-  # The Merkle Tree writer. Hashes entries and writes tiles to your public GCS bucket.
+  # 2. MERKLE TREE: Ortholog Tessera Personality
+  # Accepts 32-byte SHA-256 hashes via POST /add. Tessera handles tile layout,
+  # checkpoint signing (Ed25519), integration batching, and the static read API.
   # ==================================================================================
-  tessera:
-    image: ghcr.io/transparency-dev/tesseract/gcp:latest
-    environment:
-      # Tell the Google SDK where to find the mounted credentials
-      - GOOGLE_APPLICATION_CREDENTIALS=/tmp/adc.json
-    volumes:
-      # Mount your Mac's local ADC file directly into the container
-      - ~/.config/gcloud/application_default_credentials.json:/tmp/adc.json:ro
-    command: 
-      # Point to the GCS bucket
-      - "-bucket=legalai-tessera-tiles/my-log-prefix"
-      # Point to the GCP Secret Manager keys we just uploaded
-      - "-signer_private_key_secret_name=projects/legalai-460612/secrets/tessera-private-key/versions/latest"
-      - "-signer_public_key_secret_name=projects/legalai-460612/secrets/tessera-public-key/versions/latest"
+  tessera-personality:
+    build:
+      context: ../../
+      dockerfile: tessera-personality/Dockerfile
+    command:
+      - "--storage=posix"
+      - "--data-dir=/data"
+      - "--listen=:8081"
+      - "--origin=ortholog-local-dev"
+      # No --key-path: generates ephemeral Ed25519 key for local dev.
     ports:
-      - "8081:8080"
+      - "8081:8081"
+    volumes:
+      - tessera_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   # ==================================================================================
-  # 3. ROUTING LAYER: Nginx
-  # Splits traffic hitting ORTHOLOG_TESSERA_URL. 
-  # Writes -> Tessera container. Reads -> Direct to GCS.
-  # ==================================================================================
-  tessera-router:
-    image: nginx:alpine
-    volumes:
-      - ./nginx-tessera.conf:/etc/nginx/nginx.conf:ro
-    ports:
-      - "2024:2024"
-    depends_on:
-      - tessera
-
-  # ==================================================================================
-  # 4. ORTHOLOG OPERATOR
-  # The core protocol operator. Connects to Postgres and the Nginx Router.
+  # 3. ORTHOLOG OPERATOR
+  # The core protocol operator. Connects to Postgres and the Tessera personality.
+  # Entry bytes stored in InMemoryEntryStore (local dev). SHA-256 hashes sent to
+  # Tessera for Merkle tree inclusion.
   # ==================================================================================
   operator:
     build:
-      context: ../../ # Build from the root of the ortholog-operator repo
+      context: ../../
       dockerfile: deployment/local/Dockerfile
     environment:
       - ORTHOLOG_LOG_DID=did:ortholog:operator:local:001
       - ORTHOLOG_POSTGRES_DSN=postgres://ortholog:orthologpassword@postgres:5432/ortholog?sslmode=disable
-      - ORTHOLOG_TESSERA_URL=http://tessera-router:2024
+      - ORTHOLOG_TESSERA_URL=http://tessera-personality:8081
       - ORTHOLOG_SERVER_ADDR=:8080
       - LOG_LEVEL=debug
     ports:
@@ -82,66 +84,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      tessera-router:
-        condition: service_started
-
-  # ==================================================================================
-  # 5. OFFLINE STORAGE (COMMENTED OUT): Local MinIO & Tessera AWS Personality
-  # Uncomment these blocks (and comment out the GCP Tessera block above) to run 
-  # a 100% local, offline storage environment using MinIO.
-  # ==================================================================================
-
-  # minio:
-  #   image: minio/minio:latest
-  #   command: server /data --console-address ":9001"
-  #   environment:
-  #     MINIO_ROOT_USER: "local-admin"
-  #     MINIO_ROOT_PASSWORD: "local-password"
-  #   ports:
-  #     - "9000:9000"
-  #     - "9001:9001"
-  #   volumes:
-  #     - minio_data:/data
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-  #     interval: 5s
-  #     timeout: 5s
-  #     retries: 5
-
-  # minio-setup:
-  #   image: minio/mc:latest
-  #   depends_on:
-  #     minio:
-  #       condition: service_healthy
-  #   entrypoint: >
-  #     /bin/sh -c "
-  #     mc alias set local http://minio:9000 local-admin local-password;
-  #     mc mb local/tessera-tiles || true;
-  #     mc anonymous set download local/tessera-tiles;
-  #     exit 0;
-  #     "
-
-  # tessera-aws:
-  #   image: ghcr.io/transparency-dev/tesseract/aws:latest
-  #   environment:
-  #     - S3_BUCKET=tessera-tiles
-  #     - S3_ENDPOINT=http://minio:9000
-  #     - AWS_ACCESS_KEY_ID=local-admin
-  #     - AWS_SECRET_ACCESS_KEY=local-password
-  #     - AWS_REGION=us-east-1
-  #     - S3_FORCE_PATH_STYLE=true
-  #   volumes:
-  #     - ./tessera-private.pem:/keys/private.pem:ro
-  #     - ./tessera-public.pem:/keys/public.pem:ro
-  #   command: 
-  #     - "--signer_private_key_file=/keys/private.pem"
-  #     - "--signer_public_key_file=/keys/public.pem"
-  #   ports:
-  #     - "8081:8080"
-  #   depends_on:
-  #     minio-setup:
-  #       condition: service_completed_successfully
+      tessera-personality:
+        condition: service_healthy
 
 volumes:
   postgres_data:
-  # minio_data: # Uncomment if using local MinIO
+  tessera_data:

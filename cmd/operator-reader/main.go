@@ -1,14 +1,31 @@
 /*
-FILE PATH: cmd/operator-reader/main.go
+FILE PATH:
+    cmd/operator-reader/main.go
 
-Read-only Ortholog log operator. Serves all GET endpoints.
-Does NOT run the builder loop, accept submissions, or write anything.
+DESCRIPTION:
+    Read-only Ortholog log operator. Serves all GET endpoints.
+    Does NOT run the builder loop, accept submissions, or write anything.
 
-CHANGES:
-  - 5 new read handlers: EntryBySequence, EntryBatch, SMTLeaf, SMTLeafBatch, CommitmentQuery
-  - CommitmentStore created on read pool
-  - No shard wiring (deferred post Phase 6)
-  - No SchemaResolver (reader doesn't run builder loop)
+KEY ARCHITECTURAL DECISIONS:
+    - Hash-only tiles: TesseraEntryReader removed because entry tiles now contain
+      32-byte SHA-256 hashes, not full wire bytes. The reader needs access to the
+      same byte store as the writer for full entry bytes.
+    - Production: shared persistent byte store (DiskEntryStore, GCS-backed, etc.).
+      The reader and writer operator both access the same backing store.
+    - Local dev: InMemoryEntryStore — the reader process has an EMPTY byte store
+      unless it shares the writer's process or backing directory. Entry byte
+      hydration will fail for entries not in the store. This is acceptable for
+      local dev where the read-write operator is the primary deployment.
+    - All GET endpoints remain functional for Postgres-only queries (tree head,
+      SMT proofs, difficulty). Entry byte hydration endpoints (entry fetch, query
+      results with canonical_bytes) require the shared byte store.
+
+OVERVIEW:
+    Same startup as the read-write operator, minus:
+    - No builder loop (no advisory lock, no queue drain).
+    - No submission handler (POST /v1/entries returns 404).
+    - No witness cosign endpoint.
+    - Entry byte store: InMemoryEntryStore (empty on start — production uses shared persistent).
 */
 package main
 
@@ -66,16 +83,23 @@ func run(logger *slog.Logger) error {
 	defer pool.Close()
 	logger.Info("postgres read pool initialized", "replica", cfg.ReplicaDSN != "")
 
-	// ── Tessera ────────────────────────────────────────────────────────
+	// ── Tessera (tile reader for proofs, client for tree head) ─────────
 	tileBackend := tessera.NewHTTPTileBackend(cfg.TesseraBaseURL)
 	tileReader := tessera.NewTileReader(tileBackend, cfg.TileCacheSize)
-	entryReader := tessera.NewTesseraEntryReader(tileReader)
 	tesseraClient := tessera.NewClient(tessera.ClientConfig{
 		BaseURL: cfg.TesseraBaseURL,
 		Timeout: 30 * time.Second,
 	}, logger)
 	tesseraAdapter := tessera.NewTesseraAdapter(tesseraClient, tileReader, logger)
 	logger.Info("tessera initialized", "url", cfg.TesseraBaseURL)
+
+	// ── Entry byte store (read-only mode) ──────────────────────────────
+	// Hash-only tiles: TesseraEntryReader is gone. Tiles contain hashes only.
+	// The reader needs a shared persistent byte store in production.
+	// For now: InMemoryEntryStore (empty — entry byte hydration will fail
+	// for entries not populated by a writer process).
+	entryBytes := tessera.NewInMemoryEntryStore()
+	logger.Warn("operator-reader using empty InMemoryEntryStore — entry byte hydration will fail. Production requires shared persistent byte store.")
 
 	// ── SMT (read-only) ────────────────────────────────────────────────
 	leafStore := store.NewPostgresLeafStore(pool.DB)
@@ -88,7 +112,7 @@ func run(logger *slog.Logger) error {
 	// ── Stores ─────────────────────────────────────────────────────────
 	treeHeadStore := store.NewTreeHeadStore(pool.DB)
 	commitmentStore := store.NewCommitmentStore(pool.DB)
-	fetcher := store.NewPostgresEntryFetcher(pool.DB, entryReader, cfg.LogDID)
+	fetcher := store.NewPostgresEntryFetcher(pool.DB, entryBytes, cfg.LogDID)
 
 	// ── Difficulty (static) ────────────────────────────────────────────
 	diffController := middleware.NewDifficultyController(
@@ -102,7 +126,7 @@ func run(logger *slog.Logger) error {
 	)
 
 	// ── Query API ──────────────────────────────────────────────────────
-	queryAPI := indexes.NewPostgresQueryAPI(pool.DB, entryReader, cfg.LogDID)
+	queryAPI := indexes.NewPostgresQueryAPI(pool.DB, entryBytes, cfg.LogDID)
 
 	// ── HTTP handlers ──────────────────────────────────────────────────
 	treeDeps := &api.TreeDeps{
@@ -172,9 +196,9 @@ func run(logger *slog.Logger) error {
 	return nil
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 // Configuration
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 
 type readerConfig struct {
 	LogDID            string
@@ -201,7 +225,7 @@ func loadConfig() readerConfig {
 		MaxConns:          20,
 		MinConns:          5,
 		ServerAddr:        envOr("ORTHOLOG_SERVER_ADDR", ":8081"),
-		TesseraBaseURL:    envOr("ORTHOLOG_TESSERA_URL", "http://localhost:2024"),
+		TesseraBaseURL:    envOr("ORTHOLOG_TESSERA_URL", "http://localhost:8081"),
 		TileCacheSize:     10000,
 		WarmTopLevels:     32,
 		SMTCacheSize:      100000,

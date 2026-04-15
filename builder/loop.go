@@ -1,35 +1,47 @@
 /*
-Package builder — loop.go is the continuous builder loop. THE core operational
-loop of the operator. Dequeues admitted entries, calls SDK ProcessBatch, commits
-state atomically, appends to Merkle tree, publishes commitments, requests
-witness cosignatures.
+FILE PATH:
+    builder/loop.go
+
+DESCRIPTION:
+    The continuous builder loop — THE core operational loop of the operator.
+    Dequeues admitted entries, calls SDK ProcessBatch, commits state atomically,
+    appends entry hashes to the Merkle tree, publishes commitments, and requests
+    witness cosignatures.
 
 KEY ARCHITECTURAL DECISIONS:
+    - Single goroutine: determinism requires exactly one builder per log.
+      Advisory lock prevents concurrent instances.
+    - Atomic commit: leaf mutations + delta buffer + queue status in ONE
+      Postgres transaction. No partial state on crash.
+    - Hash-only Merkle tree (Conflict #1 resolution): Step 6 passes
+      SHA-256(wire_bytes) — exactly 32 bytes — to Tessera. Full entry bytes
+      stay in the operator's own storage (InMemoryEntryStore/disk).
+      Tessera never sees full entry data. This preserves SDK-D11 (1MB)
+      within the tlog-tiles uint16 (64KB) entry bundle constraint.
+    - SDK MerkleTree interface: builder touches only the MerkleAppender
+      interface, never tessera/client.go directly. Swappable backend.
+    - Idempotent: replaying the same batch produces identical state.
+    - Context-aware: every Postgres call checks ctx.Done() first.
 
-  - Single goroutine: determinism requires exactly one builder per log.
-    Advisory lock prevents concurrent instances.
-  - Atomic commit: leaf mutations + delta buffer + queue status in ONE
-    Postgres transaction. No partial state on crash.
-  - SDK MerkleTree interface: builder touches only the interface, never
-    tessera/client.go directly. Swappable backend.
-  - Idempotent: replaying the same batch produces identical state.
-  - SDK LeafMutation is a diff format: carries tip positions, not a full
-    SMTLeaf. The operator reconstructs the leaf from mutation fields.
-  - Context-aware: every Postgres call checks ctx.Done() first. Shutdown
-    never produces spurious ERROR logs.
+OVERVIEW:
+    Run loop: dequeue → fetch → split → ProcessBatch → atomic commit →
+    Merkle append (hash-only) → commitment → witness cosig.
 
-INVARIANTS:
+    Step 6 (Merkle append) is POST-COMMIT and best-effort. Crash between
+    commit and append → re-append on restart is safe (Tessera deduplicates
+    by leaf hash). The operator's atomic state is in Postgres.
 
-  - processBatch either fully commits or fully rolls back.
-  - Crash between commit and Tessera append → on restart, re-append is
-    idempotent (Tessera deduplicates by leaf hash).
-  - Empty batch → no mutations, no commitment, no cosig request.
-  - Context cancellation → clean exit, no error logged.
+KEY DEPENDENCIES:
+    - github.com/clearcompass-ai/ortholog-sdk/builder: ProcessBatch, BatchResult.
+    - tessera/proof_adapter.go: TesseraAdapter implements MerkleAppender.
+    - store/smt_state.go: PostgresLeafStore.SetTx for atomic leaf writes.
+    - store/entries.go: PostgresEntryFetcher for entry retrieval.
 */
 package builder
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -48,9 +60,9 @@ import (
 	"github.com/clearcompass-ai/ortholog-operator/store"
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 // 1) Configuration
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 
 // LoopConfig configures the builder loop.
 type LoopConfig struct {
@@ -70,13 +82,19 @@ func DefaultLoopConfig(logDID string) LoopConfig {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 2) Interfaces (satisfied by TesseraAdapter and HeadSync respectively)
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
+// 2) Interfaces
+// -------------------------------------------------------------------------------------------------
 
-// MerkleAppender is the subset of sdk smt.MerkleTree used by the builder.
-// AppendLeaf takes full wire bytes (canonical + sig_envelope). Tessera
-// computes RFC6962.HashLeaf(data) internally — the caller does not hash.
+// MerkleAppender is the subset of the Merkle tree interface used by the builder.
+//
+// AppendLeaf takes a 32-byte SHA-256 hash of the entry's wire bytes.
+// The operator computes SHA-256(canonical + sig_envelope) and passes only
+// the digest. Tessera stores this hash in its entry tiles and computes
+// the Merkle leaf hash as H(0x00 || hash_bytes).
+//
+// This is the hash-only architecture (Conflict #1 resolution). Full entry
+// bytes stay in the operator's own storage. Tessera never sees them.
 type MerkleAppender interface {
 	AppendLeaf(data []byte) (uint64, error)
 	Head() (types.TreeHead, error)
@@ -87,9 +105,9 @@ type WitnessCosigner interface {
 	RequestCosignatures(ctx context.Context, head types.TreeHead) error
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 // 3) BuilderLoop
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 
 // BuilderLoop is the continuous builder goroutine.
 type BuilderLoop struct {
@@ -150,15 +168,12 @@ func NewBuilderLoop(
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 // 4) Run — main loop with clean shutdown and panic recovery
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 
 // Run executes the builder loop until ctx is cancelled.
 // MUST be called from a single goroutine.
-//
-// Shutdown behavior: context cancellation produces a clean INFO log and nil
-// return. No ERROR logs on shutdown. Panics are recovered with a stack trace.
 func (bl *BuilderLoop) Run(ctx context.Context) (retErr error) {
 	// Panic recovery — builder goroutine death must be diagnosable.
 	defer func() {
@@ -181,7 +196,7 @@ func (bl *BuilderLoop) Run(ctx context.Context) (retErr error) {
 
 	// Recover stale processing entries from prior crash.
 	if err := ctx.Err(); err != nil {
-		return nil // Already cancelled before we started.
+		return nil
 	}
 	recovered, err := bl.queue.RecoverStale(ctx)
 	if err != nil {
@@ -196,7 +211,6 @@ func (bl *BuilderLoop) Run(ctx context.Context) (retErr error) {
 	}
 
 	for {
-		// ── Check context BEFORE any work ─────────────────────────────
 		if err := ctx.Err(); err != nil {
 			bl.logger.Info("builder loop stopped",
 				"batches", bl.totalBatches.Load(),
@@ -209,7 +223,6 @@ func (bl *BuilderLoop) Run(ctx context.Context) (retErr error) {
 		processed, err := bl.processBatch(ctx)
 
 		if err != nil {
-			// Context cancellation is not an error — it's a clean shutdown.
 			if isContextError(err) {
 				bl.logger.Info("builder loop stopped",
 					"batches", bl.totalBatches.Load(),
@@ -226,7 +239,6 @@ func (bl *BuilderLoop) Run(ctx context.Context) (retErr error) {
 				"consecutive_errors", consecutive,
 			)
 
-			// Back off on repeated errors to avoid tight error loops.
 			backoff := bl.cfg.PollInterval * time.Duration(min(int(consecutive), 10))
 			select {
 			case <-ctx.Done():
@@ -236,17 +248,14 @@ func (bl *BuilderLoop) Run(ctx context.Context) (retErr error) {
 			continue
 		}
 
-		// Success — reset consecutive error counter.
 		bl.consecutiveErr.Store(0)
 
 		if processed > 0 {
 			bl.totalBatches.Add(1)
 			bl.totalEntries.Add(int64(processed))
-			// Non-empty batch: loop immediately for throughput.
 			continue
 		}
 
-		// Empty queue — wait before polling again.
 		select {
 		case <-ctx.Done():
 			bl.logger.Info("builder loop stopped",
@@ -259,14 +268,11 @@ func (bl *BuilderLoop) Run(ctx context.Context) (retErr error) {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 // 5) processBatch — one builder cycle, fully atomic
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 
-// processBatch executes one builder cycle. Returns entries processed.
-// Context cancellation at any step returns a context error (not logged as ERROR).
 func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
-	// Capture prior root for commitment.
 	priorRoot, err := bl.tree.Root()
 	if err != nil {
 		return 0, fmt.Errorf("prior root: %w", err)
@@ -327,17 +333,11 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	}
 
 	// ── Step 5: Atomic commit ─────────────────────────────────────────
-	// All state changes in ONE Postgres Serializable transaction:
-	//   - Leaf mutations → smt_leaves (reconstructed from diff)
-	//   - Delta buffer → delta_window_buffers
-	//   - Queue status → builder_queue (mark done)
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 
 	err = store.WithSerializableTx(ctx, bl.db, func(ctx context.Context, tx pgx.Tx) error {
-		// Write leaf mutations. SDK LeafMutation is a diff format —
-		// the operator reconstructs the full leaf from tip positions.
 		for _, mut := range result.Mutations {
 			leaf := types.SMTLeaf{
 				Key:          mut.LeafKey,
@@ -349,14 +349,12 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 			}
 		}
 
-		// Save delta buffer.
 		if bl.bufferStore != nil && result.UpdatedBuffer != nil {
 			if bufErr := bl.bufferStore.SaveTx(ctx, tx, result.UpdatedBuffer); bufErr != nil {
 				return fmt.Errorf("save buffer: %w", bufErr)
 			}
 		}
 
-		// Mark queue entries as processed.
 		if qErr := bl.queue.MarkProcessed(ctx, tx, seqs); qErr != nil {
 			return fmt.Errorf("mark processed: %w", qErr)
 		}
@@ -369,22 +367,28 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 
 	// ──────────────────────────────────────────────────────────────────
 	// POST-COMMIT: Steps 6-8 are best-effort. The atomic state is safe.
-	// Failures here are non-fatal — the next cycle will catch up.
 	// ──────────────────────────────────────────────────────────────────
 
-	// ── Step 6: Append to Merkle tree (post-commit) ──────────────────
-	// Tessera append is idempotent: same data → same position.
+	// ── Step 6: Append to Merkle tree — HASH ONLY (post-commit) ──────
+	//
+	// Hash-only architecture (Conflict #1 resolution):
+	// Compute SHA-256(wire_bytes) and send only the 32-byte hash to Tessera.
+	// Full wire bytes stay in the operator's own storage (InMemoryEntryStore
+	// or persistent disk store). Tessera never sees full entry data.
+	//
+	// Two-step verification for consumers:
+	//   1. Prove hash is in Merkle tree at position N (tile-based proof).
+	//   2. Prove entry data hashes to that value (SHA-256 of fetched bytes).
+	//
+	// Tessera append is idempotent: same hash → same position.
 	// Crash here → re-append on restart is safe.
-	// Option B: full wire bytes (canonical + sig_envelope) go into the tree.
-	// The inclusion proof covers both content and signature — the proof says
-	// "this exact signed entry is in the log at position N."
 	if bl.merkle != nil {
 		for _, ewm := range metas {
-			// Reconstruct wire bytes: canonical_bytes + sig_envelope.
 			wireBytes := envelope.AppendSignature(
 				ewm.CanonicalBytes, ewm.SignatureAlgoID, ewm.SignatureBytes)
-			if _, appendErr := bl.merkle.AppendLeaf(wireBytes); appendErr != nil {
-				bl.logger.Error("Tessera append failed",
+			entryHash := sha256.Sum256(wireBytes)
+			if _, appendErr := bl.merkle.AppendLeaf(entryHash[:]); appendErr != nil {
+				bl.logger.Error("Tessera append failed (hash-only)",
 					"seq", ewm.Position.Sequence, "error", appendErr)
 			}
 		}
@@ -427,21 +431,19 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	return len(seqs), nil
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 // 6) Observability
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 
 // Stats returns current builder loop counters.
 func (bl *BuilderLoop) Stats() (batches, entries, errs int64) {
 	return bl.totalBatches.Load(), bl.totalEntries.Load(), bl.totalErrors.Load()
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 // 7) Helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 
-// isContextError returns true if err is caused by context cancellation or
-// deadline exceeded. Used to distinguish clean shutdown from real failures.
 func isContextError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }

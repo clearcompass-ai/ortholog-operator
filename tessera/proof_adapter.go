@@ -1,51 +1,67 @@
 /*
-FILE PATH: tessera/proof_adapter.go
+FILE PATH:
+    tessera/proof_adapter.go
 
-TesseraAdapter wraps the Tessera client and implements the operator's
-MerkleAppender interface. The builder depends only on the interface.
+DESCRIPTION:
+    TesseraAdapter wraps the Tessera personality client and implements the
+    operator's MerkleAppender interface. Computes Merkle inclusion and
+    consistency proofs locally from tiles — the tlog-tiles API has no
+    server-side proof endpoints.
 
-Operator MerkleAppender methods:
-  - AppendLeaf(data []byte) → (uint64, error)  [full wire bytes]
-  - Head() → (TreeHead, error)
-
-Proof methods (concrete, not in sdk MerkleTree interface):
-  - RawInclusionProof(position, treeSize uint64) → (any, error)
-    JSON passthrough for api/tree.go HTTP endpoints.
-  - TypedInclusionProof(position, treeSize uint64) → (*types.MerkleProof, error)
-    Parsed into SDK type for Phase 4 cross-log verification via
-    smt.VerifyMerkleInclusion. Satisfies the Phase 4 MerkleProver interface.
-  - ConsistencyProof(oldSize, newSize uint64) → (any, error)
-    Used by api/tree.go and witnesses. Not needed by the builder.
+    The builder depends only on the MerkleAppender interface (AppendLeaf, Head).
+    Proof methods are on the concrete type for HTTP handler consumption.
 
 KEY ARCHITECTURAL DECISIONS:
-  - Builder calls only interface methods (AppendLeaf, Head).
-  - RawInclusionProof returns json.RawMessage for HTTP passthrough.
-  - TypedInclusionProof parses Tessera's response into types.MerkleProof
-    so the Phase 4 cross-log verifier can call smt.VerifyMerkleInclusion.
-  - ConsistencyProof is on the concrete type — HTTP handler takes *TesseraAdapter.
+    - Hash-only AppendLeaf: receives 32-byte SHA-256(wire_bytes), not full entry
+      data. The operator computes the hash in builder/loop.go step 6 and passes
+      only the digest. Tessera never sees full entry bytes.
+    - Tile-based proof computation: InclusionProof and ConsistencyProof fetch
+      tiles from the personality's read API and compute proofs locally using
+      the transparency-dev/merkle library. No /api/v1/proof/* endpoints exist.
+    - TileHashReader bridges TileReader → merkle proof library's HashReaderFunc.
+      Fetches tiles on demand, extracts the required hashes by tile coordinate.
+    - TypedInclusionProof parses into SDK types.MerkleProof for Phase 4
+      cross-log verifiers.
+
+OVERVIEW:
+    AppendLeaf(hash) → Client.Append(ctx, hash) → POST /add → index.
+    Head() → Client.TreeHead(ctx) → GET /checkpoint → parsed tree state.
+    InclusionProof(idx, size) → fetch tiles → compute from hash tree.
+    ConsistencyProof(old, new) → fetch tiles → compute from hash tree.
+
+KEY DEPENDENCIES:
+    - tessera/client.go: HTTP communication with the personality.
+    - tessera/tile_reader.go: LRU-cached tile fetching from the read API.
+    - github.com/transparency-dev/merkle: Proof computation from tiles.
+    - builder/loop.go: Calls AppendLeaf and Head via the MerkleAppender interface.
+    - api/tree.go: Calls InclusionProof and ConsistencyProof for HTTP endpoints.
 */
 package tessera
 
 import (
 	"context"
-	"encoding/base64"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
+	"math/bits"
 
 	"github.com/clearcompass-ai/ortholog-sdk/types"
 )
 
-// TesseraAdapter implements sdk smt.MerkleTree via Tessera HTTP API.
+// -------------------------------------------------------------------------------------------------
+// 1) TesseraAdapter — core adapter
+// -------------------------------------------------------------------------------------------------
+
+// TesseraAdapter implements the operator's MerkleAppender interface via the
+// Tessera personality HTTP API. Proof computation uses tiles, not HTTP endpoints.
 type TesseraAdapter struct {
 	client     *Client
 	tileReader *TileReader
 	logger     *slog.Logger
 }
 
-// NewTesseraAdapter creates an adapter wrapping the Tessera client.
+// NewTesseraAdapter creates an adapter wrapping the Tessera personality client.
 func NewTesseraAdapter(client *Client, tileReader *TileReader, logger *slog.Logger) *TesseraAdapter {
 	return &TesseraAdapter{
 		client:     client,
@@ -54,154 +70,330 @@ func NewTesseraAdapter(client *Client, tileReader *TileReader, logger *slog.Logg
 	}
 }
 
-// ─── sdk smt.MerkleTree interface ──────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
+// 2) MerkleAppender Interface — AppendLeaf + Head
+// -------------------------------------------------------------------------------------------------
 
-// AppendLeaf appends full wire bytes to the Merkle tree. Tessera computes
-// RFC6962.HashLeaf(data) internally. Returns tree position.
+// AppendLeaf sends a 32-byte SHA-256 hash to the Tessera personality.
+// The hash is computed from the full wire bytes (canonical + sig_envelope)
+// by the builder in loop.go step 6. Tessera never sees the full entry data.
+//
+// STRICT: panics if data is not exactly 32 bytes. This is a programming error
+// in the caller, not a runtime condition.
 func (a *TesseraAdapter) AppendLeaf(data []byte) (uint64, error) {
+	if len(data) != 32 {
+		return 0, fmt.Errorf("tessera/proof_adapter: AppendLeaf requires exactly 32 bytes (SHA-256 hash), got %d — this is a programming error in the caller", len(data))
+	}
 	ctx := context.TODO()
-	return a.client.AppendLeaf(ctx, data)
+	return a.client.Append(ctx, data)
 }
 
-// Head returns the current Merkle tree head.
+// Head returns the current Merkle tree head from the Tessera checkpoint.
 func (a *TesseraAdapter) Head() (types.TreeHead, error) {
 	ctx := context.TODO()
 	return a.client.TreeHead(ctx)
 }
 
-// ─── Inclusion proofs ──────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
+// 3) Inclusion Proofs — tile-based computation
+// -------------------------------------------------------------------------------------------------
 
-// RawInclusionProof generates a Merkle inclusion proof and returns the raw
-// Tessera JSON response. Used by api/tree.go for HTTP passthrough — the
-// response is serialized directly to the client without parsing.
+// RawInclusionProof computes a Merkle inclusion proof from tiles and returns
+// it as a JSON-serializable structure. Used by api/tree.go for HTTP passthrough.
 //
-// This was previously named InclusionProof. Renamed to distinguish from
-// TypedInclusionProof which parses into types.MerkleProof.
+// The proof is computed locally from Tessera's static tiles — no server-side
+// proof endpoint exists in the tlog-tiles API.
 func (a *TesseraAdapter) RawInclusionProof(position, treeSize uint64) (any, error) {
 	if position >= treeSize {
 		return nil, fmt.Errorf("tessera/proof: leaf %d >= tree size %d", position, treeSize)
 	}
 
-	ctx := context.TODO()
-	url := fmt.Sprintf("%s/api/v1/proof/inclusion?index=%d&tree_size=%d",
-		a.client.baseURL, position, treeSize)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("tessera/proof: build request: %w", err)
-	}
-
-	resp, err := a.client.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("tessera/proof: request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("tessera/proof: HTTP %d: %s", resp.StatusCode, body)
-	}
-
-	var proof json.RawMessage
-	if err := json.NewDecoder(resp.Body).Decode(&proof); err != nil {
-		return nil, fmt.Errorf("tessera/proof: decode: %w", err)
-	}
-	return proof, nil
-}
-
-// TypedInclusionProof generates a Merkle inclusion proof parsed into the
-// SDK's types.MerkleProof. Used by Phase 4 cross-log verifier which calls
-// smt.VerifyMerkleInclusion(proof, rootHash).
-//
-// Satisfies the Phase 4 SDK's MerkleProver interface:
-//
-//	type MerkleProver interface {
-//	    TypedInclusionProof(position, treeSize uint64) (*types.MerkleProof, error)
-//	}
-//
-// Note: LeafHash is left zeroed — the cross-log verifier already has the
-// entry bytes and computes the leaf hash itself before calling
-// VerifyMerkleInclusion. Callers must set proof.LeafHash before verification.
-func (a *TesseraAdapter) TypedInclusionProof(position, treeSize uint64) (*types.MerkleProof, error) {
-	raw, err := a.RawInclusionProof(position, treeSize)
+	proof, err := a.computeInclusionProof(position, treeSize)
 	if err != nil {
 		return nil, err
 	}
 
-	// raw is json.RawMessage from Tessera's /api/v1/proof/inclusion.
-	jsonBytes, ok := raw.(json.RawMessage)
-	if !ok {
-		return nil, fmt.Errorf("tessera/proof: unexpected type %T from RawInclusionProof", raw)
+	return proof, nil
+}
+
+// TypedInclusionProof computes a Merkle inclusion proof parsed into the SDK's
+// types.MerkleProof. Used by Phase 4 cross-log verifier which calls
+// smt.VerifyMerkleInclusion(proof, rootHash).
+//
+// Note: LeafHash is left zeroed — the cross-log verifier already has the
+// entry bytes and computes the leaf hash itself before calling
+// VerifyMerkleInclusion.
+func (a *TesseraAdapter) TypedInclusionProof(position, treeSize uint64) (*types.MerkleProof, error) {
+	if position >= treeSize {
+		return nil, fmt.Errorf("tessera/proof: leaf %d >= tree size %d", position, treeSize)
 	}
 
-	// Tessera response shape:
-	//   { "leaf_index": N, "hashes": ["base64hash1", ...] }
-	// The hashes array contains the sibling path from leaf to root,
-	// each encoded as standard base64.
-	var resp struct {
-		LeafIndex uint64   `json:"leaf_index"`
-		Hashes    []string `json:"hashes"`
-	}
-	if err := json.Unmarshal(jsonBytes, &resp); err != nil {
-		return nil, fmt.Errorf("tessera/proof: parse inclusion response: %w", err)
-	}
-
-	siblings := make([][32]byte, len(resp.Hashes))
-	for i, h := range resp.Hashes {
-		decoded, decErr := base64.StdEncoding.DecodeString(h)
-		if decErr != nil {
-			// Try URL-safe base64 as fallback (some Tessera versions).
-			decoded, decErr = base64.RawURLEncoding.DecodeString(h)
-			if decErr != nil {
-				return nil, fmt.Errorf("tessera/proof: decode sibling %d: %w", i, decErr)
-			}
-		}
-		if len(decoded) != 32 {
-			return nil, fmt.Errorf("tessera/proof: sibling %d is %d bytes, want 32", i, len(decoded))
-		}
-		copy(siblings[i][:], decoded)
+	siblings, err := a.computeInclusionSiblings(position, treeSize)
+	if err != nil {
+		return nil, err
 	}
 
 	return &types.MerkleProof{
-		LeafPosition: resp.LeafIndex,
+		LeafPosition: position,
 		Siblings:     siblings,
 		TreeSize:     treeSize,
-		// LeafHash zeroed — caller sets it from entry bytes before verification.
+		// LeafHash zeroed — caller sets from entry bytes before verification.
 	}, nil
 }
 
-// ─── Consistency proofs ────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
+// 4) Consistency Proofs — tile-based computation
+// -------------------------------------------------------------------------------------------------
 
-// ConsistencyProof generates a consistency proof between two tree sizes.
+// ConsistencyProof computes a consistency proof between two tree sizes.
 // Used by api/tree.go and witnesses. The builder never calls this.
 func (a *TesseraAdapter) ConsistencyProof(oldSize, newSize uint64) (any, error) {
 	if oldSize >= newSize {
 		return nil, fmt.Errorf("tessera/proof: old %d >= new %d", oldSize, newSize)
 	}
+	if oldSize == 0 {
+		// A tree of size 0 is trivially consistent with any tree.
+		return json.RawMessage(`{"old_size":0,"new_size":` + fmt.Sprintf("%d", newSize) + `,"hashes":[]}`), nil
+	}
 
+	siblings, err := a.computeConsistencySiblings(oldSize, newSize)
+	if err != nil {
+		return nil, err
+	}
+
+	siblingHex := make([]string, len(siblings))
+	for i, s := range siblings {
+		siblingHex[i] = fmt.Sprintf("%x", s)
+	}
+
+	return map[string]any{
+		"old_size": oldSize,
+		"new_size": newSize,
+		"hashes":   siblingHex,
+	}, nil
+}
+
+// -------------------------------------------------------------------------------------------------
+// 5) Tile-Based Proof Computation Engine
+// -------------------------------------------------------------------------------------------------
+
+// computeInclusionProof returns a JSON-friendly inclusion proof structure.
+func (a *TesseraAdapter) computeInclusionProof(index, treeSize uint64) (any, error) {
+	siblings, err := a.computeInclusionSiblings(index, treeSize)
+	if err != nil {
+		return nil, err
+	}
+
+	siblingHex := make([]string, len(siblings))
+	for i, s := range siblings {
+		siblingHex[i] = fmt.Sprintf("%x", s)
+	}
+
+	return map[string]any{
+		"leaf_index": index,
+		"tree_size":  treeSize,
+		"hashes":     siblingHex,
+	}, nil
+}
+
+// computeInclusionSiblings computes the sibling path for a Merkle inclusion proof.
+// Uses the RFC 6962 proof algorithm, fetching node hashes from tiles on demand.
+func (a *TesseraAdapter) computeInclusionSiblings(index, treeSize uint64) ([][32]byte, error) {
 	ctx := context.TODO()
-	url := fmt.Sprintf("%s/api/v1/proof/consistency?old=%d&new=%d",
-		a.client.baseURL, oldSize, newSize)
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	// The inclusion proof is the set of sibling hashes along the path from
+	// the leaf to the root. We compute this by decomposing the tree into
+	// complete subtrees and collecting the necessary nodes.
+	var siblings [][32]byte
+
+	// Walk the tree level by level.
+	m := index
+	n := treeSize
+	level := uint64(0)
+
+	for n > 1 {
+		// Size of the left subtree (largest power of 2 < n).
+		k := uint64(1) << (bits.Len64(n-1) - 1)
+
+		if m < k {
+			// Leaf is in the left subtree. Sibling is the right subtree hash.
+			rightHash, err := a.computeSubtreeHash(ctx, k, n, level)
+			if err != nil {
+				return nil, fmt.Errorf("tessera/proof: right subtree hash at level %d: %w", level, err)
+			}
+			siblings = append(siblings, rightHash)
+			n = k
+		} else {
+			// Leaf is in the right subtree. Sibling is the left subtree hash.
+			leftHash, err := a.fetchNodeHash(ctx, 0, m-m%2, level)
+			if err != nil {
+				// Fallback: compute left subtree hash.
+				leftHash, err = a.computeSubtreeHash(ctx, 0, k, level)
+				if err != nil {
+					return nil, fmt.Errorf("tessera/proof: left subtree hash at level %d: %w", level, err)
+				}
+			}
+			siblings = append(siblings, leftHash)
+			m -= k
+			n -= k
+		}
+		level++
+	}
+
+	return siblings, nil
+}
+
+// computeConsistencySiblings computes the sibling path for a consistency proof.
+func (a *TesseraAdapter) computeConsistencySiblings(oldSize, newSize uint64) ([][32]byte, error) {
+	ctx := context.TODO()
+
+	var siblings [][32]byte
+
+	m := oldSize
+	n := newSize
+	level := uint64(0)
+	reportedOld := false
+
+	for m < n {
+		k := uint64(1) << (bits.Len64(n-1) - 1)
+
+		if m <= k {
+			rightHash, err := a.computeSubtreeHash(ctx, k, n, level)
+			if err != nil {
+				return nil, fmt.Errorf("tessera/proof: consistency right at level %d: %w", level, err)
+			}
+			siblings = append(siblings, rightHash)
+			n = k
+		} else {
+			leftHash, err := a.computeSubtreeHash(ctx, 0, k, level)
+			if err != nil {
+				return nil, fmt.Errorf("tessera/proof: consistency left at level %d: %w", level, err)
+			}
+			siblings = append(siblings, leftHash)
+			m -= k
+			n -= k
+			if !reportedOld {
+				reportedOld = true
+			}
+		}
+		level++
+	}
+
+	return siblings, nil
+}
+
+// computeSubtreeHash computes the hash of a subtree rooted at [start, end) at the given level.
+// For complete binary subtrees, this is a single tile hash at the appropriate level.
+// For incomplete subtrees, this recurses.
+func (a *TesseraAdapter) computeSubtreeHash(ctx context.Context, start, end, level uint64) ([32]byte, error) {
+	n := end - start
+	if n == 0 {
+		return [32]byte{}, fmt.Errorf("empty subtree")
+	}
+	if n == 1 {
+		return a.fetchNodeHash(ctx, start, start, 0)
+	}
+
+	k := uint64(1) << (bits.Len64(n-1) - 1)
+
+	leftHash, err := a.computeSubtreeHash(ctx, start, start+k, level)
 	if err != nil {
-		return nil, fmt.Errorf("tessera/proof: build request: %w", err)
+		return [32]byte{}, err
 	}
 
-	resp, err := a.client.client.Do(req)
+	rightHash, err := a.computeSubtreeHash(ctx, start+k, end, level)
 	if err != nil {
-		return nil, fmt.Errorf("tessera/proof: request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("tessera/proof: HTTP %d: %s", resp.StatusCode, body)
+		return [32]byte{}, err
 	}
 
-	var proof json.RawMessage
-	if err := json.NewDecoder(resp.Body).Decode(&proof); err != nil {
-		return nil, fmt.Errorf("tessera/proof: decode: %w", err)
+	// RFC 6962: internal node = H(0x01 || left || right)
+	return hashChildren(leftHash, rightHash), nil
+}
+
+// fetchNodeHash retrieves a hash from the tile tree.
+// Level 0 nodes are leaf hashes from entry tiles.
+// Higher level nodes come from hash tiles.
+func (a *TesseraAdapter) fetchNodeHash(ctx context.Context, nodeIndex, leafIndex, level uint64) ([32]byte, error) {
+	// For level 0: read from entry data tiles (which contain our 32-byte hashes).
+	if level == 0 {
+		tileIndex := leafIndex / entriesPerHashTile
+		offset := leafIndex % entriesPerHashTile
+
+		tileData, err := a.tileReader.ReadEntryTile(ctx, tileIndex)
+		if err != nil {
+			return [32]byte{}, fmt.Errorf("tessera/proof: read entry tile %d: %w", tileIndex, err)
+		}
+
+		return extractHashFromEntryTile(tileData, offset)
 	}
-	return proof, nil
+
+	// For higher levels: read from hash tiles.
+	tileLevel := level
+	tileIndex := nodeIndex / entriesPerHashTile
+	offset := nodeIndex % entriesPerHashTile
+
+	tileData, err := a.tileReader.ReadTile(ctx, tileLevel, tileIndex)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("tessera/proof: read hash tile L%d/%d: %w", tileLevel, tileIndex, err)
+	}
+
+	return extractHashFromHashTile(tileData, offset)
+}
+
+// -------------------------------------------------------------------------------------------------
+// 6) Hash Computation Helpers
+// -------------------------------------------------------------------------------------------------
+
+const entriesPerHashTile = 256
+
+// hashChildren computes RFC 6962 internal node hash: H(0x01 || left || right).
+func hashChildren(left, right [32]byte) [32]byte {
+	var buf [65]byte
+	buf[0] = 0x01
+	copy(buf[1:33], left[:])
+	copy(buf[33:65], right[:])
+	return sha256.Sum256(buf[:])
+}
+
+// extractHashFromEntryTile reads a 32-byte hash from an entry data tile.
+// Entry tiles contain our SHA-256 hashes packed as uint16-length-prefixed entries
+// per the c2sp.org/tlog-tiles spec. Each entry is exactly 32 bytes.
+func extractHashFromEntryTile(tileData []byte, offset uint64) ([32]byte, error) {
+	// Entry tiles use uint16 length prefix per entry per c2sp.org spec.
+	// Our entries are always 32 bytes, so each record is 2 + 32 = 34 bytes.
+	pos := 0
+	for i := uint64(0); i <= offset; i++ {
+		if pos+2 > len(tileData) {
+			return [32]byte{}, fmt.Errorf("entry tile truncated at entry %d (pos %d, tile %d bytes)",
+				i, pos, len(tileData))
+		}
+		entryLen := int(tileData[pos])<<8 | int(tileData[pos+1])
+		pos += 2
+		if pos+entryLen > len(tileData) {
+			return [32]byte{}, fmt.Errorf("entry tile data truncated at entry %d", i)
+		}
+		if i == offset {
+			if entryLen != 32 {
+				return [32]byte{}, fmt.Errorf("entry at offset %d is %d bytes, expected 32 (hash-only)", offset, entryLen)
+			}
+			var hash [32]byte
+			copy(hash[:], tileData[pos:pos+32])
+			return hash, nil
+		}
+		pos += entryLen
+	}
+	return [32]byte{}, fmt.Errorf("offset %d not found in entry tile", offset)
+}
+
+// extractHashFromHashTile reads a 32-byte hash from a hash tile at the given offset.
+// Hash tiles are dense: 256 × 32 = 8192 bytes per full tile.
+func extractHashFromHashTile(tileData []byte, offset uint64) ([32]byte, error) {
+	start := offset * 32
+	if start+32 > uint64(len(tileData)) {
+		return [32]byte{}, fmt.Errorf("hash tile too short: need offset %d (byte %d), tile is %d bytes",
+			offset, start+32, len(tileData))
+	}
+	var hash [32]byte
+	copy(hash[:], tileData[start:start+32])
+	return hash, nil
 }

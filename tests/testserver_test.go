@@ -1,14 +1,28 @@
 /*
-FILE PATH: tests/testserver_test.go
+FILE PATH:
+    tests/testserver_test.go
 
-Wires up a complete operator HTTP server for integration testing.
-Real Postgres, real middleware chain, real builder loop.
+DESCRIPTION:
+    Wires up a complete operator HTTP server for integration testing.
+    Real Postgres, real middleware chain, real builder loop.
 
-DESIGN RULE: Postgres is an index. Entry bytes live in EntryReader.
-InMemoryEntryStore satisfies both EntryReader and EntryWriter.
-MerkleAppender and WitnessCosigner use in-process stubs.
+KEY ARCHITECTURAL DECISIONS:
+    - Postgres is an index. Entry bytes live in EntryReader.
+      InMemoryEntryStore satisfies both EntryReader and EntryWriter.
+    - MerkleAppender and WitnessCosigner use in-process stubs.
+    - stubMerkleAppender.AppendLeaf accepts 32-byte SHA-256 hashes
+      (hash-only architecture). The builder computes the hash in loop.go
+      step 6 and passes only the digest.
 
-CHANGES: 5 new handler fields wired for full buildout endpoints.
+OVERVIEW:
+    startTestOperator creates: Postgres pool → clean tables → stores →
+    builder loop → HTTP server on random port. Returns testOperator with
+    all dependencies accessible for test assertions.
+
+KEY DEPENDENCIES:
+    - All api/ handlers wired with real Postgres stores.
+    - builder/loop.go runs in background goroutine.
+    - tessera/entry_reader.go InMemoryEntryStore for byte storage.
 */
 package tests
 
@@ -38,9 +52,9 @@ import (
 	optessera "github.com/clearcompass-ai/ortholog-operator/tessera"
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 // Test operator instance
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
 
 type testOperator struct {
 	BaseURL     string
@@ -48,7 +62,7 @@ type testOperator struct {
 	Queue       *opbuilder.Queue
 	CreditStore *store.CreditStore
 	EntryStore  *store.EntryStore
-	EntryBytes  *optessera.InMemoryEntryStore // Bytes live here, not Postgres.
+	EntryBytes  *optessera.InMemoryEntryStore
 	cancel      context.CancelFunc
 }
 
@@ -144,8 +158,6 @@ func startTestOperator(t *testing.T) *testOperator {
 	queryDeps := &api.QueryDeps{
 		QueryAPI: queryAPI, DiffController: diffController, Logger: logger,
 	}
-
-	// NEW: Deps for full buildout endpoints.
 	entryReadDeps := &api.EntryReadDeps{
 		Fetcher: fetcher, QueryAPI: queryAPI,
 		LogDID: testLogDID, Logger: logger,
@@ -169,8 +181,6 @@ func startTestOperator(t *testing.T) *testOperator {
 		Scan:            api.NewQueryScanHandler(queryDeps),
 		Difficulty:      api.NewDifficultyHandler(queryDeps),
 		WitnessCosign:   nil,
-
-		// NEW: Full buildout read endpoints.
 		EntryBySequence: api.NewEntryBySequenceHandler(entryReadDeps),
 		EntryBatch:      api.NewEntryBatchHandler(entryReadDeps),
 		SMTLeaf:         api.NewSMTLeafHandler(smtDeps),
@@ -241,17 +251,28 @@ func (op *testOperator) seedSession(t *testing.T, token, exchangeDID string, cre
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Stubs (satisfy real interfaces, not Go interface mocks)
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------------------------------
+// Stubs
+// -------------------------------------------------------------------------------------------------
 
+// stubMerkleAppender implements MerkleAppender for tests.
+//
+// Hash-only architecture: AppendLeaf receives 32-byte SHA-256 hashes from
+// builder/loop.go step 6. The stub passes the hash directly to the
+// StubMerkleTree (which further hashes it for the Merkle leaf as
+// H(0x00 || data), matching RFC 6962).
 type stubMerkleAppender struct {
 	mt *smt.StubMerkleTree
 }
 
+// AppendLeaf accepts 32-byte SHA-256 hashes (hash-only architecture).
+// The builder computes SHA-256(wire_bytes) in loop.go step 6 and passes
+// the 32-byte digest here.
 func (s *stubMerkleAppender) AppendLeaf(data []byte) (uint64, error) {
-	h := sha256.Sum256(data)
-	return s.mt.AppendLeaf(h[:])
+	// The stub's internal tree expects a hash to build the Merkle tree from.
+	// With hash-only architecture, data IS the 32-byte hash.
+	// StubMerkleTree.AppendLeaf takes []byte and computes its own leaf hash.
+	return s.mt.AppendLeaf(data)
 }
 
 func (s *stubMerkleAppender) Head() (types.TreeHead, error) {
@@ -271,3 +292,6 @@ type stubWitnessCosigner struct{}
 func (s *stubWitnessCosigner) RequestCosignatures(_ context.Context, _ types.TreeHead) error {
 	return nil
 }
+
+// Suppress unused imports.
+var _ = sha256.Sum256
