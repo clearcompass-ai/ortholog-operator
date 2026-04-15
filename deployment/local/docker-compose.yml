@@ -1,7 +1,17 @@
-# deployment/local/docker-compose.yml
+# ====================================================================================
+# FILE: deployment/local/docker-compose.yml
+#
+# PURPOSE: 
+# Local deployment of the Ortholog Operator.
+# Currently configured to use Google Cloud Storage (GCS) via Application Default 
+# Credentials (ADC) for Merkle tree tiles, with local MinIO commented out.
+# ====================================================================================
 
 services:
-  # 1. PostgreSQL (State, Queues, Indexes)
+  # ==================================================================================
+  # 1. CORE STATE: PostgreSQL
+  # Stores queues, SMT state, and entry indexes. No entry bytes are stored here.
+  # ==================================================================================
   postgres:
     image: postgres:18-alpine
     environment:
@@ -18,57 +28,37 @@ services:
       timeout: 5s
       retries: 5
 
-  # 2. MinIO (Local Object Storage for Tessera Tiles)
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: "local-admin"
-      MINIO_ROOT_PASSWORD: "local-password"
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - minio_data:/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  # 3. MinIO Setup (Creates the 'tessera-tiles' bucket and makes it public)
-  minio-setup:
-    image: minio/mc:latest
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 local-admin local-password;
-      mc mb local/tessera-tiles || true;
-      mc anonymous set download local/tessera-tiles;
-      exit 0;
-      "
-
-  # 4. Trillian Tessera (The Merkle Tree Writer - AWS/S3 Personality)
-# 4. Trillian Tessera (The Merkle Tree Writer - AWS/S3 Personality)
+  # ==================================================================================
+  # 2. TRILLIAN TESSERA (ACTIVE): GCP Personality
+  # The Merkle Tree writer. Hashes entries and writes tiles to your public GCS bucket.
+  # ==================================================================================
   tessera:
-    # FIX: Use the 'tesseract' namespace as published in their GHCR
-    image: ghcr.io/transparency-dev/tesseract/aws:latest
+    # Uses the GCP-specific image from the transparency-dev repository
+    image: ghcr.io/transparency-dev/tesseract/gcp:latest
     environment:
-      - S3_BUCKET=tessera-tiles
-      - S3_ENDPOINT=http://minio:9000
-      - AWS_ACCESS_KEY_ID=local-admin
-      - AWS_SECRET_ACCESS_KEY=local-password
-      - AWS_REGION=us-east-1
-      - S3_FORCE_PATH_STYLE=true
+      - STORAGE=gcp
+      - GCP_PROJECT=legalai-460612
+      # The bucket and folder prefix where tiles will be written
+      - GCS_BUCKET=legalai-tessera-tiles/my-log-prefix
+      # Points the Google Cloud SDK inside the container to your mounted ADC file
+      - GOOGLE_APPLICATION_CREDENTIALS=/tmp/adc.json
+    volumes:
+      # Mount the dummy signing keys required by Tessera (generated via shell script)
+      - ./tessera-private.pem:/keys/private.pem:ro
+      - ./tessera-public.pem:/keys/public.pem:ro
+      # Mount your Mac's local Application Default Credentials file into the container
+      - ~/.config/gcloud/application_default_credentials.json:/tmp/adc.json:ro
+    command: 
+      - "--signer_private_key_file=/keys/private.pem"
+      - "--signer_public_key_file=/keys/public.pem"
     ports:
       - "8081:8080"
-    depends_on:
-      minio-setup:
-        condition: service_completed_successfully
 
-  # 5. Nginx (The Traffic Splitter)
+  # ==================================================================================
+  # 3. ROUTING LAYER: Nginx
+  # Splits traffic hitting ORTHOLOG_TESSERA_URL. 
+  # Writes -> Tessera container. Reads -> Direct to GCS.
+  # ==================================================================================
   tessera-router:
     image: nginx:alpine
     volumes:
@@ -76,10 +66,12 @@ services:
     ports:
       - "2024:2024"
     depends_on:
-      - minio
       - tessera
 
-  # 6. Ortholog Operator
+  # ==================================================================================
+  # 4. ORTHOLOG OPERATOR
+  # The core protocol operator. Connects to Postgres and the Nginx Router.
+  # ==================================================================================
   operator:
     build:
       context: ../../ # Build from the root of the ortholog-operator repo
@@ -98,6 +90,63 @@ services:
       tessera-router:
         condition: service_started
 
+  # ==================================================================================
+  # 5. OFFLINE STORAGE (COMMENTED OUT): Local MinIO & Tessera AWS Personality
+  # Uncomment these blocks (and comment out the GCP Tessera block above) to run 
+  # a 100% local, offline storage environment using MinIO.
+  # ==================================================================================
+
+  # minio:
+  #   image: minio/minio:latest
+  #   command: server /data --console-address ":9001"
+  #   environment:
+  #     MINIO_ROOT_USER: "local-admin"
+  #     MINIO_ROOT_PASSWORD: "local-password"
+  #   ports:
+  #     - "9000:9000"
+  #     - "9001:9001"
+  #   volumes:
+  #     - minio_data:/data
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+  #     interval: 5s
+  #     timeout: 5s
+  #     retries: 5
+
+  # minio-setup:
+  #   image: minio/mc:latest
+  #   depends_on:
+  #     minio:
+  #       condition: service_healthy
+  #   entrypoint: >
+  #     /bin/sh -c "
+  #     mc alias set local http://minio:9000 local-admin local-password;
+  #     mc mb local/tessera-tiles || true;
+  #     mc anonymous set download local/tessera-tiles;
+  #     exit 0;
+  #     "
+
+  # tessera-aws:
+  #   image: ghcr.io/transparency-dev/tesseract/aws:latest
+  #   environment:
+  #     - S3_BUCKET=tessera-tiles
+  #     - S3_ENDPOINT=http://minio:9000
+  #     - AWS_ACCESS_KEY_ID=local-admin
+  #     - AWS_SECRET_ACCESS_KEY=local-password
+  #     - AWS_REGION=us-east-1
+  #     - S3_FORCE_PATH_STYLE=true
+  #   volumes:
+  #     - ./tessera-private.pem:/keys/private.pem:ro
+  #     - ./tessera-public.pem:/keys/public.pem:ro
+  #   command: 
+  #     - "--signer_private_key_file=/keys/private.pem"
+  #     - "--signer_public_key_file=/keys/public.pem"
+  #   ports:
+  #     - "8081:8080"
+  #   depends_on:
+  #     minio-setup:
+  #       condition: service_completed_successfully
+
 volumes:
   postgres_data:
-  minio_data:
+  # minio_data: # Uncomment if using local MinIO
