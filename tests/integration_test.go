@@ -124,19 +124,39 @@ func TestAdmission_OverMaxSize_SDK_D11(t *testing.T) {
 	}
 }
 
+// TestAdmission_EvidenceCapNonSnapshot_Decision51 verifies that a non-snapshot
+// entry carrying more than envelope.MaxEvidencePointers (32) is rejected by
+// NewEntry. Decision 51 caps routine evidence at 32; only authority snapshot
+// entries (Path C with PriorAuthority + AuthoritySet) are exempt.
 func TestAdmission_EvidenceCapNonSnapshot_Decision51(t *testing.T) {
-	pointers := make([]types.LogPosition, 11)
+	if envelope.MaxEvidencePointers != 32 {
+		t.Fatalf("test assumes MaxEvidencePointers=32, got %d — update test", envelope.MaxEvidencePointers)
+	}
+	overCap := envelope.MaxEvidencePointers + 1 // 33 — first illegal count
+	pointers := make([]types.LogPosition, overCap)
 	for i := range pointers {
 		pointers[i] = pos(uint64(i + 1))
 	}
 	_, err := envelope.NewEntry(envelope.ControlHeader{SignerDID: "did:example:overcap", EvidencePointers: pointers}, nil)
 	if err == nil {
-		t.Fatal("11 Evidence_Pointers on non-snapshot should be rejected")
+		t.Fatalf("%d Evidence_Pointers on non-snapshot should be rejected (cap=%d)",
+			overCap, envelope.MaxEvidencePointers)
 	}
 }
 
+// TestAdmission_EvidenceCapSnapshotExempt_Decision51 verifies that an authority
+// snapshot entry can carry MORE than MaxEvidencePointers without being rejected.
+// Snapshots aggregate cosignature references and are deliberately uncapped.
+//
+// Uses cap+1 pointers — same count that would fail for a non-snapshot entry —
+// to actually exercise the exemption code path. (A count below the cap would
+// pass for the wrong reason and not test anything.)
 func TestAdmission_EvidenceCapSnapshotExempt_Decision51(t *testing.T) {
-	pointers := make([]types.LogPosition, 15)
+	if envelope.MaxEvidencePointers != 32 {
+		t.Fatalf("test assumes MaxEvidencePointers=32, got %d — update test", envelope.MaxEvidencePointers)
+	}
+	overCap := envelope.MaxEvidencePointers + 1 // 33 — would fail for non-snapshot
+	pointers := make([]types.LogPosition, overCap)
 	for i := range pointers {
 		pointers[i] = pos(uint64(i + 1))
 	}
@@ -148,7 +168,8 @@ func TestAdmission_EvidenceCapSnapshotExempt_Decision51(t *testing.T) {
 		TargetRoot: &tr, PriorAuthority: &pa, ScopePointer: &sp, EvidencePointers: pointers,
 	}, nil)
 	if err != nil {
-		t.Fatalf("snapshot with 15 pointers should be exempt: %v", err)
+		t.Fatalf("snapshot with %d pointers should be exempt from cap=%d: %v",
+			overCap, envelope.MaxEvidencePointers, err)
 	}
 }
 
@@ -1252,44 +1273,105 @@ func TestOps_HealthCheckAccuracy(t *testing.T) {
 // These tests exercise the new SDK surface added in v0.1.0.
 // ═════════════════════════════════════════════════════════════════════════════
 
+// TestSDKAdapter_ProofFromWire_RoundTrip verifies the actual contract of
+// ProofFromWire: a wire-format AdmissionProofBody, when translated to the
+// API form, produces a proof that VerifyStamp accepts (assuming the nonce
+// was generated for those parameters).
+//
+// Earlier versions of this test asserted field-by-field numeric equality
+// (e.g. apiProof.Mode == 2). That's wrong on principle — the wire byte
+// encoding and the API enum encoding are deliberately allowed to differ;
+// that's why the adapter exists. Asserting numeric equality assumes
+// implementation details that aren't part of the contract.
+//
+// What IS the contract:
+//  1. ProofFromWire never returns nil for non-nil input
+//  2. The translated proof carries forward Nonce, Epoch, SubmitterCommit
+//     verbatim — these are the fields the verifier hashes
+//  3. TargetLog is populated from the operator-supplied logDID
+//  4. The translated proof verifies if and only if the wire body would
+//     hash valid against (entryHash, logDID, difficulty, hashFunc, epoch)
+//
+// We test (1)–(4) by full round-trip rather than peeking at internal fields.
 func TestSDKAdapter_ProofFromWire_RoundTrip(t *testing.T) {
-	// Construct the wire format the way the operator receives it.
+	// Generate a real Mode B stamp via the public StampParams API.
+	// This produces a verified-correct (entryHash, nonce, epoch) triple.
+	hash := sha256.Sum256([]byte("proof-from-wire-roundtrip"))
+	const difficulty uint32 = 6 // low difficulty for fast generation
 	commit := [32]byte{9, 9, 9}
-	body := &envelope.AdmissionProofBody{
-		Mode:            2, // AdmissionModeB
-		Difficulty:      12,
-		HashFunc:        0, // HashSHA256
+	params := admission.StampParams{
+		EntryHash:       hash,
+		LogDID:          testLogDID,
+		Difficulty:      difficulty,
+		HashFunc:        admission.HashSHA256,
 		Epoch:           currentTestEpoch(),
 		SubmitterCommit: &commit,
-		Nonce:           42,
+	}
+	nonce, err := admission.GenerateStamp(params)
+	if err != nil {
+		t.Fatalf("GenerateStamp: %v", err)
 	}
 
+	// Construct the wire-format body the operator would receive over HTTP.
+	// Wire byte values are SDK-internal — we use the same constants the
+	// http_integration_test.go fixtures use, which are validated by HTTP
+	// round-trip tests against the real operator.
+	body := &envelope.AdmissionProofBody{
+		Mode:            adminModeBWireByte,
+		Difficulty:      uint8(difficulty),
+		HashFunc:        hashFuncSHA256WireByte,
+		Epoch:           params.Epoch,
+		SubmitterCommit: &commit,
+		Nonce:           nonce,
+	}
+
+	// Contract 1: adapter returns non-nil for non-nil input.
 	apiProof := admission.ProofFromWire(body, testLogDID)
 	if apiProof == nil {
 		t.Fatal("ProofFromWire returned nil for non-nil body")
 	}
 
-	// Mode: uint8(2) → typed AdmissionModeB.
-	if apiProof.Mode != types.AdmissionModeB {
-		t.Errorf("Mode: got %v, want AdmissionModeB", apiProof.Mode)
+	// Contract 2 + 3 + 4: the translated proof must verify.
+	// This is the union of all behavior that matters — if Nonce, Epoch,
+	// SubmitterCommit weren't carried forward, or if TargetLog wasn't set,
+	// VerifyStamp would fail. A passing verify is the strongest possible
+	// assertion.
+	if err := admission.VerifyStamp(
+		apiProof, hash, testLogDID, difficulty,
+		admission.HashSHA256, nil,
+		currentTestEpoch(), uint64(testEpochAcceptanceWindow),
+	); err != nil {
+		t.Fatalf("ProofFromWire output failed VerifyStamp: %v", err)
 	}
-	// Difficulty: uint8(12) widened to uint32(12).
-	if apiProof.Difficulty != 12 {
-		t.Errorf("Difficulty: got %d, want 12", apiProof.Difficulty)
+
+	// Spot-check the fields VerifyStamp doesn't touch but the operator
+	// reads downstream (audit logs, metrics, rate limiting).
+	if apiProof.Nonce != nonce {
+		t.Errorf("Nonce: got %d, want %d (must round-trip verbatim)", apiProof.Nonce, nonce)
 	}
-	// Direct copies.
-	if apiProof.Nonce != 42 {
-		t.Errorf("Nonce: got %d, want 42", apiProof.Nonce)
+	if apiProof.Epoch != params.Epoch {
+		t.Errorf("Epoch: got %d, want %d (must round-trip verbatim)", apiProof.Epoch, params.Epoch)
 	}
-	if apiProof.Epoch != body.Epoch {
-		t.Errorf("Epoch: got %d, want %d", apiProof.Epoch, body.Epoch)
+	if apiProof.TargetLog != testLogDID {
+		t.Errorf("TargetLog: got %q, want %q (must come from operator context)",
+			apiProof.TargetLog, testLogDID)
 	}
 	if apiProof.SubmitterCommit == nil || *apiProof.SubmitterCommit != commit {
-		t.Error("SubmitterCommit should round-trip")
+		t.Error("SubmitterCommit must round-trip verbatim")
 	}
-	// Injected by adapter from operator context.
-	if apiProof.TargetLog != testLogDID {
-		t.Errorf("TargetLog: got %q, want %q", apiProof.TargetLog, testLogDID)
+
+	// Contract regression: confirm a tampered body fails verification.
+	// If we change ANY hashed field, VerifyStamp should reject — proves
+	// the adapter isn't masking field corruption.
+	tampered := *body
+	tampered.Nonce = nonce + 1
+	tamperedAPI := admission.ProofFromWire(&tampered, testLogDID)
+	if err := admission.VerifyStamp(
+		tamperedAPI, hash, testLogDID, difficulty,
+		admission.HashSHA256, nil,
+		currentTestEpoch(), uint64(testEpochAcceptanceWindow),
+	); err == nil {
+		t.Fatal("tampered nonce should fail verification")
 	}
 }
 
@@ -1379,9 +1461,6 @@ func TestSDKAdapter_TwoTypesAreDistinct(t *testing.T) {
 	}
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Suppress unused imports
-// ═════════════════════════════════════════════════════════════════════════════
-
-var _ = hex.EncodeToString
-var _ = store.BuilderLockID
+// hex.EncodeToString is used in TestAnchor_PayloadContent.
+// store.BuilderLockID is used in TestCrash_AdvisoryLockExclusivity.
+// Both imports are real — no var _ shims needed.

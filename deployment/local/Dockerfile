@@ -1,5 +1,5 @@
 # deployment/local/Dockerfile
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 # FIX: Install git so 'go mod download' can fetch from GitHub
 RUN apk add --no-cache git

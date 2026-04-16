@@ -11,6 +11,13 @@ POST-WAVE-1.5 CHANGES:
   - Mode B verification uses ProofFromWire adapter.
   - VerifyStamp takes 8 args including currentEpoch + acceptanceWindow.
 
+VET-COMPLIANCE NOTE:
+
+	Every http.Get / http.Client.Do call checks err before defer resp.Body.Close().
+	If a request errors, resp is nil and a deferred Close would panic — `go vet`
+	catches this with the "using resp before checking for errors" diagnostic.
+	All such call sites route through doRequest / httpGet helpers.
+
 Run: ORTHOLOG_TEST_DSN="postgres://..." go test ./tests/ -v -count=1 -run TestHTTP
 */
 package tests
@@ -38,8 +45,14 @@ import (
 
 const (
 	// adminModeBWireByte is the wire-byte encoding of AdmissionModeB inside
-	// AdmissionProofBody. Mirrors types.AdmissionModeB which is also 2.
-	adminModeBWireByte uint8 = 2
+	// AdmissionProofBody. The SDK's types.AdmissionMode enum uses iota from 0
+	// (ModeA=0, ModeB=1) and ProofFromWire does a direct cast — so the wire
+	// byte and the API enum share the same numeric value: 1.
+	//
+	// We initially guessed 2 (assuming "0 = absent, 1 = ModeA, 2 = ModeB")
+	// and TestSDKAdapter_ProofFromWire_RoundTrip caught the mismatch:
+	//     "admission: stamp mode is not AdmissionModeB: got mode 2"
+	adminModeBWireByte uint8 = 1
 
 	// hashFuncSHA256WireByte is the wire-byte encoding of HashSHA256 inside
 	// AdmissionProofBody. Mirrors admission.HashSHA256 which is also 0.
@@ -127,6 +140,33 @@ func buildModeBWireEntry(t *testing.T, header envelope.ControlHeader, payload []
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// HTTP helpers (vet-compliant: always check err before defer)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// doRequest is the safe replacement for `resp, _ := http.X(...); defer resp.Body.Close()`.
+// It performs the request, fails the test on transport error, and returns the
+// response with the caller responsible for Close. Centralizing this pattern
+// keeps the per-test code short and prevents future vet regressions.
+func doRequest(t *testing.T, req *http.Request) *http.Response {
+	t.Helper()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("HTTP %s %s: %v", req.Method, req.URL, err)
+	}
+	return resp
+}
+
+// httpGet is the safe replacement for `resp, _ := http.Get(url); defer resp.Body.Close()`.
+func httpGet(t *testing.T, url string) *http.Response {
+	t.Helper()
+	resp, err := http.Get(url) //nolint:noctx // tests are short-lived
+	if err != nil {
+		t.Fatalf("HTTP GET %s: %v", url, err)
+	}
+	return resp
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Poll helper — replaces flaky time.Sleep
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -138,7 +178,7 @@ func pollQueryResults(t *testing.T, baseURL, signerDID string, expectedCount int
 	queryURL := fmt.Sprintf("%s/v1/query/signer_did/%s", baseURL, signerDID)
 
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(queryURL)
+		resp, err := http.Get(queryURL) //nolint:noctx
 		if err != nil {
 			time.Sleep(50 * time.Millisecond)
 			continue
@@ -157,16 +197,14 @@ func pollQueryResults(t *testing.T, baseURL, signerDID string, expectedCount int
 }
 
 // submitEntry POSTs a wire entry with auth and returns the parsed response.
+// Used in happy-path tests; fails the test if status != 202.
 func submitEntry(t *testing.T, baseURL, token string, wire []byte) map[string]any {
 	t.Helper()
 	req, _ := http.NewRequest("POST", baseURL+"/v1/entries", bytes.NewReader(wire))
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("POST: %v", err)
-	}
+	resp := doRequest(t, req)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusAccepted {
@@ -241,10 +279,7 @@ func TestHTTP_Submission_ModeB_ValidStamp(t *testing.T) {
 
 	// POST without Authorization header.
 	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(wire))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := doRequest(t, req)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 
@@ -267,7 +302,7 @@ func TestHTTP_Submission_ModeB_NoStamp_403(t *testing.T) {
 
 	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(wire))
 	// No Authorization header.
-	resp, _ := http.DefaultClient.Do(req)
+	resp := doRequest(t, req)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusForbidden {
@@ -285,7 +320,7 @@ func TestHTTP_Submission_ModeB_WrongLogDID_403(t *testing.T) {
 	}, []byte("wrong-log-payload"), "did:ortholog:different-log", 16)
 
 	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(wire))
-	resp, _ := http.DefaultClient.Do(req)
+	resp := doRequest(t, req)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusForbidden {
@@ -303,7 +338,7 @@ func TestHTTP_Middleware_InvalidToken_401(t *testing.T) {
 	wire := buildWireEntry(t, envelope.ControlHeader{SignerDID: "did:example:auth-test"}, []byte("auth"))
 	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(wire))
 	req.Header.Set("Authorization", "Bearer invalid-nonexistent-token")
-	resp, _ := http.DefaultClient.Do(req)
+	resp := doRequest(t, req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		body, _ := io.ReadAll(resp.Body)
@@ -320,7 +355,7 @@ func TestHTTP_Middleware_ExpiredToken_401(t *testing.T) {
 	wire := buildWireEntry(t, envelope.ControlHeader{SignerDID: "did:example:expired"}, []byte("expired"))
 	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(wire))
 	req.Header.Set("Authorization", "Bearer tok-expired")
-	resp, _ := http.DefaultClient.Do(req)
+	resp := doRequest(t, req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		body, _ := io.ReadAll(resp.Body)
@@ -342,7 +377,7 @@ func TestHTTP_Middleware_OversizeBody_413(t *testing.T) {
 
 	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(oversized))
 	req.Header.Set("Authorization", "Bearer tok-big")
-	resp, _ := http.DefaultClient.Do(req)
+	resp := doRequest(t, req)
 	defer resp.Body.Close()
 
 	// MaxBytesReader silently truncates the read. The handler then tries to
@@ -359,7 +394,7 @@ func TestHTTP_Middleware_NoCredits_402(t *testing.T) {
 	wire := buildWireEntry(t, envelope.ControlHeader{SignerDID: "did:example:broke"}, []byte("need-credits"))
 	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(wire))
 	req.Header.Set("Authorization", "Bearer tok-broke")
-	resp, _ := http.DefaultClient.Do(req)
+	resp := doRequest(t, req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusPaymentRequired {
 		body, _ := io.ReadAll(resp.Body)
@@ -370,7 +405,7 @@ func TestHTTP_Middleware_NoCredits_402(t *testing.T) {
 func TestHTTP_Middleware_MalformedBody_422(t *testing.T) {
 	op := startTestOperator(t)
 	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader([]byte("garbage")))
-	resp, _ := http.DefaultClient.Do(req)
+	resp := doRequest(t, req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnprocessableEntity {
 		body, _ := io.ReadAll(resp.Body)
@@ -394,7 +429,7 @@ func TestHTTP_Middleware_WrongProtocolVersion_422(t *testing.T) {
 	wire[1] = 0x02 // Protocol version 2 instead of v5 — must be rejected.
 
 	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(wire))
-	resp, _ := http.DefaultClient.Do(req)
+	resp := doRequest(t, req)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusUnprocessableEntity {
@@ -415,7 +450,7 @@ func TestHTTP_Middleware_FutureProtocolVersion_422(t *testing.T) {
 	wire[1] = 0x06 // Protocol version 6 — does not exist; must be rejected.
 
 	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(wire))
-	resp, _ := http.DefaultClient.Do(req)
+	resp := doRequest(t, req)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusUnprocessableEntity {
@@ -471,7 +506,7 @@ func TestHTTP_CreditDeduction(t *testing.T) {
 	}, []byte("credit-entry-overflow"))
 	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(wire))
 	req.Header.Set("Authorization", "Bearer tok-credit")
-	resp, _ := http.DefaultClient.Do(req)
+	resp := doRequest(t, req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusPaymentRequired {
 		body, _ := io.ReadAll(resp.Body)
@@ -549,7 +584,7 @@ func TestHTTP_Duplicate_409(t *testing.T) {
 	// Second with same bytes → 409.
 	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(wire))
 	req.Header.Set("Authorization", "Bearer tok-dup")
-	resp, _ := http.DefaultClient.Do(req)
+	resp := doRequest(t, req)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusConflict {
@@ -616,7 +651,7 @@ func TestHTTP_EntryResponseShape(t *testing.T) {
 
 func TestHTTP_DifficultyEndpoint(t *testing.T) {
 	op := startTestOperator(t)
-	resp, _ := http.Get(op.BaseURL + "/v1/admission/difficulty")
+	resp := httpGet(t, op.BaseURL+"/v1/admission/difficulty")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -644,7 +679,7 @@ func TestHTTP_DifficultyEndpoint(t *testing.T) {
 
 func TestHTTP_HealthCheck(t *testing.T) {
 	op := startTestOperator(t)
-	resp, _ := http.Get(op.BaseURL + "/healthz")
+	resp := httpGet(t, op.BaseURL+"/healthz")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
@@ -713,7 +748,7 @@ func TestHTTP_Submission_ModeB_StaleEpoch_403(t *testing.T) {
 
 	// Submit the stale-epoch stamp.
 	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(wire))
-	resp, _ := http.DefaultClient.Do(req)
+	resp := doRequest(t, req)
 	defer resp.Body.Close()
 
 	// Operator should reject as out-of-window.
