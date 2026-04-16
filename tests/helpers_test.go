@@ -2,8 +2,16 @@
 FILE PATH: tests/helpers_test.go
 
 Shared test infrastructure for the operator integration suite.
-Provides: in-memory SDK harness, Postgres connection/migration helpers,
-mock types, and builder convenience functions.
+
+Provides:
+  - In-memory SDK harness (testHarness) that wraps the SDK builder with
+    convenience methods for SMT state inspection.
+  - Mock fetcher and schema resolver implementing the SDK builder contracts.
+  - Postgres connection/migration helpers gated by ORTHOLOG_TEST_DSN.
+  - Bulk entry generation for determinism and scale tests.
+  - SDK v0.1.0 admission helpers — buildStampParams, verifyStampForTest —
+    that wrap the post-Wave-1.5 GenerateStamp(StampParams) and
+    VerifyStamp(8-arg) APIs so test code stays readable.
 */
 package tests
 
@@ -22,6 +30,7 @@ import (
 	"github.com/clearcompass-ai/ortholog-sdk/builder"
 	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
 	"github.com/clearcompass-ai/ortholog-sdk/core/smt"
+	"github.com/clearcompass-ai/ortholog-sdk/crypto/admission"
 	"github.com/clearcompass-ai/ortholog-sdk/types"
 
 	"github.com/clearcompass-ai/ortholog-operator/store"
@@ -33,6 +42,15 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 const testLogDID = "did:ortholog:test:integration"
+
+// testEpochWindowSeconds is the epoch length used by HTTP integration tests.
+// 1 hour matches the production default (ORTHOLOG_EPOCH_WINDOW_SECONDS=3600)
+// and is wired into testserver_test.go's SubmissionDeps.Admission.
+const testEpochWindowSeconds = 3600
+
+// testEpochAcceptanceWindow matches the operator-side default. window=1
+// accepts stamps from [current-1, current+1], tolerating clock skew.
+const testEpochAcceptanceWindow = 1
 
 // testEntryBytes is the package-level InMemoryEntryStore shared by all
 // Postgres-backed query tests. Reset in cleanTables. This is the ONLY
@@ -90,6 +108,61 @@ func canonicalHashBytes(entry *envelope.Entry) [32]byte {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SDK admission helpers (post-Wave-1.5 API)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// currentTestEpoch returns the epoch index the operator's verifier will
+// compute for "now" given testEpochWindowSeconds. Test fixtures must use
+// this exact value, otherwise VerifyStamp rejects the stamp as out-of-window.
+func currentTestEpoch() uint64 {
+	return uint64(time.Now().UTC().Unix() / int64(testEpochWindowSeconds))
+}
+
+// buildStampParams constructs the StampParams struct that GenerateStamp
+// expects. Keeps test call sites readable instead of repeating six fields.
+//
+// Caller is responsible for the entry hash, log DID, and difficulty.
+// Hash function defaults to SHA-256 (operator default) and Argon2id params
+// to nil. Submitter commit is left absent (Mode B without rate-limit binding).
+func buildStampParams(entryHash [32]byte, logDID string, difficulty uint32) admission.StampParams {
+	return admission.StampParams{
+		EntryHash:  entryHash,
+		LogDID:     logDID,
+		Difficulty: difficulty,
+		HashFunc:   admission.HashSHA256,
+		Epoch:      currentTestEpoch(),
+	}
+}
+
+// verifyStampForTest constructs a types.AdmissionProof from the StampParams
+// + nonce and runs VerifyStamp with the test epoch and acceptance window.
+// Returns the verification error (or nil on success).
+//
+// This is the canonical test-side equivalent of the operator's Step 5
+// admission verification — uses ProofFromWire's API form, the same hash
+// function, and the same epoch/window the operator uses at runtime.
+func verifyStampForTest(p admission.StampParams, nonce uint64, expectedLog string, minDifficulty uint32) error {
+	apiProof := &types.AdmissionProof{
+		Mode:            types.AdmissionModeB,
+		Nonce:           nonce,
+		TargetLog:       p.LogDID,
+		Difficulty:      p.Difficulty,
+		Epoch:           p.Epoch,
+		SubmitterCommit: p.SubmitterCommit,
+	}
+	return admission.VerifyStamp(
+		apiProof,
+		p.EntryHash,
+		expectedLog,
+		minDifficulty,
+		p.HashFunc,
+		p.Argon2idParams,
+		currentTestEpoch(),
+		uint64(testEpochAcceptanceWindow),
+	)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // String helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -122,19 +195,19 @@ func newMockFetcher() *mockFetcher {
 	return &mockFetcher{entries: make(map[types.LogPosition]*types.EntryWithMetadata)}
 }
 
-func (f *mockFetcher) Fetch(pos types.LogPosition) (*types.EntryWithMetadata, error) {
+func (f *mockFetcher) Fetch(p types.LogPosition) (*types.EntryWithMetadata, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.entries[pos], nil
+	return f.entries[p], nil
 }
 
-func (f *mockFetcher) storeEntry(pos types.LogPosition, entry *envelope.Entry) {
+func (f *mockFetcher) storeEntry(p types.LogPosition, entry *envelope.Entry) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.entries[pos] = &types.EntryWithMetadata{
+	f.entries[p] = &types.EntryWithMetadata{
 		CanonicalBytes: envelope.Serialize(entry),
 		LogTime:        time.Now(),
-		Position:       pos,
+		Position:       p,
 	}
 }
 

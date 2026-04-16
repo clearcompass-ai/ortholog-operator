@@ -1,28 +1,33 @@
 /*
 FILE PATH:
-    tests/testserver_test.go
+
+	tests/testserver_test.go
 
 DESCRIPTION:
-    Wires up a complete operator HTTP server for integration testing.
-    Real Postgres, real middleware chain, real builder loop.
+
+	Wires up a complete operator HTTP server for integration testing.
+	Real Postgres, real middleware chain, real builder loop.
 
 KEY ARCHITECTURAL DECISIONS:
-    - Postgres is an index. Entry bytes live in EntryReader.
-      InMemoryEntryStore satisfies both EntryReader and EntryWriter.
-    - MerkleAppender and WitnessCosigner use in-process stubs.
-    - stubMerkleAppender.AppendLeaf accepts 32-byte SHA-256 hashes
-      (hash-only architecture). The builder computes the hash in loop.go
-      step 6 and passes only the digest.
+  - Postgres is an index. Entry bytes live in EntryReader.
+    InMemoryEntryStore satisfies both EntryReader and EntryWriter.
+  - MerkleAppender and WitnessCosigner use in-process stubs.
+  - stubMerkleAppender.AppendLeaf accepts 32-byte SHA-256 hashes
+    (hash-only architecture). The builder computes the hash in loop.go
+    step 6 and passes only the digest.
+  - SubmissionDeps uses the cohesive sub-struct shape (StorageDeps +
+    AdmissionConfig + IdentityDeps).
 
 OVERVIEW:
-    startTestOperator creates: Postgres pool → clean tables → stores →
-    builder loop → HTTP server on random port. Returns testOperator with
-    all dependencies accessible for test assertions.
+
+	startTestOperator creates: Postgres pool → clean tables → stores →
+	builder loop → HTTP server on random port. Returns testOperator with
+	all dependencies accessible for test assertions.
 
 KEY DEPENDENCIES:
-    - All api/ handlers wired with real Postgres stores.
-    - builder/loop.go runs in background goroutine.
-    - tessera/entry_reader.go InMemoryEntryStore for byte storage.
+  - All api/ handlers wired with real Postgres stores.
+  - builder/loop.go runs in background goroutine.
+  - tessera/entry_reader.go InMemoryEntryStore for byte storage.
 */
 package tests
 
@@ -143,13 +148,28 @@ func startTestOperator(t *testing.T) *testOperator {
 	// ── HTTP handlers ──────────────────────────────────────────────────
 	queryAPI := indexes.NewPostgresQueryAPI(pool, entryBytes, testLogDID)
 
+	// SubmissionDeps using the cohesive sub-struct shape.
 	submissionDeps := &api.SubmissionDeps{
-		DB: pool, EntryStore: entryStore, EntryWriter: entryBytes,
-		CreditStore: creditStore,
-		Queue: queue, LogDID: testLogDID, MaxEntrySize: 1 << 20,
-		DiffController: diffController, Logger: logger,
-		DIDResolver: nil,
+		Storage: api.StorageDeps{
+			DB:          pool,
+			EntryStore:  entryStore,
+			EntryWriter: entryBytes,
+		},
+		Admission: api.AdmissionConfig{
+			DiffController:        diffController,
+			EpochWindowSeconds:    3600, // 1 hour
+			EpochAcceptanceWindow: 1,    // accept current ± 1
+		},
+		Identity: api.IdentityDeps{
+			CreditStore: creditStore,
+			DIDResolver: nil,
+		},
+		Queue:        queue,
+		LogDID:       testLogDID,
+		MaxEntrySize: 1 << 20,
+		Logger:       logger,
 	}
+
 	treeDeps := &api.TreeDeps{
 		TreeHeadStore: treeHeadStore, Inclusion: merkle,
 		Consistency: merkle, Logger: logger,
@@ -265,13 +285,7 @@ type stubMerkleAppender struct {
 	mt *smt.StubMerkleTree
 }
 
-// AppendLeaf accepts 32-byte SHA-256 hashes (hash-only architecture).
-// The builder computes SHA-256(wire_bytes) in loop.go step 6 and passes
-// the 32-byte digest here.
 func (s *stubMerkleAppender) AppendLeaf(data []byte) (uint64, error) {
-	// The stub's internal tree expects a hash to build the Merkle tree from.
-	// With hash-only architecture, data IS the 32-byte hash.
-	// StubMerkleTree.AppendLeaf takes []byte and computes its own leaf hash.
 	return s.mt.AppendLeaf(data)
 }
 

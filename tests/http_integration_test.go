@@ -4,6 +4,13 @@ FILE PATH: tests/http_integration_test.go
 HTTP integration tests. Every test makes real HTTP calls to a real operator
 server backed by real Postgres. No interface mocks.
 
+POST-WAVE-1.5 CHANGES:
+  - Wire format is protocol v5. Preamble bytes updated.
+  - header.AdmissionProof now points to *envelope.AdmissionProofBody (wire
+    type), not *types.AdmissionProof (API type).
+  - Mode B verification uses ProofFromWire adapter.
+  - VerifyStamp takes 8 args including currentEpoch + acceptanceWindow.
+
 Run: ORTHOLOG_TEST_DSN="postgres://..." go test ./tests/ -v -count=1 -run TestHTTP
 */
 package tests
@@ -23,14 +30,27 @@ import (
 
 	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
 	"github.com/clearcompass-ai/ortholog-sdk/crypto/admission"
-	"github.com/clearcompass-ai/ortholog-sdk/types"
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wire format constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+const (
+	// adminModeBWireByte is the wire-byte encoding of AdmissionModeB inside
+	// AdmissionProofBody. Mirrors types.AdmissionModeB which is also 2.
+	adminModeBWireByte uint8 = 2
+
+	// hashFuncSHA256WireByte is the wire-byte encoding of HashSHA256 inside
+	// AdmissionProofBody. Mirrors admission.HashSHA256 which is also 0.
+	hashFuncSHA256WireByte uint8 = 0
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Wire format helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// buildWireEntry creates a v3 entry with a fake ECDSA signature appended.
+// buildWireEntry creates a v5 entry with a fake ECDSA signature appended.
 // Used for Mode A (authenticated) submissions where stamp isn't needed.
 func buildWireEntry(t *testing.T, header envelope.ControlHeader, payload []byte) []byte {
 	t.Helper()
@@ -43,16 +63,32 @@ func buildWireEntry(t *testing.T, header envelope.ControlHeader, payload []byte)
 	return envelope.AppendSignature(canonical, envelope.SigAlgoECDSA, fakeSig)
 }
 
-// buildModeBWireEntry creates a v3 entry with a valid compute stamp for Mode B.
-// Brute-forces the nonce so that the stamp verifies against the canonical hash.
-// With difficulty 16 this takes ~65ms on average.
+// buildModeBWireEntry creates a v5 entry with a valid compute stamp for Mode B.
+// Brute-forces the nonce so that the stamp verifies against the canonical hash
+// using the post-Wave-1.5 admission API (StampParams + 8-arg VerifyStamp).
+//
+// At difficulty 16 with SHA-256 this typically takes ~65ms.
+//
+// IMPORTANT: header.AdmissionProof is *envelope.AdmissionProofBody (the wire
+// format type), NOT *types.AdmissionProof (the API form). The two types are
+// deliberately distinct — wire format omits TargetLog (implicit) and includes
+// Hash; API form has TargetLog and omits Hash. The operator translates between
+// them via admission.ProofFromWire.
 func buildModeBWireEntry(t *testing.T, header envelope.ControlHeader, payload []byte, logDID string, difficulty uint32) []byte {
 	t.Helper()
-	header.AdmissionProof = &types.AdmissionProof{
-		Mode:       types.AdmissionModeB,
-		Nonce:      0,
-		TargetLog:  logDID,
-		Difficulty: difficulty,
+
+	// Use the test epoch so the operator (which computes the same epoch
+	// via currentTestEpoch math) accepts our stamp. If we used time.Now
+	// directly, a tick across the hour boundary could cause flaky failures.
+	stampEpoch := currentTestEpoch()
+
+	// Wire-format type. Operator deserializes this from entry header bytes.
+	header.AdmissionProof = &envelope.AdmissionProofBody{
+		Mode:       adminModeBWireByte,
+		Difficulty: uint8(difficulty),
+		HashFunc:   hashFuncSHA256WireByte,
+		Epoch:      stampEpoch,
+		Nonce:      0, // updated each iteration
 	}
 
 	for nonce := uint64(0); nonce < 20_000_000; nonce++ {
@@ -64,7 +100,21 @@ func buildModeBWireEntry(t *testing.T, header envelope.ControlHeader, payload []
 		canonical := envelope.Serialize(entry)
 		entryHash := sha256.Sum256(canonical)
 
-		if admission.VerifyStamp(entryHash, nonce, logDID, difficulty, admission.HashSHA256, nil) == nil {
+		// Translate wire→API for verification (same path the operator
+		// takes at request handling time).
+		apiProof := admission.ProofFromWire(header.AdmissionProof, logDID)
+
+		err = admission.VerifyStamp(
+			apiProof,
+			entryHash,
+			logDID,
+			difficulty,
+			admission.HashSHA256,
+			nil, // Argon2idParams not needed for SHA-256
+			currentTestEpoch(),
+			uint64(testEpochAcceptanceWindow),
+		)
+		if err == nil {
 			fakeSig := make([]byte, 64)
 			for i := range fakeSig {
 				fakeSig[i] = byte(i + 1)
@@ -282,13 +332,13 @@ func TestHTTP_Middleware_OversizeBody_413(t *testing.T) {
 	op := startTestOperator(t)
 	op.seedSession(t, "tok-big", "did:example:exchange-big", 100)
 
-	// Build a real entry that exceeds MaxEntrySize after deserialization.
-	// The SizeLimit middleware wraps r.Body with MaxBytesReader.
-	// When io.ReadAll hits the limit, the next Read returns an error.
-	// The handler reads body → gets truncated/error → returns 400 (read failure).
+	// Build a body that exceeds MaxEntrySize. The SizeLimit middleware wraps
+	// r.Body with MaxBytesReader. When io.ReadAll hits the limit, the next
+	// Read returns an error and the handler reads truncated bytes.
+	// Then deserialization fails → 422.
 	oversized := make([]byte, (1<<20)+2048)
 	oversized[0] = 0x00
-	oversized[1] = 0x03 // valid v3 preamble
+	oversized[1] = 0x05 // valid v5 preamble (Wave 1.5)
 
 	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(oversized))
 	req.Header.Set("Authorization", "Bearer tok-big")
@@ -328,13 +378,20 @@ func TestHTTP_Middleware_MalformedBody_422(t *testing.T) {
 	}
 }
 
+// TestHTTP_Middleware_WrongProtocolVersion_422 verifies the operator rejects
+// any wire protocol version other than v5 (current, post-Wave-1.5).
+//
+// Wire format protocol version is stored in bytes 0-1 of the entry as a
+// big-endian uint16. The operator's submission handler reads this in Step 1
+// and rejects with 422 if it does not equal 5.
 func TestHTTP_Middleware_WrongProtocolVersion_422(t *testing.T) {
 	op := startTestOperator(t)
 
-	// Build a wire entry then overwrite protocol version to v2.
+	// Build a valid v5 wire entry then overwrite protocol version to v2
+	// (a value the operator will refuse).
 	wire := buildWireEntry(t, envelope.ControlHeader{SignerDID: "did:example:v2"}, []byte("v2"))
 	wire[0] = 0x00
-	wire[1] = 0x02 // Protocol version 2 instead of 3.
+	wire[1] = 0x02 // Protocol version 2 instead of v5 — must be rejected.
 
 	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(wire))
 	resp, _ := http.DefaultClient.Do(req)
@@ -343,6 +400,27 @@ func TestHTTP_Middleware_WrongProtocolVersion_422(t *testing.T) {
 	if resp.StatusCode != http.StatusUnprocessableEntity {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("v2 entry: expected 422, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+// TestHTTP_Middleware_FutureProtocolVersion_422 confirms forward-compatibility
+// rejection: a v6 entry (which doesn't exist yet) must also be refused.
+// Catches the failure mode where the operator might silently accept anything
+// "5 or higher" instead of strict equality.
+func TestHTTP_Middleware_FutureProtocolVersion_422(t *testing.T) {
+	op := startTestOperator(t)
+
+	wire := buildWireEntry(t, envelope.ControlHeader{SignerDID: "did:example:v6"}, []byte("v6"))
+	wire[0] = 0x00
+	wire[1] = 0x06 // Protocol version 6 — does not exist; must be rejected.
+
+	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(wire))
+	resp, _ := http.DefaultClient.Do(req)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("v6 entry: expected 422, got %d: %s", resp.StatusCode, body)
 	}
 }
 
@@ -574,6 +652,74 @@ func TestHTTP_HealthCheck(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "ok" {
 		t.Fatalf("body: %q", body)
+	}
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 9. Mode B — Stale Epoch Rejection (SDK-2 acceptance window)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// TestHTTP_Submission_ModeB_StaleEpoch_403 mints a stamp with an epoch many
+// windows in the past, then submits it. The operator's VerifyStamp must
+// reject it because its currentEpoch math will compute a much higher number,
+// putting the stamp outside the [current-window, current+window] band.
+//
+// This is the regression test for the SDK-2 epoch acceptance window contract.
+// Without enforcement, a stamp could be reused indefinitely.
+func TestHTTP_Submission_ModeB_StaleEpoch_403(t *testing.T) {
+	op := startTestOperator(t)
+
+	// Build a stamp manually with a stale epoch (100 hours in the past).
+	staleEpoch := currentTestEpoch() - 100
+
+	header := envelope.ControlHeader{
+		SignerDID: "did:example:stale-epoch",
+	}
+	header.AdmissionProof = &envelope.AdmissionProofBody{
+		Mode:       adminModeBWireByte,
+		Difficulty: 8, // low difficulty for fast nonce search
+		HashFunc:   hashFuncSHA256WireByte,
+		Epoch:      staleEpoch,
+		Nonce:      0,
+	}
+
+	// Brute force a valid nonce against the stale epoch.
+	var wire []byte
+	for nonce := uint64(0); nonce < 5_000_000; nonce++ {
+		header.AdmissionProof.Nonce = nonce
+		entry, err := envelope.NewEntry(header, []byte("stale-payload"))
+		if err != nil {
+			t.Fatalf("NewEntry: %v", err)
+		}
+		canonical := envelope.Serialize(entry)
+		entryHash := sha256.Sum256(canonical)
+
+		// Verify against the stale epoch with window=0 (exact match) to
+		// confirm the nonce is valid for THAT epoch — not the operator's.
+		apiProof := admission.ProofFromWire(header.AdmissionProof, testLogDID)
+		if admission.VerifyStamp(
+			apiProof, entryHash, testLogDID, 8,
+			admission.HashSHA256, nil,
+			staleEpoch, 0, // window=0 → exact match required
+		) == nil {
+			fakeSig := make([]byte, 64)
+			wire = envelope.AppendSignature(canonical, envelope.SigAlgoECDSA, fakeSig)
+			break
+		}
+	}
+	if wire == nil {
+		t.Fatal("could not mint stale-epoch stamp within 5M nonces")
+	}
+
+	// Submit the stale-epoch stamp.
+	req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(wire))
+	resp, _ := http.DefaultClient.Do(req)
+	defer resp.Body.Close()
+
+	// Operator should reject as out-of-window.
+	if resp.StatusCode != http.StatusForbidden {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("stale-epoch stamp: expected 403, got %d: %s", resp.StatusCode, body)
 	}
 }
 

@@ -8,9 +8,8 @@ CHANGES:
   - submitFn: anchor.SubmitViaHTTP (correction #6)
   - CommitmentStore: created + wired via WithCommitmentStore
   - 5 new handlers: EntryBySequence, EntryBatch, SMTLeaf, SMTLeafBatch, CommitmentQuery
-  - No artifact_client (moved to SDK)
-  - No shard wiring (deferred post Phase 6)
-  - No builder/schema_resolver.go needed (SDK provides CachingResolver)
+  - SubmissionDeps refactored into sub-structs (StorageDeps + AdmissionConfig + IdentityDeps)
+  - Epoch config (EpochWindowSeconds + EpochAcceptanceWindow) for SDK-2 stamp validation
 */
 package main
 
@@ -20,6 +19,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -69,7 +69,6 @@ func run(logger *slog.Logger) error {
 	defer pools.Close()
 
 	// ── Step 3: Run migrations ─────────────────────────────────────────
-	// derivation_commitments table is now in schemaDDL (store/postgres.go).
 	if err := store.RunMigrations(ctx, pools.Write); err != nil {
 		return fmt.Errorf("step 3: %w", err)
 	}
@@ -133,16 +132,8 @@ func run(logger *slog.Logger) error {
 		SchemeTag:         schemeTag,
 	}, treeHeadStore, logger)
 
-	// CommitmentStore for indexed commitment lookup.
 	commitmentStore := store.NewCommitmentStore(pools.Write)
-
-	// SchemaResolver: SDK's CachingResolver already implements
-	// builder.SchemaResolver — fetches schema entry, deserializes,
-	// checks CommutativeOperations. No operator wrapper needed.
 	schemaResolver := schema.NewCachingResolver()
-
-	// submitFn via SubmitViaHTTP — same pattern as anchor/publisher.go.
-	// Commentary entries get signed and submitted through local admission.
 	submitFn := anchor.SubmitViaHTTP(fmt.Sprintf("http://localhost%s", cfg.ServerAddr))
 
 	commitPub := opbuilder.NewCommitmentPublisher(
@@ -219,12 +210,28 @@ func run(logger *slog.Logger) error {
 	// ── Step 14: HTTP server ───────────────────────────────────────────
 	queryAPI := indexes.NewPostgresQueryAPI(pools.Read, entryBytes, cfg.LogDID)
 
+	// Build SubmissionDeps using the cohesive sub-structs.
 	submissionDeps := &api.SubmissionDeps{
-		DB: pools.Write, EntryStore: entryStore, EntryWriter: entryBytes,
-		CreditStore: creditStore, Queue: queue, LogDID: cfg.LogDID,
-		MaxEntrySize: int64(cfg.MaxEntrySize), DiffController: diffController,
-		Logger: logger, DIDResolver: nil,
+		Storage: api.StorageDeps{
+			DB:          pools.Write,
+			EntryStore:  entryStore,
+			EntryWriter: entryBytes,
+		},
+		Admission: api.AdmissionConfig{
+			DiffController:        diffController,
+			EpochWindowSeconds:    cfg.EpochWindowSeconds,
+			EpochAcceptanceWindow: cfg.EpochAcceptanceWindow,
+		},
+		Identity: api.IdentityDeps{
+			CreditStore: creditStore,
+			DIDResolver: nil,
+		},
+		Queue:        queue,
+		LogDID:       cfg.LogDID,
+		MaxEntrySize: int64(cfg.MaxEntrySize),
+		Logger:       logger,
 	}
+
 	treeDeps := &api.TreeDeps{
 		TreeHeadStore: treeHeadStore, Inclusion: tesseraAdapter,
 		Consistency: tesseraAdapter, Logger: logger,
@@ -297,62 +304,66 @@ func run(logger *slog.Logger) error {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type operatorConfig struct {
-	LogDID             string
-	OperatorDID        string
-	PostgresDSN        string
-	ReplicaDSN         string
-	MaxConns           int
-	MinConns           int
-	ServerAddr         string
-	MaxEntrySize       int
-	TesseraBaseURL     string
-	TileCacheSize      int
-	WarmTopLevels      int
-	SMTCacheSize       int
-	DeltaWindowSize    int
-	CommitmentInterval int
-	CommitmentMaxAge   time.Duration
-	WitnessEndpoints   []string
-	WitnessQuorumK     int
-	PeerEndpoints      []string
-	AnchorEnabled      bool
-	AnchorSources      []anchor.AnchorSource
-	InitialDifficulty  int
-	MinDifficulty      int
-	MaxDifficulty      int
-	LowThreshold       int
-	HighThreshold      int
-	HashFunction       string
+	LogDID                string
+	OperatorDID           string
+	PostgresDSN           string
+	ReplicaDSN            string
+	MaxConns              int
+	MinConns              int
+	ServerAddr            string
+	MaxEntrySize          int
+	TesseraBaseURL        string
+	TileCacheSize         int
+	WarmTopLevels         int
+	SMTCacheSize          int
+	DeltaWindowSize       int
+	CommitmentInterval    int
+	CommitmentMaxAge      time.Duration
+	WitnessEndpoints      []string
+	WitnessQuorumK        int
+	PeerEndpoints         []string
+	AnchorEnabled         bool
+	AnchorSources         []anchor.AnchorSource
+	InitialDifficulty     int
+	MinDifficulty         int
+	MaxDifficulty         int
+	LowThreshold          int
+	HighThreshold         int
+	HashFunction          string
+	EpochWindowSeconds    int
+	EpochAcceptanceWindow int
 }
 
 func loadConfig() operatorConfig {
 	return operatorConfig{
-		LogDID:             envOr("ORTHOLOG_LOG_DID", "did:ortholog:operator:001"),
-		OperatorDID:        envOr("ORTHOLOG_OPERATOR_DID", "did:ortholog:operator:001:signer"),
-		PostgresDSN:        envOr("ORTHOLOG_POSTGRES_DSN", "postgres://ortholog:ortholog@localhost:5432/ortholog?sslmode=disable"),
-		ReplicaDSN:         envOr("ORTHOLOG_REPLICA_DSN", ""),
-		MaxConns:           20,
-		MinConns:           5,
-		ServerAddr:         envOr("ORTHOLOG_SERVER_ADDR", ":8080"),
-		MaxEntrySize:       1 << 20,
-		TesseraBaseURL:     envOr("ORTHOLOG_TESSERA_URL", "http://localhost:2024"),
-		TileCacheSize:      10000,
-		WarmTopLevels:      32,
-		SMTCacheSize:       100000,
-		DeltaWindowSize:    10,
-		CommitmentInterval: 1000,
-		CommitmentMaxAge:   1 * time.Hour,
-		WitnessEndpoints:   nil,
-		WitnessQuorumK:     2,
-		PeerEndpoints:      nil,
-		AnchorEnabled:      false,
-		AnchorSources:      nil,
-		InitialDifficulty:  16,
-		MinDifficulty:      8,
-		MaxDifficulty:      24,
-		LowThreshold:       100,
-		HighThreshold:      10000,
-		HashFunction:       "sha256",
+		LogDID:                envOr("ORTHOLOG_LOG_DID", "did:ortholog:operator:001"),
+		OperatorDID:           envOr("ORTHOLOG_OPERATOR_DID", "did:ortholog:operator:001:signer"),
+		PostgresDSN:           envOr("ORTHOLOG_POSTGRES_DSN", "postgres://ortholog:ortholog@localhost:5432/ortholog?sslmode=disable"),
+		ReplicaDSN:            envOr("ORTHOLOG_REPLICA_DSN", ""),
+		MaxConns:              20,
+		MinConns:              5,
+		ServerAddr:            envOr("ORTHOLOG_SERVER_ADDR", ":8080"),
+		MaxEntrySize:          1 << 20,
+		TesseraBaseURL:        envOr("ORTHOLOG_TESSERA_URL", "http://localhost:2024"),
+		TileCacheSize:         10000,
+		WarmTopLevels:         32,
+		SMTCacheSize:          100000,
+		DeltaWindowSize:       10,
+		CommitmentInterval:    1000,
+		CommitmentMaxAge:      1 * time.Hour,
+		WitnessEndpoints:      nil,
+		WitnessQuorumK:        2,
+		PeerEndpoints:         nil,
+		AnchorEnabled:         false,
+		AnchorSources:         nil,
+		InitialDifficulty:     16,
+		MinDifficulty:         8,
+		MaxDifficulty:         24,
+		LowThreshold:          100,
+		HighThreshold:         10000,
+		HashFunction:          "sha256",
+		EpochWindowSeconds:    envIntOr("ORTHOLOG_EPOCH_WINDOW_SECONDS", 3600),
+		EpochAcceptanceWindow: envIntOr("ORTHOLOG_EPOCH_ACCEPTANCE_WINDOW", 1),
 	}
 }
 
@@ -361,4 +372,16 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func envIntOr(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return n
 }

@@ -1,41 +1,45 @@
 /*
-FILE PATH:
-    builder/loop.go
+Package builder — loop.go
 
 DESCRIPTION:
-    The continuous builder loop — THE core operational loop of the operator.
-    Dequeues admitted entries, calls SDK ProcessBatch, commits state atomically,
-    appends entry hashes to the Merkle tree, publishes commitments, and requests
-    witness cosignatures.
+
+	The continuous builder loop — THE core operational loop of the operator.
+	Dequeues admitted entries, calls SDK ProcessBatch, commits state atomically,
+	appends entry hashes to the Merkle tree, publishes commitments, and requests
+	witness cosignatures.
 
 KEY ARCHITECTURAL DECISIONS:
-    - Single goroutine: determinism requires exactly one builder per log.
-      Advisory lock prevents concurrent instances.
-    - Atomic commit: leaf mutations + delta buffer + queue status in ONE
-      Postgres transaction. No partial state on crash.
-    - Hash-only Merkle tree (Conflict #1 resolution): Step 6 passes
-      SHA-256(wire_bytes) — exactly 32 bytes — to Tessera. Full entry bytes
-      stay in the operator's own storage (InMemoryEntryStore/disk).
-      Tessera never sees full entry data. This preserves SDK-D11 (1MB)
-      within the tlog-tiles uint16 (64KB) entry bundle constraint.
-    - SDK MerkleTree interface: builder touches only the MerkleAppender
-      interface, never tessera/client.go directly. Swappable backend.
-    - Idempotent: replaying the same batch produces identical state.
-    - Context-aware: every Postgres call checks ctx.Done() first.
+  - Single goroutine: determinism requires exactly one builder per log.
+    Advisory lock prevents concurrent instances.
+  - Atomic commit: leaf mutations + delta buffer + queue status in ONE
+    Postgres transaction. No partial state on crash.
+  - Overlay SMT Store: SDK ProcessBatch runs against an in-memory overlay
+    to guarantee functional purity. If batch validation fails, the overlay
+    is discarded and Postgres remains completely untouched.
+  - Hash-only Merkle tree (Conflict #1 resolution): Step 6 passes
+    SHA-256(wire_bytes) — exactly 32 bytes — to Tessera. Full entry bytes
+    stay in the operator's own storage (InMemoryEntryStore/disk).
+    Tessera never sees full entry data. This preserves SDK-D11 (1MB)
+    within the tlog-tiles uint16 (64KB) entry bundle constraint.
+  - SDK MerkleTree interface: builder touches only the MerkleAppender
+    interface, never tessera/client.go directly. Swappable backend.
+  - Idempotent: replaying the same batch produces identical state.
+  - Context-aware: every Postgres call checks ctx.Done() first.
 
 OVERVIEW:
-    Run loop: dequeue → fetch → split → ProcessBatch → atomic commit →
-    Merkle append (hash-only) → commitment → witness cosig.
 
-    Step 6 (Merkle append) is POST-COMMIT and best-effort. Crash between
-    commit and append → re-append on restart is safe (Tessera deduplicates
-    by leaf hash). The operator's atomic state is in Postgres.
+	Run loop: dequeue → fetch → split → ProcessBatch → atomic commit →
+	Merkle append (hash-only) → commitment → witness cosig.
+
+	Step 6 (Merkle append) is POST-COMMIT and best-effort. Crash between
+	commit and append → re-append on restart is safe (Tessera deduplicates
+	by leaf hash). The operator's atomic state is in Postgres.
 
 KEY DEPENDENCIES:
-    - github.com/clearcompass-ai/ortholog-sdk/builder: ProcessBatch, BatchResult.
-    - tessera/proof_adapter.go: TesseraAdapter implements MerkleAppender.
-    - store/smt_state.go: PostgresLeafStore.SetTx for atomic leaf writes.
-    - store/entries.go: PostgresEntryFetcher for entry retrieval.
+  - github.com/clearcompass-ai/ortholog-sdk/builder: ProcessBatch, BatchResult.
+  - tessera/proof_adapter.go: TesseraAdapter implements MerkleAppender.
+  - store/smt_state.go: PostgresLeafStore.SetTx for atomic leaf writes.
+  - store/entries.go: PostgresEntryFetcher for entry retrieval.
 */
 package builder
 
@@ -324,8 +328,15 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	}
 
 	// ── Step 4: SDK ProcessBatch ──────────────────────────────────────
+	// Wrap the live Postgres leaf store in an in-memory overlay.
+	// This prevents mid-batch errors from mutating the database non-transactionally.
+	// If ProcessBatch fails, the overlayStore is garbage collected and Postgres
+	// remains completely untouched.
+	overlayStore := smt.NewOverlayLeafStore(bl.leafStore)
+	overlayTree := smt.NewTree(overlayStore, bl.nodeCache)
+
 	result, err := sdkbuilder.ProcessBatch(
-		bl.tree, entries, positions,
+		overlayTree, entries, positions,
 		bl.fetcher, bl.schema, bl.cfg.LogDID, bl.buffer,
 	)
 	if err != nil {
@@ -338,6 +349,7 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	}
 
 	err = store.WithSerializableTx(ctx, bl.db, func(ctx context.Context, tx pgx.Tx) error {
+		// Apply the successfully computed SMT mutations inside the transaction.
 		for _, mut := range result.Mutations {
 			leaf := types.SMTLeaf{
 				Key:          mut.LeafKey,

@@ -3,7 +3,7 @@ module github.com/clearcompass-ai/ortholog-operator
 go 1.25.0
 
 require (
-	github.com/clearcompass-ai/ortholog-sdk v1.3.0
+	github.com/clearcompass-ai/ortholog-sdk v0.1.0
 	github.com/jackc/pgx/v5 v5.7.4
 	github.com/transparency-dev/tessera v1.0.2
 	golang.org/x/mod v0.35.0

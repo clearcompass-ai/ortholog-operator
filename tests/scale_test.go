@@ -7,21 +7,32 @@ Postgres write behavior, and queue drain time under sustained load.
 Gated by ORTHOLOG_TEST_DSN — skips without Postgres.
 Entry count configurable via ORTHOLOG_SCALE_N (default 1,000,000).
 
-Run:
-  ORTHOLOG_TEST_DSN="postgres://ortholog:ortholog@localhost:5432/ortholog_test?sslmode=disable" \
-    go test ./tests/ -v -count=1 -run TestScale -timeout 30m
+POST-WAVE-1.5 NOTES:
+  - Wire format used in HTTP throughput tests is protocol v5.
+  - Mode A throughput test (TestScale_HTTPAdmission_10K) exercises the
+    fast path (authenticated, no stamp).
+  - Mode B throughput test (TestScale_HTTPAdmission_ModeB_1K) exercises
+    the slow path (compute stamp at low difficulty for tractable runtime).
 
-  # Start smaller:
-  ORTHOLOG_SCALE_N=100000 go test ./tests/ -v -count=1 -run TestScale -timeout 30m
+Run:
+
+	ORTHOLOG_TEST_DSN="postgres://ortholog:ortholog@localhost:5432/ortholog_test?sslmode=disable" \
+	  go test ./tests/ -v -count=1 -run TestScale -timeout 30m
+
+	# Start smaller:
+	ORTHOLOG_SCALE_N=100000 go test ./tests/ -v -count=1 -run TestScale -timeout 30m
 */
 package tests
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"strconv"
 	"sync"
@@ -573,7 +584,7 @@ func TestScale_SDKProcessBatch(t *testing.T) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 6. HTTP Admission Pipeline Throughput
+// 6. HTTP Admission Pipeline Throughput (Mode A — fast path)
 // ═════════════════════════════════════════════════════════════════════════════
 
 func TestScale_HTTPAdmission_10K(t *testing.T) {
@@ -603,7 +614,7 @@ func TestScale_HTTPAdmission_10K(t *testing.T) {
 
 	elapsed := time.Since(start)
 	rate := float64(N) / elapsed.Seconds()
-	t.Logf("HTTP ADMISSION: %d entries in %s (%.0f entries/sec, %d errors)", N, elapsed, rate, errCount)
+	t.Logf("HTTP ADMISSION (Mode A): %d entries in %s (%.0f entries/sec, %d errors)", N, elapsed, rate, errCount)
 
 	// Wait for builder to drain.
 	t.Log("waiting for builder to drain queue...")
@@ -617,6 +628,105 @@ func TestScale_HTTPAdmission_10K(t *testing.T) {
 			t.Fatalf("builder did not drain within 2 minutes (%d pending)", pending)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+	t.Logf("builder drain: %s", time.Since(drainStart))
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 7. HTTP Admission — Mode B (compute stamp) Throughput
+//
+// Mode B is intentionally slower than Mode A — every submission requires
+// a proof-of-work stamp before the operator will accept it. This test
+// uses low difficulty (8 bits) to keep runtime tractable while still
+// exercising the full SDK admission verification path: the wire-format
+// AdmissionProofBody → ProofFromWire adapter → 8-arg VerifyStamp.
+//
+// Failure modes this test would catch:
+//   - ProofFromWire bug → 100% rejection rate
+//   - Epoch math drift between client and operator → 100% rejection rate
+//   - Difficulty controller returning wrong target → bursty rejections
+//   - Operator's epoch acceptance window incorrectly enforced → flaky
+// ═════════════════════════════════════════════════════════════════════════════
+
+func TestScale_HTTPAdmission_ModeB_1K(t *testing.T) {
+	op := startTestOperator(t)
+
+	// 1K Mode B entries at difficulty 8 → ~50ms per entry on commodity HW.
+	// At difficulty 16 (operator default) this would take ~10x longer; we
+	// use 8 to keep test runtime under 5 minutes.
+	const (
+		N          = 1_000
+		difficulty = 8
+	)
+
+	// First, lower the operator's required difficulty to match what we'll
+	// generate. We can't change DifficultyController from the test, so we
+	// have to use difficulty == operator.MinDifficulty (8 by default).
+
+	start := time.Now()
+	accepted := 0
+	rejected := 0
+
+	for i := 0; i < N; i++ {
+		header := envelope.ControlHeader{
+			SignerDID: fmt.Sprintf("did:example:modeb-scale%d", i/100),
+		}
+		wire := buildModeBWireEntry(t, header, []byte(fmt.Sprintf("modeb-scale-%d", i)), testLogDID, difficulty)
+
+		req, _ := http.NewRequest("POST", op.BaseURL+"/v1/entries", bytes.NewReader(wire))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		switch resp.StatusCode {
+		case http.StatusAccepted:
+			accepted++
+		case http.StatusForbidden:
+			rejected++
+			if i < 3 {
+				// Log first few rejections for diagnosis.
+				t.Logf("  early rejection #%d: %s", i, body)
+			}
+		default:
+			t.Fatalf("unexpected status %d: %s", resp.StatusCode, body)
+		}
+
+		if (i+1)%(N/10) == 0 {
+			elapsed := time.Since(start)
+			rate := float64(i+1) / elapsed.Seconds()
+			t.Logf("  Mode B admission: %d/%d (accepted=%d rejected=%d, %.1f entries/sec)",
+				i+1, N, accepted, rejected, rate)
+		}
+	}
+
+	elapsed := time.Since(start)
+	rate := float64(N) / elapsed.Seconds()
+	t.Logf("HTTP ADMISSION (Mode B): %d entries in %s (%.1f entries/sec)", N, elapsed, rate)
+	t.Logf("  Accepted: %d (%.1f%%)", accepted, 100*float64(accepted)/float64(N))
+	t.Logf("  Rejected: %d (%.1f%%)", rejected, 100*float64(rejected)/float64(N))
+
+	// Validation: at least 95% should be accepted. Any higher rejection
+	// rate suggests a misconfiguration (clock drift, difficulty mismatch)
+	// rather than a stamp validity issue.
+	if accepted < (95*N)/100 {
+		t.Fatalf("Mode B acceptance rate too low: %d/%d (%.1f%%) — investigate clock skew or difficulty config",
+			accepted, N, 100*float64(accepted)/float64(N))
+	}
+
+	// Wait for builder drain.
+	drainStart := time.Now()
+	for {
+		pending, _ := op.Queue.PendingCount(context.Background())
+		if pending == 0 {
+			break
+		}
+		if time.Since(drainStart) > 5*time.Minute {
+			t.Fatalf("builder did not drain within 5 minutes (%d pending)", pending)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 	t.Logf("builder drain: %s", time.Since(drainStart))
 }

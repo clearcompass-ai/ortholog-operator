@@ -118,6 +118,45 @@ func (s *PostgresLeafStore) SetTx(ctx context.Context, tx pgx.Tx, key [32]byte, 
 	return nil
 }
 
+// SetBatch writes multiple leaves using Postgres batching.
+// This satisfies the sdk smt.LeafStore interface.
+// Note: The builder loop uses SetTx within its own atomic transaction block
+// to commit mutations, but this method is required for interface compliance
+// and non-transactional bulk operations.
+func (s *PostgresLeafStore) SetBatch(leaves []types.SMTLeaf) error {
+	if len(leaves) == 0 {
+		return nil
+	}
+
+	ctx := context.TODO()
+	batch := &pgx.Batch{}
+
+	for _, leaf := range leaves {
+		originBytes := SerializeLogPosition(leaf.OriginTip)
+		authBytes := SerializeLogPosition(leaf.AuthorityTip)
+
+		batch.Queue(`
+			INSERT INTO smt_leaves (leaf_key, origin_tip, authority_tip, updated_at)
+			VALUES ($1, $2, $3, NOW())
+			ON CONFLICT (leaf_key) DO UPDATE SET
+				origin_tip = EXCLUDED.origin_tip,
+				authority_tip = EXCLUDED.authority_tip,
+				updated_at = NOW()`,
+			leaf.Key[:], originBytes, authBytes,
+		)
+	}
+
+	// SendBatch executes the queued statements.
+	br := s.db.SendBatch(ctx, batch)
+	defer br.Close()
+
+	if _, err := br.Exec(); err != nil {
+		return fmt.Errorf("store/smt: set batch: %w", err)
+	}
+
+	return nil
+}
+
 // Delete removes a leaf.
 func (s *PostgresLeafStore) Delete(key [32]byte) error {
 	ctx := context.TODO()
@@ -146,12 +185,12 @@ func (s *PostgresLeafStore) Count() (int, error) {
 // PostgresNodeCache implements sdk smt.NodeCache with write-through persistence.
 // Uses a simple map with access tracking for LRU eviction.
 type PostgresNodeCache struct {
-	db       *pgxpool.Pool
-	mu       sync.RWMutex
-	cache    map[[32]byte]cacheEntry
-	access   map[[32]byte]int64 // access counter for LRU
-	counter  int64
-	maxSize  int
+	db      *pgxpool.Pool
+	mu      sync.RWMutex
+	cache   map[[32]byte]cacheEntry
+	access  map[[32]byte]int64 // access counter for LRU
+	counter int64
+	maxSize int
 }
 
 type cacheEntry struct {

@@ -15,7 +15,15 @@ KEY ARCHITECTURAL DECISIONS:
   - Canonical hash computed from RAW canonical bytes (not re-serialized).
   - Duplicate hash mapped to HTTP 409 (not generic 500).
   - DIDResolver: nil = Phase 2 wire format trust model.
-                  set = Phase 4 full DID→pubkey→VerifyEntry.
+    set = Phase 4 full DID→pubkey→VerifyEntry.
+
+DEPENDENCY SHAPE:
+
+	SubmissionDeps groups dependencies by cohesion:
+	  - StorageDeps:     persistence (DB + EntryStore + EntryWriter)
+	  - AdmissionConfig: stamp verification policy (DiffController + epoch params)
+	  - IdentityDeps:    credentials + DID resolution
+	Crosscutting fields (LogDID, Logger, MaxEntrySize, Queue) live at the top.
 
 INVARIANTS:
   - Past step 2: all entries have verified signatures (SDK-D5).
@@ -65,26 +73,54 @@ type DIDResolver interface {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2) Submission Dependencies
+// 2) Submission Dependencies — grouped by cohesion
 // ─────────────────────────────────────────────────────────────────────────────
 
-// SubmissionDeps holds dependencies for the submission handler.
-type SubmissionDeps struct {
-	DB              *pgxpool.Pool
-	EntryStore      *store.EntryStore
-	EntryWriter     tessera.EntryWriter // Bytes go here, not Postgres.
-	CreditStore     *store.CreditStore
-	Queue           *builder.Queue
-	LogDID          string
-	MaxEntrySize    int64
-	DiffController  *middleware.DifficultyController
-	Logger          *slog.Logger
+// StorageDeps groups persistence dependencies for the submission handler.
+// All three components participate in the same atomic transaction during
+// admission (entry insert + bytes write + queue enqueue), so they cohere.
+type StorageDeps struct {
+	DB          *pgxpool.Pool
+	EntryStore  *store.EntryStore
+	EntryWriter tessera.EntryWriter
+}
 
-	// DIDResolver resolves signer DIDs to public keys for signature verification.
-	// nil = Phase 2 trust model (wire format integrity only, no cryptographic
-	//       verification — StripSignature + Deserialize establishes format).
-	// set = Phase 4 full verification (DID → pubkey → VerifyEntry).
+// AdmissionConfig groups parameters that govern admission proof verification.
+// All fields are read together when validating Mode B (compute stamp) entries.
+//
+//	DiffController        — provides current difficulty and hash function policy.
+//	EpochWindowSeconds    — size of one epoch in seconds (e.g., 3600 = 1 hour).
+//	                        MUST be positive; zero will panic at handler creation.
+//	EpochAcceptanceWindow — tolerance in epochs around current. A value of 0
+//	                        DISABLES epoch checking entirely. A value of 1
+//	                        accepts stamps from [current-1, current+1].
+type AdmissionConfig struct {
+	DiffController        *middleware.DifficultyController
+	EpochWindowSeconds    int
+	EpochAcceptanceWindow int
+}
+
+// IdentityDeps groups credential and DID resolution dependencies.
+//
+//	CreditStore — tracks per-exchange write credits (Mode A authenticated path).
+//	DIDResolver — provides public keys for full signature verification (Phase 4).
+//	              nil enables Phase 2 trust model (wire format integrity only).
+type IdentityDeps struct {
+	CreditStore *store.CreditStore
 	DIDResolver DIDResolver
+}
+
+// SubmissionDeps is the dependency surface for the POST /v1/entries handler.
+// Cohesive subsystems are grouped into typed sub-structs; crosscutting
+// concerns (LogDID, Logger, MaxEntrySize, Queue) remain at the top level.
+type SubmissionDeps struct {
+	Storage      StorageDeps
+	Admission    AdmissionConfig
+	Identity     IdentityDeps
+	Queue        *builder.Queue
+	LogDID       string
+	MaxEntrySize int64
+	Logger       *slog.Logger
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -92,7 +128,16 @@ type SubmissionDeps struct {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // NewSubmissionHandler creates the POST /v1/entries handler.
+//
+// Panics if AdmissionConfig.EpochWindowSeconds is non-positive — without
+// a valid epoch window, the handler cannot validate Mode B admission proofs
+// and the operator should refuse to start rather than silently accept all
+// submissions or panic at request time with division by zero.
 func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
+	if deps.Admission.EpochWindowSeconds <= 0 {
+		panic("api: SubmissionDeps.Admission.EpochWindowSeconds must be positive")
+	}
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
@@ -104,15 +149,15 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 			return
 		}
 
-		// Validate preamble: Protocol_Version (bytes 0-1) must be 3.
+		// Validate preamble: Protocol_Version (bytes 0-1) must be 5.
 		if len(raw) < 6 {
 			writeError(w, http.StatusUnprocessableEntity, "entry too short for preamble")
 			return
 		}
 		protocolVersion := binary.BigEndian.Uint16(raw[0:2])
-		if protocolVersion != 3 {
+		if protocolVersion != 5 {
 			writeError(w, http.StatusUnprocessableEntity,
-				fmt.Sprintf("unsupported protocol version %d (expected 3)", protocolVersion))
+				fmt.Sprintf("unsupported protocol version %d (expected 5)", protocolVersion))
 			return
 		}
 
@@ -143,10 +188,10 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 		}
 
 		// Signature verification dispatch:
-		if deps.DIDResolver != nil {
+		if deps.Identity.DIDResolver != nil {
 			// Phase 4: full cryptographic verification.
 			// DID → public key → sdk VerifyEntry.
-			pubkey, resolveErr := deps.DIDResolver.ResolvePublicKey(ctx, entry.Header.SignerDID)
+			pubkey, resolveErr := deps.Identity.DIDResolver.ResolvePublicKey(ctx, entry.Header.SignerDID)
 			if resolveErr != nil {
 				writeError(w, http.StatusUnauthorized,
 					fmt.Sprintf("DID resolution failed for %s: %s", entry.Header.SignerDID, resolveErr))
@@ -195,15 +240,16 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 					"unauthenticated submission requires compute stamp")
 				return
 			}
-			if h.AdmissionProof.TargetLog != deps.LogDID {
-				writeError(w, http.StatusForbidden, "stamp bound to different log DID")
-				return
-			}
 
-			// Compute hash over raw canonical bytes for stamp verification.
+			// Translate wire-format AdmissionProofBody → API AdmissionProof.
+			// Uses the SDK adapter (v0.1.0+) for centralized translation.
+			// The wire format omits TargetLog because it's implicit at
+			// admission time (this operator's own LogDID).
+			apiProof := admission.ProofFromWire(h.AdmissionProof, deps.LogDID)
+
 			canonicalHash := sha256.Sum256(canonical)
-			currentDifficulty := deps.DiffController.CurrentDifficulty()
-			hashFuncName := deps.DiffController.HashFunction()
+			currentDifficulty := deps.Admission.DiffController.CurrentDifficulty()
+			hashFuncName := deps.Admission.DiffController.HashFunction()
 			var hashFunc admission.HashFunc
 			switch hashFuncName {
 			case "argon2id":
@@ -212,9 +258,19 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 				hashFunc = admission.HashSHA256
 			}
 
+			// SDK-2 epoch validation. Window=0 disables the check entirely.
+			currentEpoch := uint64(time.Now().UTC().Unix() / int64(deps.Admission.EpochWindowSeconds))
+			acceptanceWindow := uint64(deps.Admission.EpochAcceptanceWindow)
+
 			if err := admission.VerifyStamp(
-				canonicalHash, h.AdmissionProof.Nonce,
-				deps.LogDID, currentDifficulty, hashFunc, nil,
+				apiProof,
+				canonicalHash,
+				deps.LogDID,
+				currentDifficulty,
+				hashFunc,
+				nil, // Argon2idParams: nil = SDK defaults
+				currentEpoch,
+				acceptanceWindow,
 			); err != nil {
 				writeError(w, http.StatusForbidden,
 					fmt.Sprintf("stamp verification failed: %s", err))
@@ -230,17 +286,17 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 
 		// ── Steps 8-9: Atomic persist + enqueue ────────────────────────
 		var seq uint64
-		err = store.WithReadCommittedTx(ctx, deps.DB, func(ctx context.Context, tx pgx.Tx) error {
+		err = store.WithReadCommittedTx(ctx, deps.Storage.DB, func(ctx context.Context, tx pgx.Tx) error {
 			// Mode A credit deduction (inside transaction).
 			if authenticated {
-				if _, deductErr := deps.CreditStore.Deduct(ctx, tx, exchangeDID); deductErr != nil {
+				if _, deductErr := deps.Identity.CreditStore.Deduct(ctx, tx, exchangeDID); deductErr != nil {
 					return deductErr // ErrInsufficientCredits → HTTP 402
 				}
 			}
 
 			// Allocate sequence number.
 			var seqErr error
-			seq, seqErr = deps.EntryStore.NextSequence(ctx, tx)
+			seq, seqErr = deps.Storage.EntryStore.NextSequence(ctx, tx)
 			if seqErr != nil {
 				return seqErr
 			}
@@ -258,7 +314,7 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 			}
 
 			// Insert entry index (metadata only — no bytes in Postgres).
-			insertErr := deps.EntryStore.Insert(ctx, tx, store.EntryRow{
+			insertErr := deps.Storage.EntryStore.Insert(ctx, tx, store.EntryRow{
 				SequenceNumber: seq,
 				CanonicalHash:  canonicalHash,
 				LogTime:        logTime,
@@ -273,8 +329,8 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 			}
 
 			// Write bytes to Tessera (source of truth for entry bytes).
-			if deps.EntryWriter != nil {
-				if writeErr := deps.EntryWriter.WriteEntry(seq, canonical, sigBytes); writeErr != nil {
+			if deps.Storage.EntryWriter != nil {
+				if writeErr := deps.Storage.EntryWriter.WriteEntry(seq, canonical, sigBytes); writeErr != nil {
 					return fmt.Errorf("write entry bytes: %w", writeErr)
 				}
 			}
@@ -290,7 +346,7 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 			}
 			if errors.Is(err, store.ErrDuplicateEntry) {
 				// Look up existing sequence for the response.
-				existingSeq, found, _ := deps.EntryStore.FetchByHash(ctx, canonicalHash)
+				existingSeq, found, _ := deps.Storage.EntryStore.FetchByHash(ctx, canonicalHash)
 				if found {
 					writeError(w, http.StatusConflict,
 						fmt.Sprintf("duplicate entry: existing sequence %d", existingSeq))

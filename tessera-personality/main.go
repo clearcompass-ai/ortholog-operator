@@ -7,44 +7,24 @@ DESCRIPTION:
     (32 bytes) via POST /add, delegates Merkle tree computation to the Tessera
     library, and serves the c2sp.org/tlog-tiles static read API automatically.
 
-    This binary is the ONLY writer to the Merkle tree. The operator calls POST /add
-    with the 32-byte SHA-256(wire_bytes) digest. Full entry bytes live in the
-    operator's own storage (Postgres entry_index + InMemoryEntryStore). Tessera
-    never sees full entry data — only cryptographic commitments.
-
 KEY ARCHITECTURAL DECISIONS:
     - Hash-only entries: 32 bytes per leaf. Preserves SDK-D11 1MB limit without
       violating the tlog-tiles uint16 (64KB) entry bundle constraint.
-    - Ed25519 checkpoint signing: required by c2sp.org/tlog-tiles spec. The operator
-      independently produces ECDSA secp256k1 cosigned tree heads for smart contract
-      bridges — dual attestation over identical tree state.
-    - POSIX driver for local dev, GCP driver for production. Selected by --storage flag.
-    - Tessera handles tile layout, checkpoint production, integration batching, and
-      the static read API (/checkpoint, /tile/{L}/{N}, /tile/entries/{N}).
-    - No antispam: the operator's admission pipeline handles dedup via canonical_hash
-      UNIQUE constraint. Tessera receives pre-validated hashes only.
-
-OVERVIEW:
-    1. Parse flags (storage backend, listen address, origin string, key path).
-    2. Initialize storage driver (POSIX or GCP).
-    3. Load or generate Ed25519 signing key for checkpoint signatures.
-    4. Call tessera.NewAppender to get appender + reader + shutdown.
-    5. Register POST /add handler: validate 32-byte body, call appender.Add, return index.
-    6. Serve Tessera's static tlog-tiles read API via the reader's HTTP handler.
-    7. Block on SIGTERM/SIGINT, call shutdown for clean quiescence.
+    - Ed25519 checkpoint signing: required by c2sp.org/tlog-tiles spec.
+    - POSIX driver for local dev, GCP driver for production.
+    - Tessera handles tile layout, checkpoint production, integration batching,
+      and the static read API (/checkpoint, /tile/{L}/{N}, /tile/entries/{N}).
 
 KEY DEPENDENCIES:
-    - github.com/transparency-dev/tessera: Core tlog library (Appender, Entry, drivers).
-    - github.com/transparency-dev/tessera/storage/posix: Filesystem-backed tile storage.
-    - golang.org/x/mod/sumdb/note: Ed25519 signed note signer/verifier for checkpoints.
+    - github.com/transparency-dev/tessera
+    - github.com/transparency-dev/tessera/storage/posix
+    - golang.org/x/mod/sumdb/note
 */
 package main
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -67,17 +47,8 @@ import (
 // -------------------------------------------------------------------------------------------------
 
 const (
-	// hashEntrySize is the exact byte length of a SHA-256 digest.
-	// The personality rejects any POST body that is not exactly this size.
-	hashEntrySize = 32
-
-	// maxRequestBody caps the POST /add body read to prevent abuse.
-	// 32 bytes of hash + minimal overhead. Anything larger is rejected.
+	hashEntrySize  = 32
 	maxRequestBody = 256
-
-	// readTimeout and writeTimeout for the HTTP server.
-	serverReadTimeout  = 30 * time.Second
-	serverWriteTimeout = 60 * time.Second
 )
 
 // -------------------------------------------------------------------------------------------------
@@ -85,11 +56,9 @@ const (
 // -------------------------------------------------------------------------------------------------
 
 var (
-	flagStorage  = flag.String("storage", "posix", "Storage backend: posix or gcp")
-	flagDataDir  = flag.String("data-dir", "/data", "POSIX storage directory")
-	flagListen   = flag.String("listen", ":8081", "HTTP listen address")
-	flagOrigin   = flag.String("origin", "ortholog-dev", "Log origin string for checkpoint")
-	flagKeyPath  = flag.String("key-path", "", "Path to Ed25519 private key (PEM). Empty = generate ephemeral.")
+	flagStorageDir = flag.String("storage_dir", "/data", "POSIX storage directory")
+	flagListen     = flag.String("listen", ":8081", "HTTP listen address")
+	flagPrivKey    = flag.String("private_key", "", "Path to note signer private key file. Empty = generate ephemeral.")
 )
 
 // -------------------------------------------------------------------------------------------------
@@ -109,61 +78,37 @@ func main() {
 }
 
 func run(logger *slog.Logger) error {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := context.Background()
 
 	// -------------------------------------------------------------------------------------------------
-	// 3a) Initialize storage driver
+	// 3a) Initialize POSIX storage driver
 	// -------------------------------------------------------------------------------------------------
 
-	var driver tessera.Driver
-	switch *flagStorage {
-	case "posix":
-		d, err := posix.New(ctx, *flagDataDir)
-		if err != nil {
-			return fmt.Errorf("posix driver: %w", err)
-		}
-		driver = d
-		logger.Info("storage initialized", "backend", "posix", "dir", *flagDataDir)
-
-	// case "gcp":
-	//     Uncomment and wire GCP driver for production:
-	//     d, err := gcp.New(ctx, gcpConfig)
-	//     driver = d
-
-	default:
-		return fmt.Errorf("unsupported storage backend: %s (supported: posix, gcp)", *flagStorage)
+	driver, err := posix.New(ctx, posix.Config{Path: *flagStorageDir})
+	if err != nil {
+		return fmt.Errorf("posix driver: %w", err)
 	}
+	logger.Info("storage initialized", "backend", "posix", "dir", *flagStorageDir)
 
 	// -------------------------------------------------------------------------------------------------
 	// 3b) Ed25519 signing key for checkpoint
 	// -------------------------------------------------------------------------------------------------
 
-	signer, verifier, err := loadOrGenerateKey(logger)
-	if err != nil {
-		return fmt.Errorf("signing key: %w", err)
-	}
-
-	verifierStr, err := note.NewVerifier(verifier)
-	if err != nil {
-		return fmt.Errorf("create verifier: %w", err)
-	}
-	logger.Info("checkpoint signer ready",
-		"origin", *flagOrigin,
-		"verifier", verifierStr.Name())
+	signer := getSignerOrGenerate(logger)
 
 	// -------------------------------------------------------------------------------------------------
 	// 3c) Create Tessera Appender
 	// -------------------------------------------------------------------------------------------------
 
-	opts := tessera.NewAppendOptions()
-	opts.WithCheckpointSigner(signer, verifier)
-
-	appender, shutdown, _, err := tessera.NewAppender(ctx, driver, opts)
+	appender, shutdown, _, err := tessera.NewAppender(ctx, driver,
+		tessera.NewAppendOptions().
+			WithCheckpointSigner(signer).
+			WithCheckpointInterval(time.Second).
+			WithBatching(256, time.Second))
 	if err != nil {
 		return fmt.Errorf("tessera appender: %w", err)
 	}
-	logger.Info("tessera appender created", "origin", *flagOrigin)
+	logger.Info("tessera appender created")
 
 	// -------------------------------------------------------------------------------------------------
 	// 3d) HTTP server
@@ -180,23 +125,20 @@ func run(logger *slog.Logger) error {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	// Tessera's tlog-tiles read API is served from the storage directory.
-	// For POSIX, we serve the files directly. Tessera writes them in the
-	// exact c2sp.org/tlog-tiles layout: checkpoint, tile/{L}/{N}, tile/entries/{N}.
-	if *flagStorage == "posix" {
-		fs := http.FileServer(http.Dir(*flagDataDir))
-		mux.Handle("/", fs)
-		logger.Info("serving tlog-tiles read API from filesystem", "dir", *flagDataDir)
-	}
+	// Serve Tessera's tlog-tiles read API from the POSIX storage directory.
+	// Tessera writes files in the exact c2sp.org/tlog-tiles layout.
+	fs := http.FileServer(http.Dir(*flagStorageDir))
+	mux.Handle("GET /checkpoint", addCacheHeaders("no-cache", fs))
+	mux.Handle("GET /tile/", addCacheHeaders("max-age=31536000, immutable", fs))
+	logger.Info("serving tlog-tiles read API from filesystem", "dir", *flagStorageDir)
 
 	server := &http.Server{
 		Addr:         *flagListen,
 		Handler:      mux,
-		ReadTimeout:  serverReadTimeout,
-		WriteTimeout: serverWriteTimeout,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
 	}
 
-	// Start server in background.
 	errCh := make(chan error, 1)
 	go func() {
 		logger.Info("HTTP server starting", "addr", *flagListen)
@@ -219,17 +161,14 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("http server: %w", err)
 	}
 
-	// Graceful: stop accepting new requests.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutdownCancel()
 	_ = server.Shutdown(shutdownCtx)
 
-	// Tessera shutdown: flush pending entries, finalize checkpoint.
 	if err := shutdown(shutdownCtx); err != nil {
 		logger.Warn("tessera shutdown", "error", err)
 	}
 
-	cancel()
 	logger.Info("tessera-personality stopped cleanly")
 	return nil
 }
@@ -240,7 +179,6 @@ func run(logger *slog.Logger) error {
 
 func newAddHandler(appender *tessera.Appender, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Read body — must be exactly 32 bytes.
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody))
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, "failed to read request body")
@@ -253,7 +191,7 @@ func newAddHandler(appender *tessera.Appender, logger *slog.Logger) http.Handler
 			return
 		}
 
-		// Validate non-zero hash (defense against accidental empty submissions).
+		// Validate non-zero hash.
 		allZero := true
 		for _, b := range body {
 			if b != 0 {
@@ -262,16 +200,12 @@ func newAddHandler(appender *tessera.Appender, logger *slog.Logger) http.Handler
 			}
 		}
 		if allZero {
-			writeJSONError(w, http.StatusBadRequest, "zero hash rejected — likely a bug in the caller")
+			writeJSONError(w, http.StatusBadRequest, "zero hash rejected")
 			return
 		}
 
-		// Submit to Tessera. The entry data IS the 32-byte hash.
-		// Tessera computes the Merkle leaf hash as H(0x00 || entry_data).
-		indexFuture := appender.Add(r.Context(), tessera.NewEntry(body))
-
-		// Block until sequenced.
-		index, err := indexFuture()
+		// Submit to Tessera. Returns tessera.Index with .Index field (uint64).
+		idx, err := appender.Add(r.Context(), tessera.NewEntry(body))()
 		if err != nil {
 			logger.Error("tessera add failed", "error", err)
 			writeJSONError(w, http.StatusInternalServerError, "sequencing failed")
@@ -280,75 +214,66 @@ func newAddHandler(appender *tessera.Appender, logger *slog.Logger) http.Handler
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]uint64{"index": index})
+		_ = json.NewEncoder(w).Encode(map[string]uint64{"index": idx.Index})
 	}
 }
 
 // -------------------------------------------------------------------------------------------------
-// 5) Ed25519 Key Management
+// 5) Signer — load from file or generate ephemeral
 // -------------------------------------------------------------------------------------------------
 
-// loadOrGenerateKey loads an Ed25519 key from disk or generates an ephemeral one.
-// Returns a note.Signer and note.Verifier for Tessera's checkpoint signing.
-func loadOrGenerateKey(logger *slog.Logger) (note.Signer, note.Verifier, error) {
-	var privKey ed25519.PrivateKey
-
-	if *flagKeyPath != "" {
-		// Production: load from file.
-		keyData, err := os.ReadFile(*flagKeyPath)
+// getSignerOrGenerate loads a note.Signer from a private key file,
+// or generates an ephemeral Ed25519 keypair for local dev.
+//
+// Key format follows golang.org/x/mod/sumdb/note:
+//   Private: "PRIVATE+KEY+<name>+<hash>+<keydata>"
+//   Public:  "<name>+<hash>+<keydata>"
+func getSignerOrGenerate(logger *slog.Logger) note.Signer {
+	if *flagPrivKey != "" {
+		keyData, err := os.ReadFile(*flagPrivKey)
 		if err != nil {
-			return nil, nil, fmt.Errorf("read key file %s: %w", *flagKeyPath, err)
+			logger.Error("failed to read private key file", "path", *flagPrivKey, "error", err)
+			os.Exit(1)
 		}
-		if len(keyData) != ed25519.PrivateKeySize {
-			return nil, nil, fmt.Errorf("key file must be %d bytes raw Ed25519, got %d",
-				ed25519.PrivateKeySize, len(keyData))
-		}
-		privKey = ed25519.PrivateKey(keyData)
-		logger.Info("loaded Ed25519 key from file", "path", *flagKeyPath)
-	} else {
-		// Local dev: generate ephemeral key.
-		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		signer, err := note.NewSigner(string(keyData))
 		if err != nil {
-			return nil, nil, fmt.Errorf("generate key: %w", err)
+			logger.Error("failed to create signer from key file", "path", *flagPrivKey, "error", err)
+			os.Exit(1)
 		}
-		privKey = priv
-		logger.Warn("generated ephemeral Ed25519 key — NOT for production")
+		logger.Info("loaded signer from file", "path", *flagPrivKey, "name", signer.Name())
+		return signer
 	}
 
-	// Derive the key hash for the note signer name.
-	// Format: "<origin>+<key_hash_hex_prefix>"
-	pubKey := privKey.Public().(ed25519.PublicKey)
-	keyHash := sha256Short(pubKey)
-	signerName := fmt.Sprintf("%s+%x", *flagOrigin, keyHash)
-
-	signer, err := note.NewEd25519SignerFromKey(signerName, privKey)
+	// Local dev: generate ephemeral keypair.
+	skey, vkey, err := note.GenerateKey(rand.Reader, "ortholog-local-dev")
 	if err != nil {
-		return nil, nil, fmt.Errorf("create signer: %w", err)
+		logger.Error("failed to generate ephemeral key", "error", err)
+		os.Exit(1)
 	}
 
-	verifier, err := note.NewEd25519VerifierFromKey(signerName, pubKey)
+	signer, err := note.NewSigner(skey)
 	if err != nil {
-		return nil, nil, fmt.Errorf("create verifier: %w", err)
+		logger.Error("failed to create signer from generated key", "error", err)
+		os.Exit(1)
 	}
 
-	return signer, verifier, nil
-}
+	logger.Warn("generated ephemeral Ed25519 key — NOT for production",
+		"verifier_key", vkey,
+		"signer_name", signer.Name())
 
-// sha256Short returns the first 4 bytes of SHA-256(data) as a uint32.
-func sha256Short(data []byte) uint32 {
-	// Use a simple hash for key ID — not crypto-critical, just an identifier.
-	var h [32]byte
-	// Inline SHA-256 would require crypto/sha256 import; use a simpler approach
-	// for the key hash identifier.
-	for i, b := range data {
-		h[i%32] ^= b
-	}
-	return binary.BigEndian.Uint32(h[:4])
+	return signer
 }
 
 // -------------------------------------------------------------------------------------------------
 // 6) Helpers
 // -------------------------------------------------------------------------------------------------
+
+func addCacheHeaders(value string, fs http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Cache-Control", value)
+		fs.ServeHTTP(w, r)
+	}
+}
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")

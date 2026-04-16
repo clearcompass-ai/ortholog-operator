@@ -1,27 +1,4 @@
-# ======================================================================================
-# FILE PATH: deployment/local/docker-compose.yml
-#
-# DESCRIPTION:
-#   Local deployment of the Ortholog Operator with the dedicated Tessera personality.
-#   Three services: Postgres (state), Tessera personality (Merkle tree), Operator (protocol).
-#
-# KEY ARCHITECTURAL DECISIONS:
-#   - Dedicated Tessera personality replaces the CT personality (tesseract/gcp) which
-#     required X.509 roots and certificate chains. The Ortholog personality accepts
-#     32-byte SHA-256 hashes and serves the c2sp.org/tlog-tiles static read API.
-#   - No nginx router: the personality serves both writes (POST /add) and reads
-#     (/checkpoint, /tile/*) from a single process. For production, CDN or nginx
-#     goes in front of the GCS tile storage.
-#   - POSIX storage for local dev: tiles written to /data volume. No cloud credentials.
-#   - Ed25519 ephemeral key for checkpoint signing in local dev. Production loads
-#     from --key-path flag.
-# ======================================================================================
-
 services:
-  # ==================================================================================
-  # 1. CORE STATE: PostgreSQL
-  # Stores queues, SMT state, and entry indexes. No entry bytes are stored here.
-  # ==================================================================================
   postgres:
     image: postgres:18-alpine
     environment:
@@ -38,21 +15,13 @@ services:
       timeout: 5s
       retries: 5
 
-  # ==================================================================================
-  # 2. MERKLE TREE: Ortholog Tessera Personality
-  # Accepts 32-byte SHA-256 hashes via POST /add. Tessera handles tile layout,
-  # checkpoint signing (Ed25519), integration batching, and the static read API.
-  # ==================================================================================
   tessera-personality:
     build:
       context: ../../
       dockerfile: tessera-personality/Dockerfile
     command:
-      - "--storage=posix"
-      - "--data-dir=/data"
+      - "--storage_dir=/data"
       - "--listen=:8081"
-      - "--origin=ortholog-local-dev"
-      # No --key-path: generates ephemeral Ed25519 key for local dev.
     ports:
       - "8081:8081"
     volumes:
@@ -63,12 +32,6 @@ services:
       timeout: 3s
       retries: 10
 
-  # ==================================================================================
-  # 3. ORTHOLOG OPERATOR
-  # The core protocol operator. Connects to Postgres and the Tessera personality.
-  # Entry bytes stored in InMemoryEntryStore (local dev). SHA-256 hashes sent to
-  # Tessera for Merkle tree inclusion.
-  # ==================================================================================
   operator:
     build:
       context: ../../
