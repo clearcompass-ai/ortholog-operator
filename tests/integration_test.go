@@ -86,7 +86,7 @@ func TestAdmission_WrongSignerKey_SDK_D5(t *testing.T) {
 	entry := makeEntry(t, envelope.ControlHeader{SignerDID: "did:example:alice"}, nil)
 	canonical := envelope.Serialize(entry)
 	fakeSig := make([]byte, 64)
-	wire := envelope.AppendSignature(canonical, envelope.SigAlgoECDSA, fakeSig)
+	wire := envelope.MustAppendSignature(canonical, envelope.SigAlgoECDSA, fakeSig)
 	gotCanonical, algoID, gotSig, err := envelope.StripSignature(wire)
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +99,7 @@ func TestAdmission_WrongSignerKey_SDK_D5(t *testing.T) {
 func TestAdmission_CorruptSignature_SDK_D5(t *testing.T) {
 	entry := makeEntry(t, envelope.ControlHeader{SignerDID: "did:example:alice"}, nil)
 	canonical := envelope.Serialize(entry)
-	wire := envelope.AppendSignature(canonical, envelope.SigAlgoECDSA,
+	wire := envelope.MustAppendSignature(canonical, envelope.SigAlgoECDSA,
 		[]byte("not-a-real-signature-but-64-bytes-long-padding-here-1234567890ab"))
 	_, _, sig, err := envelope.StripSignature(wire)
 	if err != nil {

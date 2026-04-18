@@ -64,7 +64,7 @@ func buildWireEntry(t *testing.T, header envelope.ControlHeader, payload []byte)
 	for i := range fakeSig {
 		fakeSig[i] = byte(i + 1)
 	}
-	return envelope.AppendSignature(canonical, envelope.SigAlgoECDSA, fakeSig)
+	return envelope.MustAppendSignature(canonical, envelope.SigAlgoECDSA, fakeSig)
 }
 
 // buildModeBWireEntry creates a v5 entry with a valid compute stamp for Mode B.
@@ -125,7 +125,7 @@ func buildModeBWireEntry(t *testing.T, header envelope.ControlHeader, payload []
 			for i := range fakeSig {
 				fakeSig[i] = byte(i + 1)
 			}
-			return envelope.AppendSignature(canonical, envelope.SigAlgoECDSA, fakeSig)
+			return envelope.MustAppendSignature(canonical, envelope.SigAlgoECDSA, fakeSig)
 		}
 	}
 	t.Fatal("could not find valid nonce within 20M iterations")
@@ -731,7 +731,7 @@ func TestHTTP_Submission_ModeB_StaleEpoch_403(t *testing.T) {
 			staleEpoch, 0, // window=0 → exact match required
 		) == nil {
 			fakeSig := make([]byte, 64)
-			wire = envelope.AppendSignature(canonical, envelope.SigAlgoECDSA, fakeSig)
+			wire = envelope.MustAppendSignature(canonical, envelope.SigAlgoECDSA, fakeSig)
 			break
 		}
 	}

@@ -2,88 +2,71 @@
 FILE PATH: cmd/rebuild-tiles/main.go
 
 DESCRIPTION:
-    One-shot utility that rebuilds the Tessera tile store after the
-    v0.3.0-tessera operator migration. Drives the patched builder loop
-    to completion over the existing admitted entries in Postgres, against
-    a FRESH Tessera storage root.
 
-    Necessary because the v0.3.0 migration changes the Merkle leaf scheme
-    from sha256(canonical+signature_envelope) to envelope.EntryIdentity,
-    which makes every previously-published inclusion proof invalid. Live
-    operators must rebuild their tiles before the new code path serves
-    verification traffic.
+	One-shot utility that rebuilds the Tessera tile store after the
+	v0.3.0-tessera operator migration. Drives the patched builder loop
+	to completion over existing admitted entries in Postgres, against
+	a FRESH Tessera personality (empty storage).
+
+	Necessary because the v0.3.0 migration changes the Merkle leaf scheme
+	from sha256(canonical+signature_envelope) to envelope.EntryIdentity,
+	which makes every previously-published inclusion proof invalid.
 
 WHY A SEPARATE BINARY:
-    The production operator's main.go starts the admission HTTP server,
-    the anchor publisher, the commitment publisher, and the witness
-    cosigner concurrently with the builder loop. For a tile rebuild we
-    want ONLY the builder loop — no admission (no new entries should
-    enter), no anchor publishing (source tree heads would stamp over
-    mid-rebuild state), no witness cosig requests (wasted work on
-    un-finalized tree heads).
 
-    Running the operator with a flag to disable everything except the
-    builder loop is equally valid; a dedicated binary makes the intent
-    explicit and the blast radius small.
+	The production operator runs admission, anchor publisher, commitment
+	publisher, and witness cosigner concurrently with the builder loop.
+	For a tile rebuild we want ONLY the builder loop — no new admissions,
+	no anchor publishing, no witness cosig requests. A dedicated binary
+	makes the intent explicit.
 
 SAFETY CONTRACT:
-    1. Idempotent against its OWN re-runs. If interrupted halfway, a
-       second invocation resumes from the queue state left by the first.
-    2. NOT idempotent against running while the production operator is
-       also running. The builder loop uses the advisory lock the
-       operator acquires, so two instances cannot step on each other —
-       but the production operator will advance queue state past what
-       the rebuild instance has processed, potentially skipping tiles.
-       Operators MUST stop the production binary before running this.
-    3. Fresh Tessera storage root is the caller's responsibility. If the
-       provided root contains existing tile data, the rebuild will
-       APPEND to it rather than replace — almost certainly wrong. Verify
-       the root is empty before running.
+ 1. Idempotent against its OWN re-runs.
+ 2. NOT idempotent against the production operator running
+    concurrently. Stop the production binary first.
+ 3. Point --tessera-url at a FRESH personality with empty storage. If
+    the target contains existing tile data, rebuild will APPEND rather
+    than replace.
+ 4. BYTE STORE: uses tessera.NewInMemoryEntryStore() here, which is
+    EMPTY at startup. For a real rebuild, the byte store MUST be the
+    same persistent backend the production operator wrote to —
+    otherwise the fetcher will find nothing to replay. Wire your
+    persistent store at the marked line.
 
 USAGE:
 
-    # 1. Stop the production operator.
-    systemctl stop ortholog-operator
+	# 1. Stop the production operator.
+	systemctl stop ortholog-operator
 
-    # 2. Back up Postgres (operator state of record — do not touch).
-    pg_dump ortholog > /var/backups/operator-pre-rebuild-$(date -I).sql
+	# 2. Back up Postgres.
+	pg_dump ortholog > /var/backups/operator-pre-rebuild-$(date -I).sql
 
-    # 3. Wipe the Tessera storage root (keep the byte store — that has
-    #    the wire bytes we replay from, and the new identity scheme
-    #    treats them the same way).
-    rm -rf /var/lib/operator/tessera/*
+	# 3. Start a FRESH Tessera personality on a new port with empty
+	#    storage (or wipe the existing personality's storage and restart).
 
-    # 4. Reset the builder queue so EVERY admitted entry gets replayed
-    #    through the new leaf scheme. This is a destructive SQL
-    #    operation — the pre-rebuild backup is your escape hatch.
-    psql ortholog <<SQL
-        UPDATE builder_queue SET status = 'pending', dequeued_at = NULL;
-        DELETE FROM derivation_commitments WHERE true;
-    SQL
+	# 4. Reset queue + tree state so every admitted entry replays.
+	psql ortholog <<SQL
+	    UPDATE builder_queue SET status = 0, processed_at = NULL;
+	    DELETE FROM derivation_commitments WHERE true;
+	    DELETE FROM smt_leaves WHERE true;
+	    DELETE FROM smt_nodes WHERE true;
+	    DELETE FROM delta_window_buffers WHERE true;
+	SQL
 
-    # 5. Run the rebuild.
-    ./rebuild-tiles \
-        --database-url="$OPERATOR_DATABASE_URL" \
-        --log-did="did:web:your-log.example" \
-        --operator-did="did:web:your-log.example" \
-        --tessera-root=/var/lib/operator/tessera \
-        --bytestore-root=/var/lib/operator/bytestore \
-        --batch-size=1000
+	# 5. Run the rebuild.
+	./rebuild-tiles \
+	    --database-url="$OPERATOR_DATABASE_URL" \
+	    --log-did="did:web:your-log.example" \
+	    --tessera-url="http://fresh-tessera:8081" \
+	    --batch-size=1000
 
-    # 6. When the rebuild exits cleanly (all entries replayed, queue
-    #    drained), start the production operator.
-    systemctl start ortholog-operator
-
-    # 7. Verify: compute envelope.EntryIdentity(entry) client-side for a
-    #    known sequence, fetch the inclusion proof from the new Tessera
-    #    tree, confirm verification succeeds.
+	# 6. Start the production operator pointing at the new personality.
 
 EXIT CODES:
-    0 — rebuild completed, queue drained, final tree head published.
-    1 — configuration error (missing flag, unreachable DB, invalid DID).
-    2 — Postgres transaction failure during replay.
-    3 — Tessera append failure. Rebuild is in a partial state; do NOT
-        serve traffic from it. Investigate, then re-run from step 3.
+
+	0 — rebuild completed cleanly.
+	1 — configuration error.
+	3 — builder loop failure. Rebuild is in a partial state; investigate.
 */
 package main
 
@@ -112,28 +95,24 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	var (
-		databaseURL    = flag.String("database-url", os.Getenv("OPERATOR_DATABASE_URL"), "Postgres connection string")
-		logDID         = flag.String("log-did", os.Getenv("OPERATOR_LOG_DID"), "log DID (must match production)")
-		operatorDID    = flag.String("operator-did", os.Getenv("OPERATOR_DID"), "operator DID (signer)")
-		tesseraRoot    = flag.String("tessera-root", os.Getenv("OPERATOR_TESSERA_ROOT"), "FRESH Tessera storage root (must be empty)")
-		bytestoreRoot  = flag.String("bytestore-root", os.Getenv("OPERATOR_BYTESTORE_ROOT"), "byte store root (unchanged)")
-		batchSize      = flag.Int("batch-size", 1000, "builder batch size")
-		pollInterval   = flag.Duration("poll-interval", 10*time.Millisecond, "queue poll interval")
-		idleShutdownAfter = flag.Duration("idle-shutdown-after", 30*time.Second, "exit cleanly after this much idle time (no pending entries)")
+		databaseURL       = flag.String("database-url", os.Getenv("OPERATOR_DATABASE_URL"), "Postgres connection string")
+		logDID            = flag.String("log-did", os.Getenv("OPERATOR_LOG_DID"), "log DID (must match production)")
+		tesseraURL        = flag.String("tessera-url", os.Getenv("OPERATOR_TESSERA_URL"), "Tessera personality base URL (MUST be empty / fresh)")
+		batchSize         = flag.Int("batch-size", 1000, "builder batch size")
+		pollInterval      = flag.Duration("poll-interval", 10*time.Millisecond, "queue poll interval")
+		idleShutdownAfter = flag.Duration("idle-shutdown-after", 30*time.Second, "exit cleanly after this much idle time")
+		nodeCacheSize     = flag.Int("node-cache-size", 100_000, "SMT node cache max size")
+		deltaWindow       = flag.Int("delta-window", 10, "delta buffer window size (match production)")
 	)
 	flag.Parse()
 
-	if *databaseURL == "" || *logDID == "" || *tesseraRoot == "" || *bytestoreRoot == "" {
+	if *databaseURL == "" || *logDID == "" || *tesseraURL == "" {
 		logger.Error("required flags missing",
 			"database_url_set", *databaseURL != "",
 			"log_did_set", *logDID != "",
-			"tessera_root_set", *tesseraRoot != "",
-			"bytestore_root_set", *bytestoreRoot != "",
+			"tessera_url_set", *tesseraURL != "",
 		)
 		os.Exit(1)
-	}
-	if *operatorDID == "" {
-		*operatorDID = *logDID
 	}
 	if err := envelope.ValidateDestination(*logDID); err != nil {
 		logger.Error("invalid log DID", "error", err)
@@ -142,7 +121,7 @@ func main() {
 
 	logger.Info("tile rebuild starting",
 		"log_did", *logDID,
-		"tessera_root", *tesseraRoot,
+		"tessera_url", *tesseraURL,
 		"batch_size", *batchSize,
 	)
 
@@ -160,49 +139,53 @@ func main() {
 
 	// ── Stores ────────────────────────────────────────────────────────
 	leafStore := store.NewPostgresLeafStore(pool)
-	nodeCache := store.NewPostgresNodeCache(pool)
+	nodeCache := store.NewPostgresNodeCache(pool, *nodeCacheSize)
 
-	byteStore, err := tessera.NewFSByteStore(*bytestoreRoot)
-	if err != nil {
-		logger.Error("byte store", "error", err)
-		os.Exit(1)
-	}
-	_ = byteStore // reserved for fetcher wiring below
+	// CRITICAL: In production, replace NewInMemoryEntryStore with your
+	// persistent byte store implementation. The rebuild loop reads entry
+	// bytes from here when replaying each sequence through ProcessBatch;
+	// if the store is empty the replay produces zero output.
+	byteStore := tessera.NewInMemoryEntryStore()
+	logger.Warn("byte store is InMemoryEntryStore — rebuild will find no entries to replay unless you wire the production byte store here")
 
-	tesseraClient, err := tessera.NewClient(ctx, *tesseraRoot, *logDID, logger)
-	if err != nil {
-		logger.Error("tessera", "error", err)
-		os.Exit(1)
-	}
-	defer tesseraClient.Close()
+	// ── Tessera client + adapter ──────────────────────────────────────
+	// Rebuild only uses AppendLeaf and Head; a nil TileReader is fine
+	// because the adapter's proof methods are not called.
+	tesseraClient := tessera.NewClient(tessera.ClientConfig{
+		BaseURL: *tesseraURL,
+		Timeout: 30 * time.Second,
+	}, logger)
+	merkle := tessera.NewTesseraAdapter(tesseraClient, nil, logger)
 
 	// ── Builder dependencies ──────────────────────────────────────────
 	fetcher := store.NewPostgresEntryFetcher(pool, byteStore, *logDID)
-	schema := builder.NewInMemorySchemaResolver()
-	buffer := sdkbuilder.NewDeltaWindowBuffer(10)
-	bufferStore := builder.NewDeltaBufferStore(pool)
+	bufferStore := builder.NewDeltaBufferStore(pool, *deltaWindow, logger)
+	buffer, loadErr := bufferStore.Load(ctx)
+	if loadErr != nil {
+		logger.Warn("delta buffer load — starting cold", "error", loadErr)
+		buffer = sdkbuilder.NewDeltaWindowBuffer(*deltaWindow)
+	}
 	queue := builder.NewQueue(pool)
 	tree := smt.NewTree(leafStore, nodeCache)
 
-	// No commitment publisher (no one is running the submission path).
-	// No witness cosigner (no one is watching the tree heads).
 	bl := builder.NewBuilderLoop(
 		builder.LoopConfig{
 			LogDID:       *logDID,
 			BatchSize:    *batchSize,
 			PollInterval: *pollInterval,
-			DeltaWindow:  10,
+			DeltaWindow:  *deltaWindow,
 		},
 		pool, tree, leafStore, nodeCache,
-		queue, fetcher, schema, buffer, bufferStore,
-		nil, // commitPub
-		tesseraClient,
-		nil, // witness cosigner
+		queue, fetcher,
+		nil, // schema resolver
+		buffer, bufferStore,
+		nil,    // commitPub — no commentary on partial mid-rebuild state.
+		merkle, // MerkleAppender
+		nil,    // witness cosigner — no one watches partial tree heads.
 		logger,
 	)
 
-	// ── Idle watchdog: exit cleanly when the queue has been empty for
-	//    IdleShutdownAfter. Without this the loop would run forever.
+	// ── Idle watchdog: exit when entries counter stops advancing. ────
 	go func() {
 		lastSeenEntries := int64(-1)
 		lastAdvanced := time.Now()
@@ -220,7 +203,7 @@ func main() {
 					continue
 				}
 				if time.Since(lastAdvanced) >= *idleShutdownAfter {
-					logger.Info("idle shutdown threshold reached — rebuild complete",
+					logger.Info("idle shutdown threshold reached",
 						"total_entries", entries,
 						"idle_for", time.Since(lastAdvanced),
 					)
@@ -236,19 +219,18 @@ func main() {
 		os.Exit(3)
 	}
 
-	// ── Final sanity: publish a fresh tree head and log it. ───────────
-	head, headErr := tesseraClient.Head()
+	head, headErr := merkle.Head()
 	if headErr != nil {
 		logger.Error("final head fetch", "error", headErr)
 		os.Exit(3)
 	}
 	fmt.Printf("\n=== TILE REBUILD COMPLETE ===\n")
 	fmt.Printf("  log_did:     %s\n", *logDID)
+	fmt.Printf("  tessera_url: %s\n", *tesseraURL)
 	fmt.Printf("  tree_size:   %d\n", head.TreeSize)
 	fmt.Printf("  root_hash:   %x\n", head.RootHash[:])
 	batches, entries, errs := bl.Stats()
 	fmt.Printf("  batches:     %d\n", batches)
 	fmt.Printf("  entries:     %d\n", entries)
 	fmt.Printf("  errors:      %d\n", errs)
-	fmt.Printf("\nStart the production operator. Publish the new tree head.\n")
 }

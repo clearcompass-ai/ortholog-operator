@@ -2,27 +2,49 @@
 FILE PATH: cmd/operator/main.go
 
 DESCRIPTION:
-    Operator binary entry point. Wires config → stores → subsystems → HTTP
-    server, then runs the builder loop, anchor publisher, commitment
-    publisher, and witness cosigner as cooperating goroutines under a
-    shared context.
 
-SDK v0.3.0 WIRING CHANGES:
-    1. anchor.PublisherConfig now requires LogDID — threaded from cfg.LogDID.
-    2. builder.NewCommitmentPublisher signature changed: (operatorDID,
-       logDID, ...) — both DIDs passed explicitly.
-    3. api.SubmissionDeps now has FreshnessTolerance (defaults to
-       policy.FreshnessInteractive=5min if left zero). Explicit here for
-       auditability.
-    4. Phase 4 DID verifier registry scaffolded behind a nil check —
-       when consumers are ready, swap the nil for
-       did.DefaultVerifierRegistry(cfg.LogDID, resolver).
+	Operator binary entry point. Wires config → Postgres → stores → byte
+	store → Tessera personality → builder deps → HTTP handlers → goroutines.
+	Runs the admission HTTP server, builder loop, and (optional) anchor
+	publisher under a shared cancellable context.
+
+SDK v0.3.0 WIRING CHANGES (addressed in this rewrite):
+ 1. anchor.PublisherConfig requires LogDID — threaded from cfg.LogDID.
+ 2. builder.NewCommitmentPublisher is (operatorDID, logDID, cfg, submitFn,
+    logger) — both DIDs passed explicitly.
+ 3. api.SubmissionDeps has FreshnessTolerance (defaults to
+    policy.FreshnessInteractive = 5 min if zero). Explicit here for
+    auditability.
+ 4. Phase 4 DID verifier scaffolded behind a nil — when ready, swap
+    for did.DefaultVerifierRegistry(cfg.LogDID, resolver).
+
+OPERATOR INTERNAL SIGNATURES (the ones the last attempt got wrong):
+  - tessera.NewClient(ClientConfig{BaseURL, Timeout}, logger) → *Client.
+    Struct config, single return, no Close method.
+  - tessera.NewTesseraAdapter(client, tileReader, logger) → MerkleAppender.
+    Builder/anchor talk to the adapter, not the raw client.
+  - tessera.NewInMemoryEntryStore() → *InMemoryEntryStore. The only
+    byte-store implementation shipped today. A persistent backend is the
+    operator's responsibility to swap in.
+  - store.NewPostgresNodeCache(pool, cacheSize) → *PostgresNodeCache.
+    Cache size MUST be passed; zero would be a pathological no-cache path.
+  - builder.NewDeltaBufferStore(pool, windowSize, logger) → *DeltaBufferStore.
+  - bufferStore.Load(ctx) → (*sdkbuilder.DeltaWindowBuffer, error).
+    Returns a fresh buffer. We do NOT pass our own buffer in.
+  - middleware.NewDifficultyController(queue, cfg, logger) → takes the
+    queue FIRST (it polls queue depth for auto-adjustment).
+  - middleware.DefaultDifficultyConfig() returns a ready-to-use config
+    with all seven fields populated (InitialDifficulty, Min/Max,
+    LowThreshold, HighThreshold, AdjustInterval, HashFunction).
 
 INVARIANTS:
-    - cfg.LogDID MUST be non-empty: submission handler panics at
-      construction otherwise (destination-binding enforcement gate).
-    - cfg.OperatorDID SHOULD differ from cfg.LogDID but may collapse in
-      single-exchange deployments where the operator IS the exchange.
+  - cfg.LogDID MUST be non-empty: submission handler panics at
+    construction otherwise (destination-binding enforcement gate).
+  - cfg.OperatorDID defaults to cfg.LogDID for single-exchange
+    deployments where the operator IS the exchange.
+  - ByteStore here is NewInMemoryEntryStore() — bytes are lost on
+    restart. Production deployments MUST replace this with a
+    persistent implementation of tessera.EntryReader + EntryWriter.
 */
 package main
 
@@ -30,7 +52,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -49,8 +70,8 @@ import (
 	"github.com/clearcompass-ai/ortholog-operator/api/middleware"
 	"github.com/clearcompass-ai/ortholog-operator/builder"
 	"github.com/clearcompass-ai/ortholog-operator/store"
+	"github.com/clearcompass-ai/ortholog-operator/store/indexes"
 	"github.com/clearcompass-ai/ortholog-operator/tessera"
-	"github.com/clearcompass-ai/ortholog-operator/witness"
 )
 
 // ─────────────────────────────────────────────────────────────────────
@@ -69,10 +90,12 @@ type Config struct {
 	EpochAcceptanceWindow int
 	AnchorInterval        time.Duration
 	AnchorSources         []anchor.AnchorSource
-	TesseraStorageRoot    string
+	TesseraBaseURL        string // HTTP URL of the Tessera personality.
+	TileCacheSize         int
+	SMTNodeCacheSize      int
+	DeltaWindow           int
 	WitnessEndpoints      []string
 	WitnessQuorumK        int
-	ByteStoreRoot         string
 }
 
 func loadConfig() (*Config, error) {
@@ -81,15 +104,17 @@ func loadConfig() (*Config, error) {
 		DatabaseURL:           os.Getenv("OPERATOR_DATABASE_URL"),
 		LogDID:                os.Getenv("OPERATOR_LOG_DID"),
 		OperatorDID:           os.Getenv("OPERATOR_DID"),
-		MaxEntrySize:          1 << 20,
-		BatchSize:              1000,
-		PollInterval:           100 * time.Millisecond,
-		EpochWindowSeconds:    3600,
+		MaxEntrySize:          1 << 20, // 1 MB, matches SDK-D11.
+		BatchSize:             1000,
+		PollInterval:          100 * time.Millisecond,
+		EpochWindowSeconds:    3600, // 1h — matches testEpochWindowSeconds.
 		EpochAcceptanceWindow: 1,
-		AnchorInterval:         1 * time.Hour,
-		TesseraStorageRoot:     envOr("OPERATOR_TESSERA_ROOT", "/var/lib/operator/tessera"),
-		WitnessQuorumK:         1,
-		ByteStoreRoot:          envOr("OPERATOR_BYTESTORE_ROOT", "/var/lib/operator/bytestore"),
+		AnchorInterval:        1 * time.Hour,
+		TesseraBaseURL:        envOr("OPERATOR_TESSERA_URL", "http://localhost:8081"),
+		TileCacheSize:         10_000,
+		SMTNodeCacheSize:      100_000,
+		DeltaWindow:           10,
+		WitnessQuorumK:        1,
 	}
 	if cfg.DatabaseURL == "" {
 		return nil, fmt.Errorf("OPERATOR_DATABASE_URL required")
@@ -98,7 +123,7 @@ func loadConfig() (*Config, error) {
 		return nil, fmt.Errorf("OPERATOR_LOG_DID required (destination-binding)")
 	}
 	if cfg.OperatorDID == "" {
-		cfg.OperatorDID = cfg.LogDID // Default to single-exchange deployment.
+		cfg.OperatorDID = cfg.LogDID
 	}
 	return cfg, nil
 }
@@ -124,7 +149,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Fail-fast sanity check on the LogDID before we touch Postgres.
+	// Fail-fast sanity check on LogDID before we touch Postgres.
 	if valErr := envelope.ValidateDestination(cfg.LogDID); valErr != nil {
 		logger.Error("invalid OPERATOR_LOG_DID", "error", valErr)
 		os.Exit(1)
@@ -134,6 +159,7 @@ func main() {
 		"log_did", cfg.LogDID,
 		"operator_did", cfg.OperatorDID,
 		"addr", cfg.ServerAddr,
+		"tessera_url", cfg.TesseraBaseURL,
 		"sdk_version", "v0.3.0-tessera",
 	)
 
@@ -149,44 +175,63 @@ func main() {
 	}
 	defer pool.Close()
 
+	if err := store.RunMigrations(ctx, pool); err != nil {
+		logger.Error("migrations", "error", err)
+		os.Exit(1)
+	}
+
 	// ── Stores ────────────────────────────────────────────────────────
 	entryStore := store.NewEntryStore(pool)
 	creditStore := store.NewCreditStore(pool)
 	commitStore := store.NewCommitmentStore(pool)
 	leafStore := store.NewPostgresLeafStore(pool)
-	nodeCache := store.NewPostgresNodeCache(pool)
+	nodeCache := store.NewPostgresNodeCache(pool, cfg.SMTNodeCacheSize)
 
-	// ── Byte store + Tessera ──────────────────────────────────────────
-	byteStore, err := tessera.NewFSByteStore(cfg.ByteStoreRoot)
-	if err != nil {
-		logger.Error("byte store", "error", err)
-		os.Exit(1)
-	}
+	// ── Byte store ────────────────────────────────────────────────────
+	//
+	// WARNING: InMemoryEntryStore is the ONLY implementation shipped today.
+	// It holds entry bytes in a sync.RWMutex-guarded map; everything is
+	// lost on process exit. For production, build a persistent
+	// EntryReader/EntryWriter (disk, S3, GCS) and substitute it here.
+	//
+	// Single process contains both byte writer (admission path) and byte
+	// reader (builder fetcher, query API). Crossing process boundaries
+	// would require a shared backing store.
+	byteStore := tessera.NewInMemoryEntryStore()
+	logger.Warn("byte store is InMemoryEntryStore — bytes are lost on restart. Wire a persistent backend for production.")
 
-	tesseraClient, err := tessera.NewClient(ctx, cfg.TesseraStorageRoot, cfg.LogDID, logger)
-	if err != nil {
-		logger.Error("tessera", "error", err)
-		os.Exit(1)
-	}
-	defer tesseraClient.Close()
+	// ── Tessera personality ───────────────────────────────────────────
+	//
+	// Client talks HTTP to the personality (/add for appends, /checkpoint
+	// for tree head). TileReader fetches immutable tiles for on-demand
+	// proof computation. Adapter implements MerkleAppender + the proof
+	// interfaces server.go needs for tree endpoints.
+	tileBackend := tessera.NewHTTPTileBackend(cfg.TesseraBaseURL)
+	tileReader := tessera.NewTileReader(tileBackend, cfg.TileCacheSize)
+	tesseraClient := tessera.NewClient(tessera.ClientConfig{
+		BaseURL: cfg.TesseraBaseURL,
+		Timeout: 30 * time.Second,
+	}, logger)
+	tesseraAdapter := tessera.NewTesseraAdapter(tesseraClient, tileReader, logger)
 
 	// ── Builder dependencies ──────────────────────────────────────────
 	fetcher := store.NewPostgresEntryFetcher(pool, byteStore, cfg.LogDID)
-	schema := builder.NewInMemorySchemaResolver() // Replace with SDK schema resolver when ready.
-	buffer := sdkbuilder.NewDeltaWindowBuffer(10)
-	bufferStore := builder.NewDeltaBufferStore(pool)
+	bufferStore := builder.NewDeltaBufferStore(pool, cfg.DeltaWindow, logger)
 	queue := builder.NewQueue(pool)
 	tree := smt.NewTree(leafStore, nodeCache)
 
-	// Restore buffer from persistence (cold start = strict OCC per SDK-D9).
-	if loadErr := bufferStore.Load(ctx, buffer); loadErr != nil {
+	// Load buffer from persistence (cold start = strict OCC per SDK-D9).
+	// Load returns a fresh *DeltaWindowBuffer — we do NOT pass our own in.
+	buffer, loadErr := bufferStore.Load(ctx)
+	if loadErr != nil {
 		logger.Warn("delta buffer load — starting cold", "error", loadErr)
+		buffer = sdkbuilder.NewDeltaWindowBuffer(cfg.DeltaWindow)
 	}
 
-	// ── Commitment publisher — LogDID threaded (v0.3.0) ───────────────
+	// ── Commitment publisher (v0.3.0: LogDID threaded) ────────────────
 	commitPub := builder.NewCommitmentPublisher(
 		cfg.OperatorDID,
-		cfg.LogDID, // NEW: destination-binding for self-published commentary.
+		cfg.LogDID,
 		builder.CommitmentPublisherConfig{
 			IntervalEntries: 1000,
 			IntervalTime:    1 * time.Hour,
@@ -195,51 +240,64 @@ func main() {
 		logger,
 	).WithCommitmentStore(commitStore)
 
-	// ── Admission controller ──────────────────────────────────────────
+	// ── Difficulty controller (queue-depth-driven) ────────────────────
+	//
+	// DefaultDifficultyConfig() is the ready-made production preset:
+	//   Initial=16, Min=8, Max=24, Low=100, High=10000, Interval=30s, SHA-256.
+	// NewDifficultyController takes (queue, cfg, logger) — queue first.
 	diffController := middleware.NewDifficultyController(
-		middleware.DifficultyConfig{
-			MinDifficulty:   8,
-			MaxDifficulty:   24,
-			TargetQueueSize: 500,
-		}, logger,
+		queue, middleware.DefaultDifficultyConfig(), logger,
 	)
 
-	// ── Witness cosigner ──────────────────────────────────────────────
-	var cosigner builder.WitnessCosigner
-	if len(cfg.WitnessEndpoints) > 0 {
-		cosigner = witness.NewRequester(cfg.WitnessEndpoints, cfg.WitnessQuorumK, logger)
-	}
+	// ── Witness cosigner (optional) ───────────────────────────────────
+	//
+	// Left nil for now. The operator's witness/ package today implements
+	// the witness-as-server side (serve.go, head_sync.go) — the
+	// witness-as-client requester (one operator asking N peer witnesses
+	// to cosign its checkpoints) is a separate subsystem not yet wired.
+	// BuilderLoop tolerates a nil cosigner: the cosignature step is
+	// skipped and self-signed checkpoints are published unwitnessed.
+	//
+	// TODO: wire a real requester when multi-witness deployments go live.
+	// At that point cfg.WitnessEndpoints + cfg.WitnessQuorumK become live.
+	var cosigner builder.WitnessCosigner = nil
 
 	// ── Builder loop ──────────────────────────────────────────────────
 	loopCfg := builder.DefaultLoopConfig(cfg.LogDID)
 	loopCfg.BatchSize = cfg.BatchSize
 	loopCfg.PollInterval = cfg.PollInterval
+	loopCfg.DeltaWindow = cfg.DeltaWindow
 
 	bl := builder.NewBuilderLoop(
 		loopCfg, pool, tree, leafStore, nodeCache,
-		queue, fetcher, schema, buffer, bufferStore,
-		commitPub, tesseraClient, cosigner, logger,
+		queue, fetcher,
+		nil, // schema resolver — nil is valid; SDK builder tolerates it.
+		buffer, bufferStore,
+		commitPub,
+		tesseraAdapter, // MerkleAppender
+		cosigner,
+		logger,
 	)
 
-	// ── Anchor publisher — LogDID threaded (v0.3.0) ───────────────────
+	// ── Anchor publisher (v0.3.0: LogDID threaded) ────────────────────
 	anchorPub := anchor.NewPublisher(
 		anchor.PublisherConfig{
 			OperatorDID:   cfg.OperatorDID,
-			LogDID:        cfg.LogDID, // NEW: destination-binding.
+			LogDID:        cfg.LogDID,
 			Interval:      cfg.AnchorInterval,
 			AnchorSources: cfg.AnchorSources,
 		},
-		tesseraClient,
+		tesseraAdapter,
 		anchor.SubmitViaHTTP(fmt.Sprintf("http://localhost%s", cfg.ServerAddr)),
 		logger,
 	)
 
-	// ── Submission handler — FreshnessTolerance explicit (v0.3.0) ─────
+	// ── Submission handler (v0.3.0: 13-step pipeline) ─────────────────
 	submitHandler := api.NewSubmissionHandler(&api.SubmissionDeps{
 		Storage: api.StorageDeps{
 			DB:          pool,
 			EntryStore:  entryStore,
-			EntryWriter: tesseraClient, // satisfies tessera.EntryWriter via byteStore
+			EntryWriter: byteStore, // same store the fetcher reads from.
 		},
 		Admission: api.AdmissionConfig{
 			DiffController:        diffController,
@@ -248,44 +306,76 @@ func main() {
 		},
 		Identity: api.IdentityDeps{
 			CreditStore: creditStore,
-			DIDResolver: nil, // Phase 4: swap for did.DefaultVerifierRegistry wrapper.
+			DIDResolver: nil, // Phase 4: wire did.DefaultVerifierRegistry.
 		},
 		Queue:              queue,
 		LogDID:             cfg.LogDID,
 		MaxEntrySize:       cfg.MaxEntrySize,
 		Logger:             logger,
-		FreshnessTolerance: policy.FreshnessInteractive, // 5-min late-replay window.
+		FreshnessTolerance: policy.FreshnessInteractive, // 5-min window.
 	})
 
-	// ── Query handlers ────────────────────────────────────────────────
+	// ── Shared stores for read handlers ───────────────────────────────
+	queryAPI := indexes.NewPostgresQueryAPI(pool, byteStore, cfg.LogDID)
+	treeHeadStore := store.NewTreeHeadStore(pool)
+
+	// ── Handler struct for api.Server ─────────────────────────────────
 	queryDeps := &api.QueryDeps{
-		DB:          pool,
-		EntryStore:  entryStore,
-		EntryReader: tesseraClient,
-		Logger:      logger,
+		EntryStore:     entryStore,
+		QueryAPI:       queryAPI,
+		DiffController: diffController,
+		Logger:         logger,
+	}
+	treeDeps := &api.TreeDeps{
+		TreeHeadStore: treeHeadStore,
+		Inclusion:     tesseraAdapter,
+		Consistency:   tesseraAdapter,
+		Logger:        logger,
+	}
+	smtDeps := &api.SMTDeps{Tree: tree, LeafStore: leafStore, Logger: logger}
+	entryReadDeps := &api.EntryReadDeps{
+		Fetcher:  fetcher,
+		QueryAPI: queryAPI,
+		LogDID:   cfg.LogDID,
+		Logger:   logger,
+	}
+	commitDeps := &api.CommitmentDeps{CommitmentStore: commitStore, Logger: logger}
+
+	handlers := api.Handlers{
+		Submission:      submitHandler,
+		TreeHead:        api.NewTreeHeadHandler(treeDeps),
+		TreeInclusion:   api.NewTreeInclusionHandler(treeDeps),
+		TreeConsistency: api.NewTreeConsistencyHandler(treeDeps),
+		SMTProof:        api.NewSMTProofHandler(smtDeps),
+		SMTBatchProof:   api.NewSMTBatchProofHandler(smtDeps),
+		SMTRoot:         api.NewSMTRootHandler(smtDeps),
+		CosignatureOf:   api.NewQueryCosignatureOfHandler(queryDeps),
+		TargetRoot:      api.NewQueryTargetRootHandler(queryDeps),
+		SignerDID:       api.NewQuerySignerDIDHandler(queryDeps),
+		SchemaRef:       api.NewQuerySchemaRefHandler(queryDeps),
+		Scan:            api.NewQueryScanHandler(queryDeps),
+		Difficulty:      api.NewDifficultyHandler(queryDeps),
+		WitnessCosign:   nil, // TODO: wire witness.NewCosignServer when this operator is also a witness.
+		EntryBySequence: api.NewEntryBySequenceHandler(entryReadDeps),
+		EntryBatch:      api.NewEntryBatchHandler(entryReadDeps),
+		SMTLeaf:         api.NewSMTLeafHandler(smtDeps),
+		SMTLeafBatch:    api.NewSMTLeafBatchHandler(smtDeps),
+		CommitmentQuery: api.NewCommitmentQueryHandler(commitDeps),
 	}
 
-	// ── HTTP router ───────────────────────────────────────────────────
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/entries", submitHandler)
-	mux.HandleFunc("GET /v1/entries", api.NewRangeQueryHandler(queryDeps))
-	mux.HandleFunc("GET /v1/entries/hash/", api.NewHashLookupHandler(queryDeps))
-	mux.HandleFunc("GET /v1/entries/", api.NewRawEntryHandler(queryDeps))
-	mux.HandleFunc("GET /v1/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok","log_did":"` + cfg.LogDID + `"}`))
-	})
+	// ── HTTP server ───────────────────────────────────────────────────
+	serverCfg := api.DefaultServerConfig()
+	serverCfg.Addr = cfg.ServerAddr
+	serverCfg.MaxEntrySize = cfg.MaxEntrySize
+	server := api.NewServer(serverCfg, pool, handlers, logger)
 
-	srv := &http.Server{Addr: cfg.ServerAddr, Handler: mux}
-
-	// ── Run goroutines ────────────────────────────────────────────────
+	// ── Goroutines ────────────────────────────────────────────────────
 	var wg sync.WaitGroup
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		logger.Info("HTTP server listening", "addr", cfg.ServerAddr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.ListenAndServe(); err != nil {
 			logger.Error("http server", "error", err)
 		}
 	}()
@@ -301,6 +391,12 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		diffController.Run(ctx, 30*time.Second)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 		anchorPub.Run(ctx)
 	}()
 
@@ -310,7 +406,7 @@ func main() {
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("http shutdown", "error", err)
 	}
 
