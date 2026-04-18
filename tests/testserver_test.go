@@ -123,6 +123,7 @@ func startTestOperator(t *testing.T) *testOperator {
 	// ── Commitment publisher ───────────────────────────────────────────
 	commitPub := opbuilder.NewCommitmentPublisher(
 		testLogDID,
+		testLogDID,
 		opbuilder.CommitmentPublisherConfig{IntervalEntries: 100000, IntervalTime: 24 * time.Hour},
 		func(e *envelope.Entry) error { return nil },
 		logger,
@@ -305,6 +306,54 @@ type stubWitnessCosigner struct{}
 
 func (s *stubWitnessCosigner) RequestCosignatures(_ context.Context, _ types.TreeHead) error {
 	return nil
+}
+
+// -------------------------------------------------------------------------------------------------
+// Lightweight test-server adapter for destination_binding_test.go
+// -------------------------------------------------------------------------------------------------
+//
+// destination_binding_test.go was authored against a hypothetical
+// newTestServer(t) helper whose docstring says:
+//
+//     "test harness returning *httptest.Server configured with testLogDID
+//     as cfg.LogDID and testOperatorDID as cfg.OperatorDID. Assumed
+//     present in testserver_test.go. If unavailable, port the factory
+//     pattern from http_integration_test.go."
+//
+// Rather than duplicate the factory (risking drift between two
+// implementations of the same wiring), this helper delegates to
+// startTestOperator and exposes a minimal .URL/.Close() surface — the
+// only surface destination_binding_test.go actually uses.
+//
+// The return type is a local *testServer rather than literal
+// *httptest.Server because startTestOperator already runs a real
+// HTTP server on a net.Listener. Creating an httptest.Server on top
+// would be a second server; wrapping the existing one with a type
+// that satisfies the call-site contract is both simpler and more
+// honest about what's happening.
+
+type testServer struct {
+	URL string
+	op  *testOperator // kept for lifetime ownership; teardown is via t.Cleanup.
+}
+
+// Close is a no-op. startTestOperator registers a t.Cleanup that
+// cancels the context, shuts down the HTTP server, cleans tables,
+// and closes the pool. This method exists only to satisfy the
+// `defer srv.Close()` idiom used by destination_binding_test.go.
+func (s *testServer) Close() {}
+
+// newTestServer returns a lightweight test-server handle for tests that
+// only need a running HTTP endpoint bound to testLogDID — no credit
+// seeding, no session tokens, no queue introspection. Currently used
+// by destination_binding_test.go's five security invariants.
+//
+// For tests that need richer access (seedSession, direct Pool queries,
+// CreditStore inspection), use startTestOperator directly.
+func newTestServer(t *testing.T) *testServer {
+	t.Helper()
+	op := startTestOperator(t)
+	return &testServer{URL: op.BaseURL, op: op}
 }
 
 // Suppress unused imports.

@@ -27,7 +27,6 @@ package tests
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -168,7 +167,6 @@ func TestScale_BulkInsert(t *testing.T) {
 				SignerDID: fmt.Sprintf("did:example:signer%d", signerIdx),
 			}, payload)
 			hash := envelope.EntryIdentity(entry)
-			canonical := envelope.Serialize(entry)
 
 			_, err := tx.Exec(ctx, `
 				INSERT INTO entry_index (sequence_number, canonical_hash, log_time,
@@ -208,7 +206,6 @@ func TestScale_BulkInsert(t *testing.T) {
 				SignerDID: fmt.Sprintf("did:example:signer%d", signerIdx),
 			}, payload)
 			hash := envelope.EntryIdentity(entry)
-			canonical := envelope.Serialize(entry)
 			tx.Exec(ctx, `
 				INSERT INTO entry_index (sequence_number, canonical_hash, log_time,
 					sig_algorithm_id, signer_did)
@@ -419,6 +416,7 @@ func TestScale_BuilderThroughput(t *testing.T) {
 	merkle := &stubMerkleAppender{mt: smt.NewStubMerkleTree()}
 	witness := &stubWitnessCosigner{}
 	commitPub := opbuilder.NewCommitmentPublisher(
+		testLogDID,
 		testLogDID,
 		opbuilder.CommitmentPublisherConfig{IntervalEntries: 100_000, IntervalTime: 24 * time.Hour},
 		func(e *envelope.Entry) error { return nil },

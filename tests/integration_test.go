@@ -887,7 +887,7 @@ func TestCommitment_IsCommentary(t *testing.T) {
 
 func TestCommitment_Frequency(t *testing.T) {
 	calls := 0
-	pub := opbuilder.NewCommitmentPublisher("did:example:op", opbuilder.CommitmentPublisherConfig{IntervalEntries: 100, IntervalTime: time.Hour}, func(*envelope.Entry) error { calls++; return nil }, slog.Default())
+	pub := opbuilder.NewCommitmentPublisher("did:example:op", "did:example:op", opbuilder.CommitmentPublisherConfig{IntervalEntries: 100, IntervalTime: time.Hour}, func(*envelope.Entry) error { calls++; return nil }, slog.Default())
 	dr := &builder.BatchResult{NewRoot: [32]byte{1}, Mutations: []types.LeafMutation{{LeafKey: [32]byte{1}}}}
 	pub.MaybePublish(context.Background(), 50, pos(1), pos(50), [32]byte{}, dr)
 	if calls != 0 {
