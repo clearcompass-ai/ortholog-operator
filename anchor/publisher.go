@@ -7,16 +7,22 @@ Decision 44: anchors are standard entries, no special handling.
 
 KEY ARCHITECTURAL DECISIONS:
   - Commentary entries: Target_Root=null, Authority_Path=null → zero SMT impact.
+  - Destination-bound (SDK v0.3.0+): anchor entries are published to THIS log,
+    so Destination = LogDID. NewEntry rejects empty destination at write time.
   - Domain Payload: source_log_did, tree_head_ref (SHA-256), tree_size, timestamp.
-  - Submits to PARENT log (not local) via Mode A write credits.
+  - Submits to the local operator's admission pipeline via submitFn.
   - Configurable interval: default 1 hour.
+
+SDK ALIGNMENT (v0.3.0):
+  - envelope.NewEntry requires Destination (via ValidateDestination). Threading
+    LogDID through PublisherConfig is the minimum invasive change to satisfy
+    this while keeping the handler signature stable.
 */
 package anchor
 
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,14 +31,16 @@ import (
 	"time"
 
 	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
+	"github.com/clearcompass-ai/ortholog-sdk/crypto"
 	"github.com/clearcompass-ai/ortholog-sdk/types"
 )
 
 // PublisherConfig configures the anchor publisher.
 type PublisherConfig struct {
-	OperatorDID    string
-	Interval       time.Duration
-	AnchorSources  []AnchorSource
+	OperatorDID   string
+	LogDID        string // NEW (v0.3.0): destination-binding for self-published anchors.
+	Interval      time.Duration
+	AnchorSources []AnchorSource
 }
 
 // AnchorSource is a remote log to anchor.
@@ -56,7 +64,8 @@ type Publisher struct {
 	logger   *slog.Logger
 }
 
-// NewPublisher creates an anchor publisher.
+// NewPublisher creates an anchor publisher. LogDID in cfg MUST be non-empty —
+// the SDK's NewEntry will reject anchor commentary construction otherwise.
 func NewPublisher(
 	cfg PublisherConfig,
 	merkle MerkleHeadProvider,
@@ -122,8 +131,11 @@ func (p *Publisher) publishOne(ctx context.Context, source AnchorSource) error {
 		return fmt.Errorf("read response: %w", err)
 	}
 
-	// Build anchor payload.
-	treeHeadRef := sha256.Sum256(body)
+	// Build anchor payload. tree_head_ref is a plain SHA-256 of the remote
+	// HTTP body — this is arbitrary bytes, NOT an Entry, so crypto.HashBytes
+	// is the correct primitive (envelope.EntryIdentity is for Entry-shaped
+	// input only).
+	treeHeadRef := crypto.HashBytes(body)
 	payload, _ := json.Marshal(map[string]any{
 		"anchor_type":    "tree_head_ref",
 		"source_log_did": source.LogDID,
@@ -132,8 +144,11 @@ func (p *Publisher) publishOne(ctx context.Context, source AnchorSource) error {
 	})
 
 	// Build commentary entry (Decision 44: standard entry, no special handling).
+	// Destination = LogDID (the anchor lands in THIS operator's log).
 	entry, err := envelope.NewEntry(envelope.ControlHeader{
-		SignerDID: p.cfg.OperatorDID,
+		SignerDID:   p.cfg.OperatorDID,
+		Destination: p.cfg.LogDID, // v0.3.0 destination-binding requirement.
+		EventTime:   time.Now().UTC().Unix(),
 		// Target_Root=nil, Authority_Path=nil → commentary.
 	}, payload)
 	if err != nil {

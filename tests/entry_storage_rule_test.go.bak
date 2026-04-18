@@ -152,8 +152,8 @@ func TestRule_FetcherHydratesFromEntryReader(t *testing.T) {
 	entry, _ := envelope.NewEntry(envelope.ControlHeader{
 		SignerDID: "did:example:fetcher-rule",
 	}, []byte("fetcher-rule-payload"))
-	hash := envelope.EntryIdentity(entry)
 	canonical := envelope.Serialize(entry)
+	hash := sha256.Sum256(canonical)
 	fakeSig := []byte("test-signature-bytes-48")
 
 	// Insert index row in Postgres (no bytes).
@@ -217,8 +217,8 @@ func TestRule_QueryAPIHydratesFromEntryReader(t *testing.T) {
 		entry, _ := envelope.NewEntry(envelope.ControlHeader{
 			SignerDID: "did:example:query-rule-signer",
 		}, []byte(fmt.Sprintf("query-payload-%d", i)))
-		hash := envelope.EntryIdentity(entry)
 		canonical := envelope.Serialize(entry)
+		hash := sha256.Sum256(canonical)
 
 		tx, _ := pool.Begin(ctx)
 		tx.Exec(ctx, `
@@ -272,8 +272,8 @@ func TestRule_EntryReaderIsAuthoritative(t *testing.T) {
 	entry, _ := envelope.NewEntry(envelope.ControlHeader{
 		SignerDID: "did:example:authority-test",
 	}, []byte("original-payload"))
-	hash := envelope.EntryIdentity(entry)
 	canonical := envelope.Serialize(entry)
+	hash := sha256.Sum256(canonical)
 
 	// Insert index in Postgres.
 	seq := uint64(77001)

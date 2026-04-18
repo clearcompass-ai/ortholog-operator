@@ -13,6 +13,8 @@ KEY ARCHITECTURAL DECISIONS:
     nil submitFn = commitments computed but not published on the log.
   - WithCommitmentStore: optional persistence to derivation_commitments
     table for indexed lookup by fraud proof verifiers.
+  - Destination-bound (SDK v0.3.0+): commitments are commentary on THIS log,
+    so Destination = LogDID. Threaded through constructor.
 
 PERSISTENCE NOTE (correction #4): Commitment persistence runs POST-COMMIT
 (loop.go step 7). A crash between atomic commit and persistence loses the
@@ -23,6 +25,10 @@ submitFn NOTE (correction #6): submitFn must be wired to a real submission
 path for commentary entries to appear on the log. The anchor/publisher.go
 pattern (SubmitViaHTTP) is the reference implementation. Until submitFn is
 wired, the commentary_seq column in derivation_commitments has no value.
+
+SDK ALIGNMENT (v0.3.0):
+  - envelope.NewEntry requires Destination. NewCommitmentPublisher now takes
+    a logDID parameter; callers in cmd/operator/main.go thread cfg.LogDID.
 */
 package builder
 
@@ -49,6 +55,7 @@ type CommitmentPublisherConfig struct {
 // CommitmentPublisher publishes derivation commitments.
 type CommitmentPublisher struct {
 	operatorDID  string
+	logDID       string // NEW (v0.3.0): destination for self-published commentary.
 	cfg          CommitmentPublisherConfig
 	logger       *slog.Logger
 	mu           sync.Mutex
@@ -59,8 +66,15 @@ type CommitmentPublisher struct {
 }
 
 // NewCommitmentPublisher creates a commitment publisher.
+//
+// operatorDID: the key DID signing the commentary entries.
+// logDID:      the destination the commentary binds to (this operator's log).
+//
+// logDID MUST be non-empty — envelope.NewEntry will reject construction
+// otherwise (SDK v0.3.0 destination-binding).
 func NewCommitmentPublisher(
 	operatorDID string,
+	logDID string,
 	cfg CommitmentPublisherConfig,
 	submitFn func(entry *envelope.Entry) error,
 	logger *slog.Logger,
@@ -73,6 +87,7 @@ func NewCommitmentPublisher(
 	}
 	return &CommitmentPublisher{
 		operatorDID: operatorDID,
+		logDID:      logDID,
 		cfg:         cfg,
 		submitFn:    submitFn,
 		logger:      logger,
@@ -81,8 +96,7 @@ func NewCommitmentPublisher(
 }
 
 // WithCommitmentStore enables persistence to the derivation_commitments table.
-// Fluent setter — avoids changing constructor signature (existing callers unaffected).
-// Returns self for chaining: NewCommitmentPublisher(...).WithCommitmentStore(cs)
+// Fluent setter — avoids changing constructor signature for existing callers.
 func (cp *CommitmentPublisher) WithCommitmentStore(cs *store.CommitmentStore) *CommitmentPublisher {
 	cp.commitStore = cs
 	return cp
@@ -145,9 +159,12 @@ func (cp *CommitmentPublisher) publish(
 		return
 	}
 
-	// Build commentary entry: Target_Root=null, Authority_Path=null → Fix 1.
+	// Build commentary entry: Target_Root=null, Authority_Path=null.
+	// Destination = logDID — this commentary lands in the local log.
 	entry, err := envelope.NewEntry(envelope.ControlHeader{
-		SignerDID: cp.operatorDID,
+		SignerDID:   cp.operatorDID,
+		Destination: cp.logDID,
+		EventTime:   time.Now().UTC().Unix(),
 	}, payload)
 	if err != nil {
 		cp.logger.Error("commitment entry creation failed", "error", err)
@@ -155,9 +172,6 @@ func (cp *CommitmentPublisher) publish(
 	}
 
 	// Submit commentary entry to the log (correction #6).
-	// submitFn nil = commitments computed but not published on the log.
-	// When wired (via SubmitViaHTTP or direct enqueue), the entry gets a
-	// sequence number which is stored as commentary_seq in the table.
 	if cp.submitFn != nil {
 		if err := cp.submitFn(entry); err != nil {
 			cp.logger.Error("commitment submission failed", "error", err)
@@ -167,7 +181,7 @@ func (cp *CommitmentPublisher) publish(
 	}
 
 	// Persist to derivation_commitments table (correction #4).
-	// Post-commit, best-effort. A crash here loses the row — acceptable
+	// Post-commit, best-effort. Crash here loses the row — acceptable
 	// because commitments are reconstructable from entries.
 	if cp.commitStore != nil {
 		row := store.CommitmentRow{
@@ -176,8 +190,6 @@ func (cp *CommitmentPublisher) publish(
 			PriorSMTRoot:  priorRoot,
 			PostSMTRoot:   commitment.PostSMTRoot,
 			MutationsJSON: payload,
-			// CommentarySeq: nil until submitFn is wired and we track
-			// the sequence number returned by the submission.
 		}
 		if insertErr := cp.commitStore.Insert(ctx, row); insertErr != nil {
 			cp.logger.Error("commitment persistence failed", "error", insertErr)

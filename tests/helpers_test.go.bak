@@ -104,7 +104,7 @@ func makeEntry(t *testing.T, h envelope.ControlHeader, payload []byte) *envelope
 }
 
 func canonicalHashBytes(entry *envelope.Entry) [32]byte {
-	return envelope.EntryIdentity(entry)
+	return sha256.Sum256(envelope.Serialize(entry))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -456,8 +456,8 @@ func cleanTables(t *testing.T, pool *pgxpool.Pool) {
 func insertTestEntry(t *testing.T, pool *pgxpool.Pool, seq uint64, entry *envelope.Entry, logDID string) {
 	t.Helper()
 	ctx := context.Background()
-	hash := envelope.EntryIdentity(entry)
 	canonical := envelope.Serialize(entry)
+	hash := sha256.Sum256(canonical)
 	logTime := time.Now().UTC()
 
 	var targetRoot, cosigOf, schemaRef []byte

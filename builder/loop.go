@@ -5,8 +5,8 @@ DESCRIPTION:
 
 	The continuous builder loop — THE core operational loop of the operator.
 	Dequeues admitted entries, calls SDK ProcessBatch, commits state atomically,
-	appends entry hashes to the Merkle tree, publishes commitments, and requests
-	witness cosignatures.
+	appends entry identities to the Merkle tree, publishes commitments, and
+	requests witness cosignatures.
 
 KEY ARCHITECTURAL DECISIONS:
   - Single goroutine: determinism requires exactly one builder per log.
@@ -16,11 +16,15 @@ KEY ARCHITECTURAL DECISIONS:
   - Overlay SMT Store: SDK ProcessBatch runs against an in-memory overlay
     to guarantee functional purity. If batch validation fails, the overlay
     is discarded and Postgres remains completely untouched.
-  - Hash-only Merkle tree (Conflict #1 resolution): Step 6 passes
-    SHA-256(wire_bytes) — exactly 32 bytes — to Tessera. Full entry bytes
-    stay in the operator's own storage (InMemoryEntryStore/disk).
-    Tessera never sees full entry data. This preserves SDK-D11 (1MB)
-    within the tlog-tiles uint16 (64KB) entry bundle constraint.
+  - Entry-identity Merkle tree (SDK v0.3.0 alignment):
+    Step 6 sends envelope.EntryIdentity(entry) — SHA-256 of the entry's
+    canonical bytes, NOT the wire-bytes-including-signature hash — to
+    the Tessera personality, which wraps it with RFC 6962's 0x00 leaf
+    prefix internally. Full wire bytes (canonical + sig_envelope) stay
+    in the operator's own storage. Tessera never sees full entry data.
+    Critical: do NOT use envelope.EntryLeafHash here — that would double-
+    apply the RFC 6962 prefix because tessera-personality's NewEntry
+    already applies it.
   - SDK MerkleTree interface: builder touches only the MerkleAppender
     interface, never tessera/client.go directly. Swappable backend.
   - Idempotent: replaying the same batch produces identical state.
@@ -29,14 +33,29 @@ KEY ARCHITECTURAL DECISIONS:
 OVERVIEW:
 
 	Run loop: dequeue → fetch → split → ProcessBatch → atomic commit →
-	Merkle append (hash-only) → commitment → witness cosig.
+	Merkle append (entry-identity hash) → commitment → witness cosig.
 
 	Step 6 (Merkle append) is POST-COMMIT and best-effort. Crash between
 	commit and append → re-append on restart is safe (Tessera deduplicates
-	by leaf hash). The operator's atomic state is in Postgres.
+	by identity hash). The operator's atomic state is in Postgres.
+
+CONSUMER VERIFICATION FLOW (new contract):
+    1. Fetch wire bytes from operator's byte store.
+    2. StripSignature → (canonical, algoID, sig).
+    3. envelope.Deserialize(canonical) → entry.
+    4. envelope.EntryIdentity(entry) → 32-byte hash.
+    5. Fetch inclusion proof for position N, verify path hashes to the
+       tree head published in the signed checkpoint.
+
+MIGRATION NOTE:
+    Pre-v0.3.0 tiles contained SHA-256(canonical + sig_envelope). Those
+    tiles must be rebuilt — inclusion proofs against them will fail with
+    the new identity-based verification. Rebuild by replaying entries
+    through the builder against a fresh Tessera backend.
 
 KEY DEPENDENCIES:
   - github.com/clearcompass-ai/ortholog-sdk/builder: ProcessBatch, BatchResult.
+  - github.com/clearcompass-ai/ortholog-sdk/core/envelope: EntryIdentity.
   - tessera/proof_adapter.go: TesseraAdapter implements MerkleAppender.
   - store/smt_state.go: PostgresLeafStore.SetTx for atomic leaf writes.
   - store/entries.go: PostgresEntryFetcher for entry retrieval.
@@ -45,7 +64,6 @@ package builder
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -92,13 +110,13 @@ func DefaultLoopConfig(logDID string) LoopConfig {
 
 // MerkleAppender is the subset of the Merkle tree interface used by the builder.
 //
-// AppendLeaf takes a 32-byte SHA-256 hash of the entry's wire bytes.
-// The operator computes SHA-256(canonical + sig_envelope) and passes only
-// the digest. Tessera stores this hash in its entry tiles and computes
-// the Merkle leaf hash as H(0x00 || hash_bytes).
+// AppendLeaf takes a 32-byte SHA-256 entry identity (envelope.EntryIdentity).
+// Tessera stores this hash in its entry tiles and computes the Merkle leaf
+// hash as H(0x00 || hash_bytes) per RFC 6962. The operator does NOT apply
+// the RFC 6962 prefix here — that's Tessera's job.
 //
-// This is the hash-only architecture (Conflict #1 resolution). Full entry
-// bytes stay in the operator's own storage. Tessera never sees them.
+// Full entry bytes (canonical + signature envelope) stay in the operator's
+// own storage. Tessera never sees them.
 type MerkleAppender interface {
 	AppendLeaf(data []byte) (uint64, error)
 	Head() (types.TreeHead, error)
@@ -179,7 +197,6 @@ func NewBuilderLoop(
 // Run executes the builder loop until ctx is cancelled.
 // MUST be called from a single goroutine.
 func (bl *BuilderLoop) Run(ctx context.Context) (retErr error) {
-	// Panic recovery — builder goroutine death must be diagnosable.
 	defer func() {
 		if r := recover(); r != nil {
 			buf := make([]byte, 4096)
@@ -198,7 +215,6 @@ func (bl *BuilderLoop) Run(ctx context.Context) (retErr error) {
 		"poll_interval", bl.cfg.PollInterval,
 	)
 
-	// Recover stale processing entries from prior crash.
 	if err := ctx.Err(); err != nil {
 		return nil
 	}
@@ -328,10 +344,6 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	}
 
 	// ── Step 4: SDK ProcessBatch ──────────────────────────────────────
-	// Wrap the live Postgres leaf store in an in-memory overlay.
-	// This prevents mid-batch errors from mutating the database non-transactionally.
-	// If ProcessBatch fails, the overlayStore is garbage collected and Postgres
-	// remains completely untouched.
 	overlayStore := smt.NewOverlayLeafStore(bl.leafStore)
 	overlayTree := smt.NewTree(overlayStore, bl.nodeCache)
 
@@ -349,7 +361,6 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	}
 
 	err = store.WithSerializableTx(ctx, bl.db, func(ctx context.Context, tx pgx.Tx) error {
-		// Apply the successfully computed SMT mutations inside the transaction.
 		for _, mut := range result.Mutations {
 			leaf := types.SMTLeaf{
 				Key:          mut.LeafKey,
@@ -381,26 +392,26 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 	// POST-COMMIT: Steps 6-8 are best-effort. The atomic state is safe.
 	// ──────────────────────────────────────────────────────────────────
 
-	// ── Step 6: Append to Merkle tree — HASH ONLY (post-commit) ──────
+	// ── Step 6: Append to Merkle tree — ENTRY IDENTITY (post-commit) ──
 	//
-	// Hash-only architecture (Conflict #1 resolution):
-	// Compute SHA-256(wire_bytes) and send only the 32-byte hash to Tessera.
-	// Full wire bytes stay in the operator's own storage (InMemoryEntryStore
-	// or persistent disk store). Tessera never sees full entry data.
+	// SDK v0.3.0 alignment: send envelope.EntryIdentity(entry) — the
+	// 32-byte SHA-256 of the entry's canonical bytes. This is the
+	// Tessera "Entry.Identity()" value. The signature is NOT part of
+	// entry identity — multiple valid signatures over the same entry
+	// (rare but possible with detached sig schemes) must produce the
+	// same Merkle leaf.
 	//
-	// Two-step verification for consumers:
-	//   1. Prove hash is in Merkle tree at position N (tile-based proof).
-	//   2. Prove entry data hashes to that value (SHA-256 of fetched bytes).
+	// Tessera then wraps our identity hash with the RFC 6962 leaf prefix
+	// (0x00) internally. Do NOT call envelope.EntryLeafHash here — that
+	// would double-apply the prefix.
 	//
-	// Tessera append is idempotent: same hash → same position.
-	// Crash here → re-append on restart is safe.
+	// Idempotency: same entry identity → same Tessera position.
+	// Crash between commit and this append → safe to re-run on restart.
 	if bl.merkle != nil {
-		for _, ewm := range metas {
-			wireBytes := envelope.AppendSignature(
-				ewm.CanonicalBytes, ewm.SignatureAlgoID, ewm.SignatureBytes)
-			entryHash := sha256.Sum256(wireBytes)
-			if _, appendErr := bl.merkle.AppendLeaf(entryHash[:]); appendErr != nil {
-				bl.logger.Error("Tessera append failed (hash-only)",
+		for i, ewm := range metas {
+			identity := envelope.EntryIdentity(entries[i])
+			if _, appendErr := bl.merkle.AppendLeaf(identity[:]); appendErr != nil {
+				bl.logger.Error("Tessera append failed",
 					"seq", ewm.Position.Sequence, "error", appendErr)
 			}
 		}
@@ -425,7 +436,6 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 		}
 	}
 
-	// Update buffer reference for next cycle.
 	if result.UpdatedBuffer != nil {
 		bl.buffer = result.UpdatedBuffer
 	}
@@ -447,7 +457,6 @@ func (bl *BuilderLoop) processBatch(ctx context.Context) (int, error) {
 // 6) Observability
 // -------------------------------------------------------------------------------------------------
 
-// Stats returns current builder loop counters.
 func (bl *BuilderLoop) Stats() (batches, entries, errs int64) {
 	return bl.totalBatches.Load(), bl.totalEntries.Load(), bl.totalErrors.Load()
 }

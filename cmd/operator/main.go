@@ -1,15 +1,28 @@
 /*
 FILE PATH: cmd/operator/main.go
 
-Entry point for the Ortholog log operator (read-write mode).
+DESCRIPTION:
+    Operator binary entry point. Wires config → stores → subsystems → HTTP
+    server, then runs the builder loop, anchor publisher, commitment
+    publisher, and witness cosigner as cooperating goroutines under a
+    shared context.
 
-CHANGES:
-  - SchemaResolver: schema.NewCachingResolver() from SDK (one line, no wrapper)
-  - submitFn: anchor.SubmitViaHTTP (correction #6)
-  - CommitmentStore: created + wired via WithCommitmentStore
-  - 5 new handlers: EntryBySequence, EntryBatch, SMTLeaf, SMTLeafBatch, CommitmentQuery
-  - SubmissionDeps refactored into sub-structs (StorageDeps + AdmissionConfig + IdentityDeps)
-  - Epoch config (EpochWindowSeconds + EpochAcceptanceWindow) for SDK-2 stamp validation
+SDK v0.3.0 WIRING CHANGES:
+    1. anchor.PublisherConfig now requires LogDID — threaded from cfg.LogDID.
+    2. builder.NewCommitmentPublisher signature changed: (operatorDID,
+       logDID, ...) — both DIDs passed explicitly.
+    3. api.SubmissionDeps now has FreshnessTolerance (defaults to
+       policy.FreshnessInteractive=5min if left zero). Explicit here for
+       auditability.
+    4. Phase 4 DID verifier registry scaffolded behind a nil check —
+       when consumers are ready, swap the nil for
+       did.DefaultVerifierRegistry(cfg.LogDID, resolver).
+
+INVARIANTS:
+    - cfg.LogDID MUST be non-empty: submission handler panics at
+      construction otherwise (destination-binding enforcement gate).
+    - cfg.OperatorDID SHOULD differ from cfg.LogDID but may collapse in
+      single-exchange deployments where the operator IS the exchange.
 */
 package main
 
@@ -17,354 +30,77 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	sdkbuilder "github.com/clearcompass-ai/ortholog-sdk/builder"
+	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
 	"github.com/clearcompass-ai/ortholog-sdk/core/smt"
-	"github.com/clearcompass-ai/ortholog-sdk/schema"
+	"github.com/clearcompass-ai/ortholog-sdk/exchange/policy"
 
 	"github.com/clearcompass-ai/ortholog-operator/anchor"
 	"github.com/clearcompass-ai/ortholog-operator/api"
 	"github.com/clearcompass-ai/ortholog-operator/api/middleware"
-	opbuilder "github.com/clearcompass-ai/ortholog-operator/builder"
+	"github.com/clearcompass-ai/ortholog-operator/builder"
 	"github.com/clearcompass-ai/ortholog-operator/store"
-	"github.com/clearcompass-ai/ortholog-operator/store/indexes"
 	"github.com/clearcompass-ai/ortholog-operator/tessera"
 	"github.com/clearcompass-ai/ortholog-operator/witness"
 )
 
-func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	slog.SetDefault(logger)
+// ─────────────────────────────────────────────────────────────────────
+// Config
+// ─────────────────────────────────────────────────────────────────────
 
-	if err := run(logger); err != nil {
-		logger.Error("operator fatal", "error", err)
-		os.Exit(1)
-	}
-}
-
-func run(logger *slog.Logger) error {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// ── Step 1: Load config ────────────────────────────────────────────
-	cfg := loadConfig()
-	logger.Info("config loaded", "log_did", cfg.LogDID, "addr", cfg.ServerAddr)
-
-	// ── Step 2: Initialize Postgres pools ──────────────────────────────
-	pools, err := store.InitPools(ctx, store.PoolConfig{
-		DSN:             cfg.PostgresDSN,
-		MaxConns:        int32(cfg.MaxConns),
-		MinConns:        int32(cfg.MinConns),
-		MaxConnLifetime: 30 * time.Minute,
-		MaxConnIdleTime: 5 * time.Minute,
-	}, cfg.ReplicaDSN)
-	if err != nil {
-		return fmt.Errorf("step 2: %w", err)
-	}
-	defer pools.Close()
-
-	// ── Step 3: Run migrations ─────────────────────────────────────────
-	if err := store.RunMigrations(ctx, pools.Write); err != nil {
-		return fmt.Errorf("step 3: %w", err)
-	}
-	logger.Info("migrations complete")
-
-	// ── Step 4-5: Tessera ──────────────────────────────────────────────
-	tesseraClient := tessera.NewClient(tessera.ClientConfig{
-		BaseURL: cfg.TesseraBaseURL,
-		Timeout: 30 * time.Second,
-	}, logger)
-	tileBackend := tessera.NewHTTPTileBackend(cfg.TesseraBaseURL)
-	tileReader := tessera.NewTileReader(tileBackend, cfg.TileCacheSize)
-	tesseraAdapter := tessera.NewTesseraAdapter(tesseraClient, tileReader, logger)
-	entryBytes := tessera.NewInMemoryEntryStore()
-
-	// ── Step 6-7: SMT ──────────────────────────────────────────────────
-	leafStore := store.NewPostgresLeafStore(pools.Write)
-	nodeCache := store.NewPostgresNodeCache(pools.Write, cfg.SMTCacheSize)
-	tree := smt.NewTree(leafStore, nodeCache)
-	if err := nodeCache.WarmCache(ctx, cfg.WarmTopLevels); err != nil {
-		logger.Warn("cache warm failed (non-fatal)", "error", err)
-	} else {
-		logger.Info("SMT cache warmed", "top_levels", cfg.WarmTopLevels)
-	}
-
-	// ── Step 8: Delta buffer ───────────────────────────────────────────
-	bufferStore := opbuilder.NewDeltaBufferStore(pools.Write, cfg.DeltaWindowSize, logger)
-	deltaBuffer, err := bufferStore.Load(ctx)
-	if err != nil {
-		logger.Warn("delta buffer load failed (cold start)", "error", err)
-	}
-	logger.Info("delta buffer loaded")
-
-	// ── Step 9: Witness set ────────────────────────────────────────────
-	witnessKeys, schemeTag, err := witness.LoadCurrentSet(ctx, pools.Read)
-	if err != nil {
-		logger.Warn("witness set not found (genesis deployment)", "error", err)
-		witnessKeys = nil
-		schemeTag = 1
-	}
-	logger.Info("witness set loaded", "keys", len(witnessKeys), "scheme", schemeTag)
-
-	// ── Builder advisory lock ──────────────────────────────────────────
-	releaseLock, err := store.AcquireBuilderLock(ctx, pools.Write)
-	if err != nil {
-		return fmt.Errorf("builder lock: %w", err)
-	}
-	defer releaseLock()
-	logger.Info("builder advisory lock acquired")
-
-	// ── Step 10: Builder loop ──────────────────────────────────────────
-	entryStore := store.NewEntryStore(pools.Write)
-	fetcher := store.NewPostgresEntryFetcher(pools.Read, entryBytes, cfg.LogDID)
-	queue := opbuilder.NewQueue(pools.Write)
-	treeHeadStore := store.NewTreeHeadStore(pools.Read)
-
-	headSync := witness.NewHeadSync(witness.HeadSyncConfig{
-		WitnessEndpoints:  cfg.WitnessEndpoints,
-		QuorumK:           cfg.WitnessQuorumK,
-		PerWitnessTimeout: 30 * time.Second,
-		SchemeTag:         schemeTag,
-	}, treeHeadStore, logger)
-
-	commitmentStore := store.NewCommitmentStore(pools.Write)
-	schemaResolver := schema.NewCachingResolver()
-	submitFn := anchor.SubmitViaHTTP(fmt.Sprintf("http://localhost%s", cfg.ServerAddr))
-
-	commitPub := opbuilder.NewCommitmentPublisher(
-		cfg.OperatorDID,
-		opbuilder.CommitmentPublisherConfig{
-			IntervalEntries: cfg.CommitmentInterval,
-			IntervalTime:    cfg.CommitmentMaxAge,
-		},
-		submitFn,
-		logger,
-	).WithCommitmentStore(commitmentStore)
-
-	builderLoop := opbuilder.NewBuilderLoop(
-		opbuilder.DefaultLoopConfig(cfg.LogDID),
-		pools.Write, tree, leafStore, nodeCache,
-		queue, fetcher, schemaResolver, deltaBuffer, bufferStore, commitPub,
-		tesseraAdapter, headSync, logger,
-	)
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := builderLoop.Run(ctx); err != nil {
-			logger.Error("builder loop exited", "error", err)
-		}
-	}()
-	logger.Info("builder loop started")
-
-	// ── Step 11: Equivocation monitor ──────────────────────────────────
-	if len(cfg.PeerEndpoints) > 0 {
-		eqMonitor := witness.NewEquivocationMonitor(
-			witness.EquivocationMonitorConfig{
-				PeerEndpoints: cfg.PeerEndpoints,
-				PollInterval:  5 * time.Minute,
-			}, pools.Write, treeHeadStore, logger)
-		wg.Add(1)
-		go func() { defer wg.Done(); eqMonitor.Run(ctx) }()
-		logger.Info("equivocation monitor started", "peers", len(cfg.PeerEndpoints))
-	}
-
-	// ── Step 12: Anchor publisher ──────────────────────────────────────
-	if cfg.AnchorEnabled && len(cfg.AnchorSources) > 0 {
-		anchorPub := anchor.NewPublisher(
-			anchor.PublisherConfig{
-				OperatorDID:   cfg.OperatorDID,
-				Interval:      1 * time.Hour,
-				AnchorSources: cfg.AnchorSources,
-			},
-			tesseraAdapter,
-			anchor.SubmitViaHTTP(fmt.Sprintf("http://localhost%s", cfg.ServerAddr)),
-			logger,
-		)
-		wg.Add(1)
-		go func() { defer wg.Done(); anchorPub.Run(ctx) }()
-		logger.Info("anchor publisher started", "sources", len(cfg.AnchorSources))
-	}
-
-	// ── Step 13: Difficulty controller ──────────────────────────────────
-	creditStore := store.NewCreditStore(pools.Write)
-	diffController := middleware.NewDifficultyController(
-		queue, middleware.DifficultyConfig{
-			InitialDifficulty: uint32(cfg.InitialDifficulty),
-			MinDifficulty:     uint32(cfg.MinDifficulty),
-			MaxDifficulty:     uint32(cfg.MaxDifficulty),
-			LowThreshold:      int64(cfg.LowThreshold),
-			HighThreshold:     int64(cfg.HighThreshold),
-			HashFunction:      cfg.HashFunction,
-		}, logger,
-	)
-	wg.Add(1)
-	go func() { defer wg.Done(); diffController.Run(ctx, 30*time.Second) }()
-
-	// ── Step 14: HTTP server ───────────────────────────────────────────
-	queryAPI := indexes.NewPostgresQueryAPI(pools.Read, entryBytes, cfg.LogDID)
-
-	// Build SubmissionDeps using the cohesive sub-structs.
-	submissionDeps := &api.SubmissionDeps{
-		Storage: api.StorageDeps{
-			DB:          pools.Write,
-			EntryStore:  entryStore,
-			EntryWriter: entryBytes,
-		},
-		Admission: api.AdmissionConfig{
-			DiffController:        diffController,
-			EpochWindowSeconds:    cfg.EpochWindowSeconds,
-			EpochAcceptanceWindow: cfg.EpochAcceptanceWindow,
-		},
-		Identity: api.IdentityDeps{
-			CreditStore: creditStore,
-			DIDResolver: nil,
-		},
-		Queue:        queue,
-		LogDID:       cfg.LogDID,
-		MaxEntrySize: int64(cfg.MaxEntrySize),
-		Logger:       logger,
-	}
-
-	treeDeps := &api.TreeDeps{
-		TreeHeadStore: treeHeadStore, Inclusion: tesseraAdapter,
-		Consistency: tesseraAdapter, Logger: logger,
-	}
-	smtDeps := &api.SMTDeps{Tree: tree, LeafStore: leafStore, Logger: logger}
-	queryDeps := &api.QueryDeps{
-		QueryAPI: queryAPI, DiffController: diffController, Logger: logger,
-	}
-	entryReadDeps := &api.EntryReadDeps{
-		Fetcher: fetcher, QueryAPI: queryAPI,
-		LogDID: cfg.LogDID, Logger: logger,
-	}
-	commitDeps := &api.CommitmentDeps{
-		CommitmentStore: commitmentStore, Logger: logger,
-	}
-
-	handlers := api.Handlers{
-		Submission:      api.NewSubmissionHandler(submissionDeps),
-		TreeHead:        api.NewTreeHeadHandler(treeDeps),
-		TreeInclusion:   api.NewTreeInclusionHandler(treeDeps),
-		TreeConsistency: api.NewTreeConsistencyHandler(treeDeps),
-		SMTProof:        api.NewSMTProofHandler(smtDeps),
-		SMTBatchProof:   api.NewSMTBatchProofHandler(smtDeps),
-		SMTRoot:         api.NewSMTRootHandler(smtDeps),
-		CosignatureOf:   api.NewQueryCosignatureOfHandler(queryDeps),
-		TargetRoot:      api.NewQueryTargetRootHandler(queryDeps),
-		SignerDID:       api.NewQuerySignerDIDHandler(queryDeps),
-		SchemaRef:       api.NewQuerySchemaRefHandler(queryDeps),
-		Scan:            api.NewQueryScanHandler(queryDeps),
-		Difficulty:      api.NewDifficultyHandler(queryDeps),
-		WitnessCosign:   nil,
-		EntryBySequence: api.NewEntryBySequenceHandler(entryReadDeps),
-		EntryBatch:      api.NewEntryBatchHandler(entryReadDeps),
-		SMTLeaf:         api.NewSMTLeafHandler(smtDeps),
-		SMTLeafBatch:    api.NewSMTLeafBatchHandler(smtDeps),
-		CommitmentQuery: api.NewCommitmentQueryHandler(commitDeps),
-	}
-
-	serverCfg := api.DefaultServerConfig()
-	serverCfg.Addr = cfg.ServerAddr
-	serverCfg.MaxEntrySize = int64(cfg.MaxEntrySize)
-	server := api.NewServer(serverCfg, pools.Write, handlers, logger)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := server.ListenAndServe(); err != nil {
-			logger.Error("http server exited", "error", err)
-		}
-	}()
-	logger.Info("HTTP server started", "addr", cfg.ServerAddr)
-
-	// ── Steps 15-16: Signals + shutdown ────────────────────────────────
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	sig := <-sigCh
-	logger.Info("shutdown signal received", "signal", sig)
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
-	_ = server.Shutdown(shutdownCtx)
-	cancel()
-	wg.Wait()
-	logger.Info("all goroutines stopped, exiting cleanly")
-	return nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Configuration
-// ─────────────────────────────────────────────────────────────────────────────
-
-type operatorConfig struct {
-	LogDID                string
-	OperatorDID           string
-	PostgresDSN           string
-	ReplicaDSN            string
-	MaxConns              int
-	MinConns              int
+type Config struct {
 	ServerAddr            string
-	MaxEntrySize          int
-	TesseraBaseURL        string
-	TileCacheSize         int
-	WarmTopLevels         int
-	SMTCacheSize          int
-	DeltaWindowSize       int
-	CommitmentInterval    int
-	CommitmentMaxAge      time.Duration
-	WitnessEndpoints      []string
-	WitnessQuorumK        int
-	PeerEndpoints         []string
-	AnchorEnabled         bool
-	AnchorSources         []anchor.AnchorSource
-	InitialDifficulty     int
-	MinDifficulty         int
-	MaxDifficulty         int
-	LowThreshold          int
-	HighThreshold         int
-	HashFunction          string
+	DatabaseURL           string
+	LogDID                string // Destination for self-published entries (anchors, commitments).
+	OperatorDID           string // Signer DID for operator-authored commentary.
+	MaxEntrySize          int64
+	BatchSize             int
+	PollInterval          time.Duration
 	EpochWindowSeconds    int
 	EpochAcceptanceWindow int
+	AnchorInterval        time.Duration
+	AnchorSources         []anchor.AnchorSource
+	TesseraStorageRoot    string
+	WitnessEndpoints      []string
+	WitnessQuorumK        int
+	ByteStoreRoot         string
 }
 
-func loadConfig() operatorConfig {
-	return operatorConfig{
-		LogDID:                envOr("ORTHOLOG_LOG_DID", "did:ortholog:operator:001"),
-		OperatorDID:           envOr("ORTHOLOG_OPERATOR_DID", "did:ortholog:operator:001:signer"),
-		PostgresDSN:           envOr("ORTHOLOG_POSTGRES_DSN", "postgres://ortholog:ortholog@localhost:5432/ortholog?sslmode=disable"),
-		ReplicaDSN:            envOr("ORTHOLOG_REPLICA_DSN", ""),
-		MaxConns:              20,
-		MinConns:              5,
-		ServerAddr:            envOr("ORTHOLOG_SERVER_ADDR", ":8080"),
+func loadConfig() (*Config, error) {
+	cfg := &Config{
+		ServerAddr:            envOr("OPERATOR_ADDR", ":8080"),
+		DatabaseURL:           os.Getenv("OPERATOR_DATABASE_URL"),
+		LogDID:                os.Getenv("OPERATOR_LOG_DID"),
+		OperatorDID:           os.Getenv("OPERATOR_DID"),
 		MaxEntrySize:          1 << 20,
-		TesseraBaseURL:        envOr("ORTHOLOG_TESSERA_URL", "http://localhost:2024"),
-		TileCacheSize:         10000,
-		WarmTopLevels:         32,
-		SMTCacheSize:          100000,
-		DeltaWindowSize:       10,
-		CommitmentInterval:    1000,
-		CommitmentMaxAge:      1 * time.Hour,
-		WitnessEndpoints:      nil,
-		WitnessQuorumK:        2,
-		PeerEndpoints:         nil,
-		AnchorEnabled:         false,
-		AnchorSources:         nil,
-		InitialDifficulty:     16,
-		MinDifficulty:         8,
-		MaxDifficulty:         24,
-		LowThreshold:          100,
-		HighThreshold:         10000,
-		HashFunction:          "sha256",
-		EpochWindowSeconds:    envIntOr("ORTHOLOG_EPOCH_WINDOW_SECONDS", 3600),
-		EpochAcceptanceWindow: envIntOr("ORTHOLOG_EPOCH_ACCEPTANCE_WINDOW", 1),
+		BatchSize:              1000,
+		PollInterval:           100 * time.Millisecond,
+		EpochWindowSeconds:    3600,
+		EpochAcceptanceWindow: 1,
+		AnchorInterval:         1 * time.Hour,
+		TesseraStorageRoot:     envOr("OPERATOR_TESSERA_ROOT", "/var/lib/operator/tessera"),
+		WitnessQuorumK:         1,
+		ByteStoreRoot:          envOr("OPERATOR_BYTESTORE_ROOT", "/var/lib/operator/bytestore"),
 	}
+	if cfg.DatabaseURL == "" {
+		return nil, fmt.Errorf("OPERATOR_DATABASE_URL required")
+	}
+	if cfg.LogDID == "" {
+		return nil, fmt.Errorf("OPERATOR_LOG_DID required (destination-binding)")
+	}
+	if cfg.OperatorDID == "" {
+		cfg.OperatorDID = cfg.LogDID // Default to single-exchange deployment.
+	}
+	return cfg, nil
 }
 
 func envOr(key, fallback string) string {
@@ -374,14 +110,214 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-func envIntOr(key string, fallback int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(v)
+// ─────────────────────────────────────────────────────────────────────
+// Main
+// ─────────────────────────────────────────────────────────────────────
+
+func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
+	cfg, err := loadConfig()
 	if err != nil {
-		return fallback
+		logger.Error("config", "error", err)
+		os.Exit(1)
 	}
-	return n
+
+	// Fail-fast sanity check on the LogDID before we touch Postgres.
+	if valErr := envelope.ValidateDestination(cfg.LogDID); valErr != nil {
+		logger.Error("invalid OPERATOR_LOG_DID", "error", valErr)
+		os.Exit(1)
+	}
+
+	logger.Info("operator starting",
+		"log_did", cfg.LogDID,
+		"operator_did", cfg.OperatorDID,
+		"addr", cfg.ServerAddr,
+		"sdk_version", "v0.3.0-tessera",
+	)
+
+	ctx, cancel := signal.NotifyContext(context.Background(),
+		syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// ── Postgres ──────────────────────────────────────────────────────
+	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("pgxpool", "error", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	// ── Stores ────────────────────────────────────────────────────────
+	entryStore := store.NewEntryStore(pool)
+	creditStore := store.NewCreditStore(pool)
+	commitStore := store.NewCommitmentStore(pool)
+	leafStore := store.NewPostgresLeafStore(pool)
+	nodeCache := store.NewPostgresNodeCache(pool)
+
+	// ── Byte store + Tessera ──────────────────────────────────────────
+	byteStore, err := tessera.NewFSByteStore(cfg.ByteStoreRoot)
+	if err != nil {
+		logger.Error("byte store", "error", err)
+		os.Exit(1)
+	}
+
+	tesseraClient, err := tessera.NewClient(ctx, cfg.TesseraStorageRoot, cfg.LogDID, logger)
+	if err != nil {
+		logger.Error("tessera", "error", err)
+		os.Exit(1)
+	}
+	defer tesseraClient.Close()
+
+	// ── Builder dependencies ──────────────────────────────────────────
+	fetcher := store.NewPostgresEntryFetcher(pool, byteStore, cfg.LogDID)
+	schema := builder.NewInMemorySchemaResolver() // Replace with SDK schema resolver when ready.
+	buffer := sdkbuilder.NewDeltaWindowBuffer(10)
+	bufferStore := builder.NewDeltaBufferStore(pool)
+	queue := builder.NewQueue(pool)
+	tree := smt.NewTree(leafStore, nodeCache)
+
+	// Restore buffer from persistence (cold start = strict OCC per SDK-D9).
+	if loadErr := bufferStore.Load(ctx, buffer); loadErr != nil {
+		logger.Warn("delta buffer load — starting cold", "error", loadErr)
+	}
+
+	// ── Commitment publisher — LogDID threaded (v0.3.0) ───────────────
+	commitPub := builder.NewCommitmentPublisher(
+		cfg.OperatorDID,
+		cfg.LogDID, // NEW: destination-binding for self-published commentary.
+		builder.CommitmentPublisherConfig{
+			IntervalEntries: 1000,
+			IntervalTime:    1 * time.Hour,
+		},
+		anchor.SubmitViaHTTP(fmt.Sprintf("http://localhost%s", cfg.ServerAddr)),
+		logger,
+	).WithCommitmentStore(commitStore)
+
+	// ── Admission controller ──────────────────────────────────────────
+	diffController := middleware.NewDifficultyController(
+		middleware.DifficultyConfig{
+			MinDifficulty:   8,
+			MaxDifficulty:   24,
+			TargetQueueSize: 500,
+		}, logger,
+	)
+
+	// ── Witness cosigner ──────────────────────────────────────────────
+	var cosigner builder.WitnessCosigner
+	if len(cfg.WitnessEndpoints) > 0 {
+		cosigner = witness.NewRequester(cfg.WitnessEndpoints, cfg.WitnessQuorumK, logger)
+	}
+
+	// ── Builder loop ──────────────────────────────────────────────────
+	loopCfg := builder.DefaultLoopConfig(cfg.LogDID)
+	loopCfg.BatchSize = cfg.BatchSize
+	loopCfg.PollInterval = cfg.PollInterval
+
+	bl := builder.NewBuilderLoop(
+		loopCfg, pool, tree, leafStore, nodeCache,
+		queue, fetcher, schema, buffer, bufferStore,
+		commitPub, tesseraClient, cosigner, logger,
+	)
+
+	// ── Anchor publisher — LogDID threaded (v0.3.0) ───────────────────
+	anchorPub := anchor.NewPublisher(
+		anchor.PublisherConfig{
+			OperatorDID:   cfg.OperatorDID,
+			LogDID:        cfg.LogDID, // NEW: destination-binding.
+			Interval:      cfg.AnchorInterval,
+			AnchorSources: cfg.AnchorSources,
+		},
+		tesseraClient,
+		anchor.SubmitViaHTTP(fmt.Sprintf("http://localhost%s", cfg.ServerAddr)),
+		logger,
+	)
+
+	// ── Submission handler — FreshnessTolerance explicit (v0.3.0) ─────
+	submitHandler := api.NewSubmissionHandler(&api.SubmissionDeps{
+		Storage: api.StorageDeps{
+			DB:          pool,
+			EntryStore:  entryStore,
+			EntryWriter: tesseraClient, // satisfies tessera.EntryWriter via byteStore
+		},
+		Admission: api.AdmissionConfig{
+			DiffController:        diffController,
+			EpochWindowSeconds:    cfg.EpochWindowSeconds,
+			EpochAcceptanceWindow: cfg.EpochAcceptanceWindow,
+		},
+		Identity: api.IdentityDeps{
+			CreditStore: creditStore,
+			DIDResolver: nil, // Phase 4: swap for did.DefaultVerifierRegistry wrapper.
+		},
+		Queue:              queue,
+		LogDID:             cfg.LogDID,
+		MaxEntrySize:       cfg.MaxEntrySize,
+		Logger:             logger,
+		FreshnessTolerance: policy.FreshnessInteractive, // 5-min late-replay window.
+	})
+
+	// ── Query handlers ────────────────────────────────────────────────
+	queryDeps := &api.QueryDeps{
+		DB:          pool,
+		EntryStore:  entryStore,
+		EntryReader: tesseraClient,
+		Logger:      logger,
+	}
+
+	// ── HTTP router ───────────────────────────────────────────────────
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/entries", submitHandler)
+	mux.HandleFunc("GET /v1/entries", api.NewRangeQueryHandler(queryDeps))
+	mux.HandleFunc("GET /v1/entries/hash/", api.NewHashLookupHandler(queryDeps))
+	mux.HandleFunc("GET /v1/entries/", api.NewRawEntryHandler(queryDeps))
+	mux.HandleFunc("GET /v1/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok","log_did":"` + cfg.LogDID + `"}`))
+	})
+
+	srv := &http.Server{Addr: cfg.ServerAddr, Handler: mux}
+
+	// ── Run goroutines ────────────────────────────────────────────────
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		logger.Info("HTTP server listening", "addr", cfg.ServerAddr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("http server", "error", err)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := bl.Run(ctx); err != nil {
+			logger.Error("builder loop exited with error", "error", err)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		anchorPub.Run(ctx)
+	}()
+
+	// ── Shutdown ──────────────────────────────────────────────────────
+	<-ctx.Done()
+	logger.Info("shutdown initiated")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("http shutdown", "error", err)
+	}
+
+	wg.Wait()
+
+	b, e, errs := bl.Stats()
+	logger.Info("operator stopped",
+		"batches", b, "entries", e, "errors", errs,
+	)
 }

@@ -37,27 +37,18 @@ import (
 
 	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
 	"github.com/clearcompass-ai/ortholog-sdk/crypto/admission"
+	"github.com/clearcompass-ai/ortholog-sdk/types"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Wire format constants
+//
+// Pre-v0.1.1 of the SDK, these were local guesses (Mode B was wrongly assumed
+// to be wire byte 2 because of "0=absent, 1=ModeA, 2=ModeB" framing). The SDK
+// now exports the canonical values via types.WireByteModeB and
+// admission.WireByteHashSHA256, with a regression test that locks the
+// encoding. Use those directly at construction sites; no local re-aliasing.
 // ─────────────────────────────────────────────────────────────────────────────
-
-const (
-	// adminModeBWireByte is the wire-byte encoding of AdmissionModeB inside
-	// AdmissionProofBody. The SDK's types.AdmissionMode enum uses iota from 0
-	// (ModeA=0, ModeB=1) and ProofFromWire does a direct cast — so the wire
-	// byte and the API enum share the same numeric value: 1.
-	//
-	// We initially guessed 2 (assuming "0 = absent, 1 = ModeA, 2 = ModeB")
-	// and TestSDKAdapter_ProofFromWire_RoundTrip caught the mismatch:
-	//     "admission: stamp mode is not AdmissionModeB: got mode 2"
-	adminModeBWireByte uint8 = 1
-
-	// hashFuncSHA256WireByte is the wire-byte encoding of HashSHA256 inside
-	// AdmissionProofBody. Mirrors admission.HashSHA256 which is also 0.
-	hashFuncSHA256WireByte uint8 = 0
-)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Wire format helpers
@@ -96,10 +87,12 @@ func buildModeBWireEntry(t *testing.T, header envelope.ControlHeader, payload []
 	stampEpoch := currentTestEpoch()
 
 	// Wire-format type. Operator deserializes this from entry header bytes.
+	// Wire bytes come from the SDK's exported aliases (v0.1.1+) — locked
+	// against typed-constant drift by wire_encoding_test.go in the SDK.
 	header.AdmissionProof = &envelope.AdmissionProofBody{
-		Mode:       adminModeBWireByte,
+		Mode:       types.WireByteModeB,
 		Difficulty: uint8(difficulty),
-		HashFunc:   hashFuncSHA256WireByte,
+		HashFunc:   admission.WireByteHashSHA256,
 		Epoch:      stampEpoch,
 		Nonce:      0, // updated each iteration
 	}
@@ -711,9 +704,9 @@ func TestHTTP_Submission_ModeB_StaleEpoch_403(t *testing.T) {
 		SignerDID: "did:example:stale-epoch",
 	}
 	header.AdmissionProof = &envelope.AdmissionProofBody{
-		Mode:       adminModeBWireByte,
+		Mode:       types.WireByteModeB,
 		Difficulty: 8, // low difficulty for fast nonce search
-		HashFunc:   hashFuncSHA256WireByte,
+		HashFunc:   admission.WireByteHashSHA256,
 		Epoch:      staleEpoch,
 		Nonce:      0,
 	}

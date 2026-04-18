@@ -1313,13 +1313,12 @@ func TestSDKAdapter_ProofFromWire_RoundTrip(t *testing.T) {
 	}
 
 	// Construct the wire-format body the operator would receive over HTTP.
-	// Wire byte values are SDK-internal — we use the same constants the
-	// http_integration_test.go fixtures use, which are validated by HTTP
-	// round-trip tests against the real operator.
+	// Use the SDK's exported wire-byte aliases (v0.1.1+) — locked against
+	// typed-constant drift by wire_encoding_test.go in the SDK.
 	body := &envelope.AdmissionProofBody{
-		Mode:            adminModeBWireByte,
+		Mode:            types.WireByteModeB,
 		Difficulty:      uint8(difficulty),
-		HashFunc:        hashFuncSHA256WireByte,
+		HashFunc:        admission.WireByteHashSHA256,
 		Epoch:           params.Epoch,
 		SubmitterCommit: &commit,
 		Nonce:           nonce,
