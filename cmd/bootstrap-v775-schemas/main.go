@@ -51,6 +51,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -127,10 +128,10 @@ func parseFlags() config {
 // transitively, but for a single-file output the hand-roll is
 // dead-simple and avoids the indirect dep being promoted to direct.
 type bootstrapResult struct {
-	GeneratedAt string             `yaml:"generated_at"`
-	OperatorDID string             `yaml:"operator_did"`
-	LogDID      string             `yaml:"log_did"`
-	Schemas     []bootstrapEntry   `yaml:"schemas"`
+	GeneratedAt string           `yaml:"generated_at"`
+	OperatorDID string           `yaml:"operator_did"`
+	LogDID      string           `yaml:"log_did"`
+	Schemas     []bootstrapEntry `yaml:"schemas"`
 }
 
 type bootstrapEntry struct {
@@ -223,7 +224,7 @@ func main() {
 // semantics. The schema_id discriminator embedded in the
 // commitment payload itself is what dispatches admission validation;
 // the schema-definition entry exists for SchemaRef discoverability.
-func buildAndSign(cfg config, priv *privateKey, schemaID string) ([]byte, error) {
+func buildAndSign(cfg config, priv *ecdsa.PrivateKey, schemaID string) ([]byte, error) {
 	// SchemaParameters with all zero values plus an EventTime stamp.
 	// The schema_id discriminator is conveyed via the entry's payload
 	// (BuildSchemaEntry marshals SchemaParameters into Domain Payload);
@@ -262,7 +263,7 @@ func buildAndSign(cfg config, priv *privateKey, schemaID string) ([]byte, error)
 	//   entry.Signatures = [{SignerDID, AlgoID, sig}]
 	signingBytes := envelope.SigningPayload(entry)
 	hash := sha256.Sum256(signingBytes)
-	sig, err := signatures.SignEntry(hash, priv.ecdsa)
+	sig, err := signatures.SignEntry(hash, priv)
 	if err != nil {
 		return nil, fmt.Errorf("SignEntry: %w", err)
 	}
@@ -352,13 +353,6 @@ func submitBatch(operatorURL string, wires [][]byte) ([]batchResultEntry, error)
 // Key loading (hex-encoded 32-byte file)
 // ─────────────────────────────────────────────────────────────────────
 
-// privateKey wraps the SDK ECDSA *PrivateKey type. The wrapper is a
-// clarity nit — the call sites read more clearly with priv.ecdsa
-// than with chained type assertions.
-type privateKey struct {
-	ecdsa = signatures.MustParsePriv("placeholder")
-}
-
 // loadPrivateKey reads a hex-encoded 32-byte secp256k1 scalar from
 // disk and returns an *ecdsa.PrivateKey. The hex file is the
 // operator's institutional governance key for v7.75 deployments;
@@ -372,7 +366,7 @@ type privateKey struct {
 // callers. Wave 2 replaces direct file-based key access with HSM
 // integration; the bootstrap script's interface (--key-path) becomes
 // --hsm-handle or similar at that point.
-func loadPrivateKey(path string) (*privateKey, error) {
+func loadPrivateKey(path string) (*ecdsa.PrivateKey, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read key file: %w", err)
@@ -390,7 +384,7 @@ func loadPrivateKey(path string) (*privateKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse scalar: %w", err)
 	}
-	return &privateKey{ecdsa: priv}, nil
+	return priv, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────
