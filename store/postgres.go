@@ -18,7 +18,14 @@ INVARIANTS:
   - WithTransaction uses Serializable for builder commits, ReadCommitted
     for admission (configurable via TxOptions parameter).
 
-CHANGES: Added derivation_commitments table + index to schemaDDL.
+CHANGES:
+  - v0.3.0-tessera: Added derivation_commitments table + index.
+  - v7.75 Wave 1 (C3): Added commitment_split_id table + index for
+    cryptographic-commitment lookup; BTREE not UNIQUE per Decision 3
+    (equivocation evidence preservation).
+  - v7.75 Wave 1 (S2): Added commitment_equivocation_proofs table for
+    persisting cryptographic evidence of dealer equivocation
+    (multiple commitment entries under one SplitID, ADR-005 §3).
 */
 package store
 
@@ -202,7 +209,7 @@ var schemaDDL = []string{
 		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`,
 
-	// ── Equivocation proofs ──────────────────────────────────────────
+	// ── Equivocation proofs (tree-head fork; v0.3.0-tessera) ────────
 	`CREATE TABLE IF NOT EXISTS equivocation_proofs (
 		id         SERIAL      PRIMARY KEY,
 		head_a     BYTEA       NOT NULL,
@@ -219,10 +226,11 @@ var schemaDDL = []string{
 		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`,
 
-	// ── Derivation commitments (NEW — fraud proof lookup index) ──────
+	// ── Derivation commitments (fraud proof lookup index) ────────────
 	// Post-commit persistence: crash between atomic commit and this
 	// insert loses the row. Acceptable — reconstructable from entries.
-	// See store/commitments.go for full crash recovery semantics.
+	// See store/derivation_commitments.go for full crash recovery
+	// semantics.
 	`CREATE TABLE IF NOT EXISTS derivation_commitments (
 		id              SERIAL      PRIMARY KEY,
 		range_start_seq BIGINT      NOT NULL,
@@ -235,6 +243,87 @@ var schemaDDL = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_commitment_range
 		ON derivation_commitments (range_start_seq, range_end_seq)`,
+
+	// ── Commitment SplitID index (v7.75 — Wave 1 C3) ─────────────────
+	// Maps the 32-byte SplitID embedded in pre-grant-commitment-v1 and
+	// escrow-split-commitment-v1 entry payloads to the entry's sequence
+	// number, enabling the SDK lookup primitives FetchPREGrantCommitment
+	// and FetchEscrowSplitCommitment per ADR-005 §6.2.
+	//
+	// Equivocation evidence preservation (Wave 1 v3 Decision 3): the
+	// (schema_id, split_id) index is BTREE, NOT UNIQUE. A malicious
+	// dealer publishing two distinct commitment entries under the same
+	// SplitID produces two rows here under the same key tuple; both
+	// MUST persist so the SDK can return *CommitmentEquivocationError
+	// to verifiers. Rejecting the second row on a UNIQUE constraint
+	// would silently destroy the cryptographic evidence the SDK's
+	// equivocation detection depends on.
+	//
+	// PRIMARY KEY on sequence_number is correct — two equivocating
+	// entries have distinct sequence numbers (each has its own admission)
+	// and the (schema_id, split_id) tuple is the lookup key, not the
+	// uniqueness key.
+	`CREATE TABLE IF NOT EXISTS commitment_split_id (
+		sequence_number BIGINT NOT NULL,
+		schema_id       TEXT   NOT NULL,
+		split_id        BYTEA  NOT NULL,
+		PRIMARY KEY (sequence_number),
+		FOREIGN KEY (sequence_number) REFERENCES entry_index (sequence_number)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_commitment_split_id
+		ON commitment_split_id (schema_id, split_id)`,
+
+	// ── Commitment equivocation proofs (v7.75 — Wave 1 S2) ───────────
+	// Persists cryptographic evidence of dealer equivocation: when
+	// two or more pre-grant-commitment-v1 or escrow-split-commitment-v1
+	// entries are admitted under the same (schema_id, split_id) tuple,
+	// the witness/commitment_equivocation_monitor.go background loop
+	// detects the collision via the commitment_split_id index and
+	// records evidence here for downstream governance action
+	// (ADR-005 §3 + Wave 1 v3 §S2).
+	//
+	// Schema rationale:
+	//
+	//   - One row per (schema_id, split_id) incident. The UNIQUE
+	//     constraint makes the upsert pattern safe: when a 3rd or 4th
+	//     equivocating entry shows up, the monitor uses
+	//     ON CONFLICT (schema_id, split_id) DO UPDATE to append the
+	//     new sequence to entry_seqs rather than inserting a duplicate
+	//     evidence row.
+	//
+	//   - entry_seqs is a Postgres BIGINT[] holding every sequence
+	//     number that has been seen under this SplitID. Encoded as
+	//     a typed array so order and uniqueness can be enforced at
+	//     the application layer without splitting the row.
+	//
+	//   - first_detected_at / last_observed_at distinguish "when the
+	//     monitor first noticed equivocation" from "when the most
+	//     recent equivocating entry landed", supporting forensics
+	//     across long-lived incidents.
+	//
+	//   - alert_dispatched_at is nullable — set by the S3 alert
+	//     callback when the webhook publication succeeds, so the
+	//     S3 publisher can be re-run safely (alerted incidents
+	//     skip republishing) and operators can audit which incidents
+	//     have been escalated to governance.
+	//
+	// Append-only invariant: rows are NEVER deleted. Equivocation
+	// evidence is permanent — even after governance resolution, the
+	// historical record stays so future audits can reconstruct what
+	// the operator observed.
+	`CREATE TABLE IF NOT EXISTS commitment_equivocation_proofs (
+		id                  SERIAL      PRIMARY KEY,
+		schema_id           TEXT        NOT NULL,
+		split_id            BYTEA       NOT NULL,
+		entry_seqs          BIGINT[]    NOT NULL,
+		first_detected_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		last_observed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		alert_dispatched_at TIMESTAMPTZ,
+		UNIQUE (schema_id, split_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_commitment_equivocation_unalerted
+		ON commitment_equivocation_proofs (first_detected_at)
+		WHERE alert_dispatched_at IS NULL`,
 
 	// ── Sequence ─────────────────────────────────────────────────────
 	`CREATE SEQUENCE IF NOT EXISTS entry_sequence START 1 NO CYCLE`,

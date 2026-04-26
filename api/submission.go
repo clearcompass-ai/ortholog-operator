@@ -1,7 +1,7 @@
 /*
 FILE PATH: api/submission.go
 
-Entry submission endpoint — the complete 13-step admission pipeline.
+Entry submission endpoint — the complete admission pipeline.
 Fail-fast: first failure terminates with appropriate HTTP status.
 
 KEY ARCHITECTURAL DECISIONS:
@@ -16,40 +16,42 @@ KEY ARCHITECTURAL DECISIONS:
   - Duplicate hash mapped to HTTP 409 (not generic 500).
 
 SDK v0.3.0 HARDENING:
-  - Step 3a (NEW): entry.Validate() re-applies NewEntry's write-time invariants
-    after Deserialize. Deserialize is a pure parser — it does not re-run
-    ValidateDestination, DID non-emptiness, ASCII conformance, or size caps.
-    An attacker who wire-forges an entry with empty Destination bypasses
-    NewEntry's gate; Validate() closes that gap at admission.
-  - Step 3b (NEW): destination binding enforcement. An entry signed for
-    exchange A must not be accepted at exchange B. The signature verifies
-    (the canonical bytes that were signed commit to A), but the attacker's
-    goal is replay at B, and B rejects because entry.Destination != LogDID.
-    This is the runtime defense that the cryptographic binding enables.
-  - Step 3c (NEW): late-replay freshness. exchange/policy.CheckFreshness
-    rejects entries whose EventTime is too far in the past — protects
-    against captured-but-never-ingested signed entries being replayed
-    days later.
-  - Step 5 (UPDATED): stamp hash via envelope.EntryIdentity(entry) and
-    epoch via admission.CurrentEpoch (handles pre-1970 clock edge).
-  - Step 8 (UPDATED): canonical hash via envelope.EntryIdentity(entry) —
-    the single authoritative entry-hash primitive.
+  - Step 3a: entry.Validate() re-applies NewEntry's write-time invariants.
+  - Step 3b: destination binding enforcement.
+  - Step 3c: late-replay freshness via exchange/policy.CheckFreshness.
+  - Step 5/8: envelope.EntryIdentity for the canonical hash primitive.
+
+v7.75 WAVE 1 ADMISSION PACKAGE:
+  - Step 3a-NFC: admission.CheckNFC asserts NFC normalization on every
+    DID-shaped header field. Defensive only — no normalization on the
+    caller's behalf (SDK Decision 52 caller-normalizes contract).
+  - Step 4: admission.VerifyEntrySignature wraps SDK signatures.VerifyEntry
+    and preserves the Phase 2 nil-resolver passthrough internally.
+  - Step 4-Schema (NEW, Wave 1 v3 §C2): commitment-schema dispatch.
+    Peeks the entry's payload schema_id and routes recognized
+    cryptographic-commitment payloads through the SDK Parse* validators
+    to extract the SplitID for index population at Step 11. Unrecognized
+    payloads pass through untouched (load-bearing invariant — see the
+    "Passthrough invariant" docblock at the dispatch site).
+    NOTE: parsing here exposes the SplitID for Step 11 indexing only;
+    the operator does not interpret payload semantics for coupling,
+    contestability, or governance. Domain-payload semantics remain
+    opaque to the operator per the Domain/Protocol Separation Principle.
+  - Step 11 (UPDATED): admission tx now also INSERTs into
+    commitment_split_id when a SplitID was extracted at Step 4-Schema.
+    Population is in the same Postgres transaction as the entry_index
+    insert so the index never references a non-existent sequence.
 
   - DIDResolver: nil = Phase 2 wire format trust model.
-    set = Phase 4 full DID→pubkey→VerifyEntry. Future migration can replace
-    this with did.DefaultVerifierRegistry.VerifyEntry (see did/verifier_registry.go).
-
-DEPENDENCY SHAPE:
-
-	SubmissionDeps groups dependencies by cohesion:
-	  - StorageDeps:     persistence (DB + EntryStore + EntryWriter)
-	  - AdmissionConfig: stamp verification policy (DiffController + epoch params)
-	  - IdentityDeps:    credentials + DID resolution
-	Crosscutting fields (LogDID, Logger, MaxEntrySize, Queue) live at the top.
+    set = Phase 4 full DID→pubkey→VerifyEntry. Future migration can
+    replace this with did.DefaultVerifierRegistry.VerifyEntry.
 
 INVARIANTS:
+  - Past step 3a-NFC: all entries have NFC-normalized DID-shaped fields.
   - Past step 3b: all entries are bound to THIS log's LogDID.
   - Past step 4: all entries have verified signatures (SDK-D5).
+  - Past step 4-Schema: any pre-grant or escrow-split commitment entry
+    has a structurally valid payload and an extracted SplitID.
   - Log_Time is monotonically non-decreasing within single-operator deployment.
   - Sequence numbers are gapless (Postgres sequence).
 */
@@ -72,10 +74,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
-	"github.com/clearcompass-ai/ortholog-sdk/crypto/admission"
-	"github.com/clearcompass-ai/ortholog-sdk/crypto/signatures"
+	sdkadmission "github.com/clearcompass-ai/ortholog-sdk/crypto/admission"
+	"github.com/clearcompass-ai/ortholog-sdk/crypto/artifact"
+	"github.com/clearcompass-ai/ortholog-sdk/crypto/escrow"
 	"github.com/clearcompass-ai/ortholog-sdk/exchange/policy"
+	sdkschema "github.com/clearcompass-ai/ortholog-sdk/schema"
 
+	"github.com/clearcompass-ai/ortholog-operator/admission"
 	"github.com/clearcompass-ai/ortholog-operator/api/middleware"
 	"github.com/clearcompass-ai/ortholog-operator/builder"
 	"github.com/clearcompass-ai/ortholog-operator/store"
@@ -92,9 +97,9 @@ import (
 // nil = Phase 2 trust model (wire format integrity only).
 // set = Phase 4 full verification (DID → pubkey → sdk VerifyEntry).
 //
-// Future migration: replace this with did.VerifierRegistry, whose
-// VerifyEntry method enforces destination binding automatically and
-// dispatches across DID methods (web/key/pkh).
+// Structurally compatible with admission.DIDResolver — the operator's
+// admission package defines the same single-method interface, and Go
+// auto-converts at the call site to admission.VerifyEntrySignature.
 type DIDResolver interface {
 	ResolvePublicKey(ctx context.Context, did string) (*ecdsa.PublicKey, error)
 }
@@ -111,12 +116,6 @@ type StorageDeps struct {
 }
 
 // AdmissionConfig groups parameters that govern admission proof verification.
-//
-//	DiffController        — provides current difficulty and hash function policy.
-//	EpochWindowSeconds    — size of one epoch in seconds (e.g., 3600 = 1 hour).
-//	                        MUST be positive; zero will panic at handler creation.
-//	EpochAcceptanceWindow — tolerance in epochs around current. A value of 0
-//	                        DISABLES epoch checking entirely.
 type AdmissionConfig struct {
 	DiffController        *middleware.DifficultyController
 	EpochWindowSeconds    int
@@ -139,15 +138,89 @@ type SubmissionDeps struct {
 	MaxEntrySize int64
 	Logger       *slog.Logger
 
-	// FreshnessTolerance configures the late-replay rejection window at
-	// admission time (exchange/policy.CheckFreshness). Zero defaults to
-	// policy.FreshnessInteractive (5 minutes). Set to a larger tempo for
-	// deliberative flows, smaller for automated/daemon-only endpoints.
+	// FreshnessTolerance configures the late-replay rejection window
+	// at admission time. Zero defaults to policy.FreshnessInteractive.
 	FreshnessTolerance time.Duration
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3) Submission Handler
+// 3) Schema dispatch (C2 — commitment SplitID extraction)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// commitmentPayloadPeek mirrors the leading "schema_id" field shared
+// by both pre-grant-commitment-v1 and escrow-split-commitment-v1
+// payload envelopes. Any other field in the payload is ignored at
+// the peek stage; full validation lives in the SDK's Parse*
+// functions which are only invoked when the schema_id matches a
+// recognized commitment schema.
+type commitmentPayloadPeek struct {
+	SchemaID string `json:"schema_id"`
+}
+
+// dispatchCommitmentSchema inspects the entry's DomainPayload for a
+// recognized commitment schema_id and, when matched, routes the entry
+// through the appropriate SDK Parse* validator to extract the
+// 32-byte SplitID for downstream index population.
+//
+// Return contract:
+//
+//   - (nil, "", nil): no commitment schema matched. The entry is not
+//     a v7.75 cryptographic-commitment entry; admission proceeds
+//     unchanged. This is the Passthrough invariant case (see below).
+//   - (&splitID, schemaID, nil): a recognized commitment schema
+//     parsed cleanly; the SplitID will be inserted into
+//     commitment_split_id at Step 11.
+//   - (nil, "", err): a recognized commitment schema_id was present
+//     but the payload failed structural validation. Admission MUST
+//     reject the entry — a malformed commitment entry would surface
+//     to verifiers as missing or unparseable on lookup.
+//
+// Passthrough invariant (Wave 1 v3 §C2). An entry whose payload has
+// no schema_id field, an unrecognized schema_id, or no DomainPayload
+// at all MUST flow through this stage unchanged. The dispatch is a
+// switch on KNOWN cryptographic-commitment schema_ids; the default
+// branch is a no-op return. This is what allows the F4 bootstrap
+// script to flow schema-definition entries through admission before
+// any commitment entry has ever been admitted, and it preserves the
+// Domain/Protocol Separation Principle: the operator never inspects
+// payload semantics it does not own.
+func dispatchCommitmentSchema(entry *envelope.Entry) (*[32]byte, string, error) {
+	if entry == nil || len(entry.DomainPayload) == 0 {
+		return nil, "", nil
+	}
+	var peek commitmentPayloadPeek
+	// json.Unmarshal failure on the peek is treated as passthrough,
+	// not as rejection: domain payloads are not required to be JSON,
+	// and malformed payloads in unrelated schemas should not be
+	// policed here. The recognized-schema branches below re-decode
+	// and surface their own structural errors via the SDK Parse*
+	// functions.
+	if err := json.Unmarshal(entry.DomainPayload, &peek); err != nil {
+		return nil, "", nil
+	}
+	switch peek.SchemaID {
+	case artifact.PREGrantCommitmentSchemaID:
+		commitment, err := sdkschema.ParsePREGrantCommitmentEntry(entry)
+		if err != nil {
+			return nil, "", err
+		}
+		sid := commitment.SplitID
+		return &sid, artifact.PREGrantCommitmentSchemaID, nil
+	case escrow.EscrowSplitCommitmentSchemaID:
+		commitment, err := sdkschema.ParseEscrowSplitCommitmentEntry(entry)
+		if err != nil {
+			return nil, "", err
+		}
+		sid := commitment.SplitID
+		return &sid, escrow.EscrowSplitCommitmentSchemaID, nil
+	default:
+		// Passthrough — see invariant docblock above.
+		return nil, "", nil
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4) Submission Handler
 // ─────────────────────────────────────────────────────────────────────────────
 
 // NewSubmissionHandler creates the POST /v1/entries handler.
@@ -211,27 +284,21 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 			return
 		}
 
-		// ── Step 3a: Re-apply NewEntry's write-time invariants (NEW) ──
-		// Deserialize is a pure parser — it does not re-run ValidateDestination,
-		// DID non-emptiness, ASCII conformance, or size caps. An attacker who
-		// wire-forges an entry with empty Destination or non-ASCII bytes
-		// bypasses NewEntry's gate; Validate() closes that gap here.
+		// ── Step 3a: Re-apply NewEntry's write-time invariants ─────────
 		if err := entry.Validate(); err != nil {
 			writeError(w, http.StatusUnprocessableEntity,
 				fmt.Sprintf("entry validation: %s", err))
 			return
 		}
 
-		// ── Step 3b: Destination binding enforcement (NEW) ────────────
-		// The entry's canonical hash commits to Header.Destination. A valid
-		// signature proves the signer intended the entry for SOME destination;
-		// this check proves that destination is US. Without it, an attacker
-		// who captured a signed entry for exchange A could replay it at B —
-		// the signature still verifies, but the attacker's goal (having B
-		// accept the entry) is foiled because B rejects on destination mismatch.
-		//
-		// In Phase 4, did.VerifierRegistry.VerifyEntry performs this check
-		// automatically and step 3b becomes redundant.
+		// ── Step 3a-NFC: Defensive NFC assertion (Wave 1 v7.75 F2) ─────
+		if err := admission.CheckNFC(entry); err != nil {
+			writeError(w, http.StatusUnprocessableEntity,
+				fmt.Sprintf("NFC: %s", err))
+			return
+		}
+
+		// ── Step 3b: Destination binding enforcement ───────────────────
 		if entry.Header.Destination != deps.LogDID {
 			writeError(w, http.StatusForbidden,
 				fmt.Sprintf("entry destination %q does not match log %q",
@@ -239,51 +306,45 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 			return
 		}
 
-		// ── Step 3c: Late-replay freshness (NEW) ──────────────────────
-		// Reject entries whose EventTime is outside the tolerance. Defends
-		// against an attacker who captured a legitimately-signed entry,
-		// prevented its delivery, and replayed it arbitrarily later.
+		// ── Step 3c: Late-replay freshness ─────────────────────────────
 		if err := policy.CheckFreshness(entry, time.Now().UTC(), freshness); err != nil {
 			writeError(w, http.StatusUnprocessableEntity,
 				fmt.Sprintf("freshness: %s", err))
 			return
 		}
 
-		// ── Step 4: Signature verification (SDK-D5) ────────────────────
+		// ── Step 4: Signature verification (SDK-D5, Wave 1 F3a) ────────
 		if entry.Header.SignerDID == "" {
-			// Validate() already catches this, but belt-and-braces.
 			writeError(w, http.StatusUnprocessableEntity, "empty signer DID")
 			return
 		}
+		if err := admission.VerifyEntrySignature(ctx, entry, sigBytes, deps.Identity.DIDResolver); err != nil {
+			switch {
+			case errors.Is(err, admission.ErrSignerDIDResolution):
+				writeError(w, http.StatusUnauthorized, err.Error())
+			case errors.Is(err, admission.ErrSignatureInvalid):
+				writeError(w, http.StatusUnauthorized, err.Error())
+			default:
+				deps.Logger.Error("signature verification path failed", "error", err)
+				writeError(w, http.StatusInternalServerError, "signature verification failed")
+			}
+			return
+		}
 
-		if deps.Identity.DIDResolver != nil {
-			// Phase 4: full cryptographic verification.
-			pubkey, resolveErr := deps.Identity.DIDResolver.ResolvePublicKey(ctx, entry.Header.SignerDID)
-			if resolveErr != nil {
-				writeError(w, http.StatusUnauthorized,
-					fmt.Sprintf("DID resolution failed for %s: %s",
-						entry.Header.SignerDID, resolveErr))
-				return
-			}
-			// Use envelope.EntryIdentity — single source of truth for entry hashes.
-			// Identical bytes to sha256.Sum256(canonical), but the vocabulary
-			// makes explicit that this is the Tessera-aligned dedup key.
-			canonicalHash := envelope.EntryIdentity(entry)
-			if verifyErr := signatures.VerifyEntry(canonicalHash, sigBytes, pubkey); verifyErr != nil {
-				writeError(w, http.StatusUnauthorized,
-					fmt.Sprintf("signature verification failed: %s", verifyErr))
-				return
-			}
-		} else {
-			// Phase 2 trust model: wire format integrity only.
-			_ = sigBytes
+		// ── Step 4-Schema: Commitment dispatch (Wave 1 v3 §C2) ─────────
+		// Recognized cryptographic-commitment payloads route through
+		// the SDK Parse* validators to extract the SplitID. Recognized
+		// failures (ErrCommitmentPayloadMalformed, ErrCommitmentSchemaIDMismatch)
+		// reject with HTTP 422. Unrecognized schemas pass through —
+		// see dispatchCommitmentSchema's Passthrough invariant.
+		extractedSplitID, extractedSchemaID, dispatchErr := dispatchCommitmentSchema(entry)
+		if dispatchErr != nil {
+			writeError(w, http.StatusUnprocessableEntity,
+				fmt.Sprintf("commitment schema: %s", dispatchErr))
+			return
 		}
 
 		// ── Step 5: Entry size (SDK-D11) ───────────────────────────────
-		// Validate() already enforced this via the NewEntry-equivalent size
-		// check, but we keep it explicit here because the declared limit
-		// is an admission-policy concern (operator may tighten below the
-		// SDK ceiling).
 		if int64(len(canonical)) > deps.MaxEntrySize {
 			writeError(w, http.StatusRequestEntityTooLarge,
 				fmt.Sprintf("canonical bytes %d exceed max %d",
@@ -312,34 +373,29 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 				return
 			}
 
-			apiProof := admission.ProofFromWire(h.AdmissionProof, deps.LogDID)
+			apiProof := sdkadmission.ProofFromWire(h.AdmissionProof, deps.LogDID)
 
-			// SDK v0.3.0: envelope.EntryIdentity is the canonical entry-hash
-			// primitive. Byte-identical to sha256.Sum256(canonical) but binds
-			// to the Tessera dedup-key vocabulary.
 			canonicalHash := envelope.EntryIdentity(entry)
 			currentDifficulty := deps.Admission.DiffController.CurrentDifficulty()
 			hashFuncName := deps.Admission.DiffController.HashFunction()
-			var hashFunc admission.HashFunc
+			var hashFunc sdkadmission.HashFunc
 			switch hashFuncName {
 			case "argon2id":
-				hashFunc = admission.HashArgon2id
+				hashFunc = sdkadmission.HashArgon2id
 			default:
-				hashFunc = admission.HashSHA256
+				hashFunc = sdkadmission.HashSHA256
 			}
 
-			// SDK admission.CurrentEpoch handles the pre-1970 clock edge case
-			// (negative Unix timestamp cast to uint64 would silently underflow).
-			currentEpoch := admission.CurrentEpoch(uint64(deps.Admission.EpochWindowSeconds))
+			currentEpoch := sdkadmission.CurrentEpoch(uint64(deps.Admission.EpochWindowSeconds))
 			acceptanceWindow := uint64(deps.Admission.EpochAcceptanceWindow)
 
-			if err := admission.VerifyStamp(
+			if err := sdkadmission.VerifyStamp(
 				apiProof,
 				canonicalHash,
 				deps.LogDID,
 				currentDifficulty,
 				hashFunc,
-				nil, // Argon2idParams: nil = SDK defaults
+				nil,
 				currentEpoch,
 				acceptanceWindow,
 			); err != nil {
@@ -350,15 +406,12 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 		}
 
 		// ── Step 8: Canonical hash (Tessera-aligned vocabulary) ────────
-		// envelope.EntryIdentity(entry) is the Tessera dedup key — the
-		// value Tessera's Entry.Identity() returns. Byte-identical to
-		// sha256.Sum256(envelope.Serialize(entry)).
 		canonicalHash := envelope.EntryIdentity(entry)
 
 		// ── Step 9: Log_Time assignment (SDK-D1, Decision 50) ──────────
 		logTime := time.Now().UTC()
 
-		// ── Steps 10-12: Atomic persist + enqueue ──────────────────────
+		// ── Steps 10-12: Atomic persist + index + enqueue ──────────────
 		var seq uint64
 		err = store.WithReadCommittedTx(ctx, deps.Storage.DB, func(ctx context.Context, tx pgx.Tx) error {
 			// Mode A credit deduction (inside transaction).
@@ -397,6 +450,23 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 			})
 			if insertErr != nil {
 				return insertErr
+			}
+
+			// ── Step 11: SplitID index population (Wave 1 v3 §C2/C3) ─
+			// When Step 4-Schema extracted a SplitID, persist the
+			// (sequence, schema_id, split_id) tuple inside the same
+			// transaction so the index never references a non-existent
+			// sequence. The (schema_id, split_id) tuple is intentionally
+			// non-unique (Decision 3); duplicates here are equivocation
+			// evidence, not a constraint violation.
+			if extractedSplitID != nil {
+				if _, splitErr := tx.Exec(ctx, `
+					INSERT INTO commitment_split_id (sequence_number, schema_id, split_id)
+					VALUES ($1, $2, $3)`,
+					seq, extractedSchemaID, extractedSplitID[:],
+				); splitErr != nil {
+					return fmt.Errorf("commitment_split_id insert: %w", splitErr)
+				}
 			}
 
 			if deps.Storage.EntryWriter != nil {
@@ -440,7 +510,7 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4) Shared helpers
+// 5) Shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 func writeError(w http.ResponseWriter, status int, msg string) {

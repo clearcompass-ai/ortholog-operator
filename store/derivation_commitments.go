@@ -1,8 +1,23 @@
 /*
-FILE PATH: store/commitments.go
+FILE PATH: store/derivation_commitments.go
 
-Derivation commitment persistence. Fast-lookup index for fraud proof
-verification — "give me the commitment covering tree_size=N."
+SMT batch DERIVATION commitment persistence — fast-lookup index for
+fraud proof verification: "give me the commitment covering tree_size=N."
+
+This file is NOT about v7.75 cryptographic Pedersen commitments
+(escrow_split_commitments.go and pre_grant_commitments.go cover those).
+The word "commitment" is overloaded across two distinct concepts:
+
+  - DERIVATION commitments (this file): operator-published commentary
+    that pins the (range_start, range_end, prior_smt_root, post_smt_root,
+    mutations_json) tuple for a builder batch. Used by fraud-proof
+    verifiers to attest that a specific run of the builder against
+    a specific entry range produced a specific SMT mutation set.
+
+  - CRYPTOGRAPHIC commitments (v7.75): Pedersen commitments published
+    on-log alongside escrow shares and PRE grants per ADR-005 §4.
+    Verifier-side equivocation detection and cross-share consistency
+    rely on these.
 
 CRASH RECOVERY: Commitments are persisted POST-COMMIT (loop.go step 7).
 A crash between atomic commit and commitment persistence loses the row.
@@ -33,7 +48,7 @@ type CommitmentRow struct {
 	PriorSMTRoot  [32]byte
 	PostSMTRoot   [32]byte
 	MutationsJSON []byte
-	CommentarySeq *uint64   // nullable — set when commentary entry submitted
+	CommentarySeq *uint64 // nullable — set when commentary entry submitted
 	CreatedAt     time.Time
 }
 
@@ -42,7 +57,7 @@ type CommitmentStore struct {
 	db *pgxpool.Pool
 }
 
-// NewCommitmentStore creates a commitment store.
+// NewCommitmentStore creates a derivation-commitment store.
 func NewCommitmentStore(db *pgxpool.Pool) *CommitmentStore {
 	return &CommitmentStore{db: db}
 }
@@ -59,7 +74,7 @@ func (s *CommitmentStore) Insert(ctx context.Context, row CommitmentRow) error {
 		row.MutationsJSON, row.CommentarySeq,
 	)
 	if err != nil {
-		return fmt.Errorf("store/commitments: insert: %w", err)
+		return fmt.Errorf("store/derivation_commitments: insert: %w", err)
 	}
 	return nil
 }
@@ -83,7 +98,7 @@ func (s *CommitmentStore) QueryBySequence(ctx context.Context, seq uint64) (*Com
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("store/commitments: query seq=%d: %w", seq, err)
+		return nil, fmt.Errorf("store/derivation_commitments: query seq=%d: %w", seq, err)
 	}
 	if len(priorRoot) == 32 {
 		copy(row.PriorSMTRoot[:], priorRoot)
