@@ -14,6 +14,15 @@ entry bytes. Always.
   - PostgresEntryFetcher combines: metadata from entry_index + bytes from EntryReader.
   - SDK EntryFetcher interface unchanged: Fetch(pos) → *EntryWithMetadata.
 
+EntryWithMetadata field set: under v6 the SDK type carries only
+CanonicalBytes, LogTime, Position. Signatures live inside
+CanonicalBytes (extracted via envelope.Deserialize when needed).
+The earlier SignatureAlgoID/SignatureBytes sidecar fields were
+removed; this fetcher reads only what the type carries. The
+sig_algorithm_id column remains in entry_index for diagnostics
+and for any future SDK-internal need, but is not surfaced through
+EntryWithMetadata.
+
 INVARIANTS:
   - SDK-D5: all returned entries have verified signatures.
   - Decision 47: Fetch returns nil for foreign log DIDs.
@@ -140,16 +149,15 @@ func (f *PostgresEntryFetcher) Fetch(pos types.LogPosition) (*types.EntryWithMet
 
 	ctx := context.TODO()
 
-	// (1) Metadata from entry_index.
-	var (
-		logTime time.Time
-		algoID  int16
-	)
+	// (1) Metadata from entry_index. log_time is the only field
+	// EntryWithMetadata exposes from the index; signatures are
+	// served as part of CanonicalBytes from Tessera.
+	var logTime time.Time
 	err := f.db.QueryRow(ctx, `
-		SELECT log_time, sig_algorithm_id
+		SELECT log_time
 		FROM entry_index WHERE sequence_number = $1`,
 		pos.Sequence,
-	).Scan(&logTime, &algoID)
+	).Scan(&logTime)
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -164,12 +172,13 @@ func (f *PostgresEntryFetcher) Fetch(pos types.LogPosition) (*types.EntryWithMet
 		return nil, fmt.Errorf("store/entries: read bytes seq=%d: %w", pos.Sequence, err)
 	}
 
-	// (3) Assemble — interface unchanged.
+	// (3) Assemble — three-field EntryWithMetadata per the v6 SDK
+	// type. Callers that need the primary signature's algoID or
+	// raw bytes call envelope.Deserialize on CanonicalBytes and
+	// read entry.Signatures[0]; see the type's godoc.
 	return &types.EntryWithMetadata{
-		CanonicalBytes:  raw.CanonicalBytes,
-		LogTime:         logTime,
-		Position:        pos,
-		SignatureAlgoID: uint16(algoID),
-		SignatureBytes:  raw.SigBytes,
+		CanonicalBytes: raw.CanonicalBytes,
+		LogTime:        logTime,
+		Position:       pos,
 	}, nil
 }

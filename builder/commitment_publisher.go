@@ -26,9 +26,17 @@ path for commentary entries to appear on the log. The anchor/publisher.go
 pattern (SubmitViaHTTP) is the reference implementation. Until submitFn is
 wired, the commentary_seq column in derivation_commitments has no value.
 
-SDK ALIGNMENT (v0.3.0):
-  - envelope.NewEntry requires Destination. NewCommitmentPublisher now takes
-    a logDID parameter; callers in cmd/operator/main.go thread cfg.LogDID.
+SDK ALIGNMENT:
+  - v0.3.0: envelope.NewEntry required Destination via ValidateDestination.
+  - v7.75: entry construction split into two constructors per
+    core/envelope/entry.go's docblock —
+        envelope.NewEntry(header, payload, signatures)  — fully signed
+        envelope.NewUnsignedEntry(header, payload)      — sign-then-attach
+    The publisher constructs the commentary unsigned and hands it to
+    submitFn for signing and submission, so the right constructor is
+    NewUnsignedEntry. submitFn (or SubmitViaHTTP) is responsible for
+    populating entry.Signatures before envelope.Serialize is invoked
+    on the entry.
 */
 package builder
 
@@ -70,8 +78,8 @@ type CommitmentPublisher struct {
 // operatorDID: the key DID signing the commentary entries.
 // logDID:      the destination the commentary binds to (this operator's log).
 //
-// logDID MUST be non-empty — envelope.NewEntry will reject construction
-// otherwise (SDK v0.3.0 destination-binding).
+// logDID MUST be non-empty — envelope.NewUnsignedEntry will reject
+// construction otherwise (SDK v0.3.0 destination-binding).
 func NewCommitmentPublisher(
 	operatorDID string,
 	logDID string,
@@ -161,7 +169,11 @@ func (cp *CommitmentPublisher) publish(
 
 	// Build commentary entry: Target_Root=null, Authority_Path=null.
 	// Destination = logDID — this commentary lands in the local log.
-	entry, err := envelope.NewEntry(envelope.ControlHeader{
+	//
+	// NewUnsignedEntry per the v7.75 envelope API split: this
+	// publisher constructs the entry, submitFn signs and submits.
+	// Fully-signed callers use envelope.NewEntry(header, payload, sigs).
+	entry, err := envelope.NewUnsignedEntry(envelope.ControlHeader{
 		SignerDID:   cp.operatorDID,
 		Destination: cp.logDID,
 		EventTime:   time.Now().UTC().Unix(),

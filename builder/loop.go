@@ -30,6 +30,17 @@ KEY ARCHITECTURAL DECISIONS:
   - Idempotent: replaying the same batch produces identical state.
   - Context-aware: every Postgres call checks ctx.Done() first.
 
+SDK ALIGNMENT:
+  - Pre-v7.75: builder.EntryFetcher was the read-side abstraction.
+  - v7.75: per types/fetcher.go's docblock, "Decision 52 consolidates
+    the definition here as part of the core/scope/ primitive layering.
+    Previously it lived in builder/ and was duplicated in verifier/."
+    The interface now lives at types.EntryFetcher with the same
+    Fetch(pos LogPosition) (*EntryWithMetadata, error) signature.
+    sdkbuilder.ProcessBatch accepts types.EntryFetcher, so swapping
+    the field's declared type to types.EntryFetcher is a clean
+    follow-the-SDK rename.
+
 OVERVIEW:
 
 	Run loop: dequeue → fetch → split → ProcessBatch → atomic commit →
@@ -39,12 +50,11 @@ OVERVIEW:
 	commit and append → re-append on restart is safe (Tessera deduplicates
 	by identity hash). The operator's atomic state is in Postgres.
 
-CONSUMER VERIFICATION FLOW (new contract):
+CONSUMER VERIFICATION FLOW (v7.75 contract):
     1. Fetch wire bytes from operator's byte store.
-    2. StripSignature → (canonical, algoID, sig).
-    3. envelope.Deserialize(canonical) → entry.
-    4. envelope.EntryIdentity(entry) → 32-byte hash.
-    5. Fetch inclusion proof for position N, verify path hashes to the
+    2. envelope.Deserialize(canonical) → entry (signatures inline).
+    3. envelope.EntryIdentity(entry) → 32-byte hash.
+    4. Fetch inclusion proof for position N, verify path hashes to the
        tree head published in the signed checkpoint.
 
 MIGRATION NOTE:
@@ -54,11 +64,14 @@ MIGRATION NOTE:
     through the builder against a fresh Tessera backend.
 
 KEY DEPENDENCIES:
-  - github.com/clearcompass-ai/ortholog-sdk/builder: ProcessBatch, BatchResult.
+  - github.com/clearcompass-ai/ortholog-sdk/builder: ProcessBatch, BatchResult,
+    SchemaResolver, DeltaWindowBuffer.
   - github.com/clearcompass-ai/ortholog-sdk/core/envelope: EntryIdentity.
+  - github.com/clearcompass-ai/ortholog-sdk/types: EntryFetcher (read-side
+    abstraction, moved from builder/ in v7.75).
   - tessera/proof_adapter.go: TesseraAdapter implements MerkleAppender.
   - store/smt_state.go: PostgresLeafStore.SetTx for atomic leaf writes.
-  - store/entries.go: PostgresEntryFetcher for entry retrieval.
+  - store/entries.go: PostgresEntryFetcher implements types.EntryFetcher.
 */
 package builder
 
@@ -139,7 +152,7 @@ type BuilderLoop struct {
 	leafStore   *store.PostgresLeafStore
 	nodeCache   *store.PostgresNodeCache
 	queue       *Queue
-	fetcher     sdkbuilder.EntryFetcher
+	fetcher     types.EntryFetcher
 	schema      sdkbuilder.SchemaResolver
 	buffer      *sdkbuilder.DeltaWindowBuffer
 	bufferStore *DeltaBufferStore
@@ -163,7 +176,7 @@ func NewBuilderLoop(
 	leafStore *store.PostgresLeafStore,
 	nodeCache *store.PostgresNodeCache,
 	queue *Queue,
-	fetcher sdkbuilder.EntryFetcher,
+	fetcher types.EntryFetcher,
 	schema sdkbuilder.SchemaResolver,
 	buffer *sdkbuilder.DeltaWindowBuffer,
 	bufferStore *DeltaBufferStore,

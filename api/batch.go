@@ -125,9 +125,13 @@ type BatchSubmissionResponse struct {
 // per-entry preflight. The transactional body consumes this struct
 // to perform the inserts inside one Postgres tx.
 type preparedEntry struct {
-	entry             *envelope.Entry
+	entry *envelope.Entry
+	// canonical holds the full wire bytes. Under v7.75 wire bytes
+	// ARE the canonical bytes (the multi-sig section is appended
+	// INSIDE the canonical form by envelope.Serialize), so there is
+	// no separate sig blob to carry alongside. Callers needing the
+	// primary signature read entry.Signatures[0].
 	canonical         []byte
-	sigBytes          []byte
 	algoID            uint16
 	canonicalHash     [32]byte
 	logTime           time.Time
@@ -307,17 +311,20 @@ func preflightEntry(
 			protocolVersion, envelope.CurrentProtocolVersion())
 	}
 
-	// Step 2: strip signature, deserialize, validate algo ID.
-	canonical, algoID, sigBytes, err := envelope.StripSignature(rawWire)
-	if err != nil {
-		return nil, preflightFail(http.StatusUnauthorized,
-			"signature envelope: %s", err)
-	}
-	entry, err := envelope.Deserialize(canonical)
+	// Step 2: deserialize wire bytes, validate algo ID.
+	// Under v7.75 the wire bytes ARE the canonical bytes — the
+	// multi-sig section is appended INSIDE the canonical form by
+	// envelope.Serialize, so envelope.StripSignature is gone.
+	// Deserialize rejects zero-sig sections (ErrEmptySignatureList),
+	// so entry.Signatures[0] is safe here.
+	entry, err := envelope.Deserialize(rawWire)
 	if err != nil {
 		return nil, preflightFail(http.StatusUnprocessableEntity,
 			"deserialize: %s", err)
 	}
+	canonical := rawWire
+	algoID := entry.Signatures[0].AlgoID
+	sigBytes := entry.Signatures[0].Bytes
 	if err := envelope.ValidateAlgorithmID(algoID); err != nil {
 		return nil, preflightFail(http.StatusUnauthorized, "%s", err)
 	}
@@ -425,7 +432,6 @@ func preflightEntry(
 	return &preparedEntry{
 		entry:             entry,
 		canonical:         canonical,
-		sigBytes:          sigBytes,
 		algoID:            algoID,
 		canonicalHash:     canonicalHash,
 		logTime:           logTime,
@@ -512,7 +518,11 @@ func admitPreparedEntry(
 	}
 
 	if deps.Storage.EntryWriter != nil {
-		if writeErr := deps.Storage.EntryWriter.WriteEntry(seq, pe.canonical, pe.sigBytes); writeErr != nil {
+		// Wire bytes ARE the canonical bytes under v7.75; the
+		// signatures section lives inside pe.canonical (which is
+		// rawWire). The legacy (canonical, sig) split is no longer
+		// meaningful — pass full wire bytes as canonical, nil for sig.
+		if writeErr := deps.Storage.EntryWriter.WriteEntry(seq, pe.canonical, nil); writeErr != nil {
 			return 0, fmt.Errorf("write entry bytes: %w", writeErr)
 		}
 	}

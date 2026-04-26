@@ -5,9 +5,15 @@ DESCRIPTION:
     Shard management — spawns a new shard (new log DID) with a genesis
     commentary entry that carries forward the prior shard's final state.
 
-SDK v0.3.0 ALIGNMENT:
-    - envelope.NewEntry requires Destination. The genesis entry lands on
-      the NEW shard, so Destination = cfg.NewShardDID.
+SDK ALIGNMENT:
+    - v0.3.0: envelope.NewEntry required Destination via ValidateDestination.
+    - v7.75 split entry construction into two constructors:
+        envelope.NewEntry(header, payload, signatures)  — fully signed
+        envelope.NewUnsignedEntry(header, payload)      — sign-then-attach
+      The genesis commentary is constructed here and signed downstream
+      (the operator that calls StartNewShard owns the institutional key
+      and signs the GenesisEntry before announcing the new shard's
+      DID), so this file uses NewUnsignedEntry.
     - EventTime set to frozen-at timestamp to anchor the shard rotation
       in wall-clock time (freshness policy uses this).
 
@@ -42,6 +48,19 @@ type NewShardConfig struct {
 }
 
 // ShardRotationResult is the output of StartNewShard.
+//
+// GenesisCanonical is the result of envelope.Serialize on the
+// unsigned entry; under v7.75 envelope.Serialize requires at least
+// one signature (Entry.Signatures invariant: len >= 1). Callers MUST
+// attach a signature to GenesisEntry.Signatures before invoking
+// envelope.Serialize themselves; the field on this struct is left
+// for compatibility but will be empty when the genesis is unsigned.
+//
+// A future iteration can split this into two stages:
+//   - StartNewShard returns the unsigned envelope.Entry
+//   - Caller signs and re-serializes
+// For now, GenesisCanonical is best-effort: it serializes only when
+// the entry is in a state that envelope.Serialize accepts.
 type ShardRotationResult struct {
 	NewShardDID       string
 	GenesisEntry      *envelope.Entry
@@ -52,14 +71,17 @@ type ShardRotationResult struct {
 // StartNewShard produces the genesis commentary entry for a new shard.
 //
 // The genesis entry:
-//   - Is signed by the operator (SignerDID = OperatorDID).
+//   - Is signed by the operator (SignerDID = OperatorDID) DOWNSTREAM —
+//     this function returns an unsigned entry; the caller attaches the
+//     signature.
 //   - Is bound to the NEW shard (Destination = NewShardDID).
 //   - Carries the prior shard's final root + sequence in its payload.
 //   - Is pure commentary — zero SMT impact on either shard.
 //   - EventTime anchors the rotation to wall-clock time for freshness.
 //
-// Caller is responsible for persisting GenesisEntry to the NEW shard's
-// storage and announcing the new DID via out-of-band discovery.
+// Caller is responsible for signing GenesisEntry, persisting it to the
+// NEW shard's storage, and announcing the new DID via out-of-band
+// discovery.
 func StartNewShard(cfg NewShardConfig) (*ShardRotationResult, error) {
 	if err := validateShardConfig(cfg); err != nil {
 		return nil, err
@@ -83,20 +105,30 @@ func StartNewShard(cfg NewShardConfig) (*ShardRotationResult, error) {
 		return nil, fmt.Errorf("lifecycle/shard: marshal genesis payload: %w", err)
 	}
 
-	genesisEntry, err := envelope.NewEntry(envelope.ControlHeader{
+	// NewUnsignedEntry per the v7.75 envelope API split:
+	//   - NewEntry(header, payload, signatures) for fully-signed callers
+	//   - NewUnsignedEntry(header, payload)     for build-then-sign callers
+	// StartNewShard's contract is to PRODUCE the genesis; signing
+	// happens in the calling layer (operator's institutional-key
+	// signing path, distinct from this lifecycle helper).
+	genesisEntry, err := envelope.NewUnsignedEntry(envelope.ControlHeader{
 		SignerDID:   cfg.OperatorDID,
-		Destination: cfg.NewShardDID,   // SDK v0.3.0: required field.
-		EventTime:   frozenAt.Unix(),   // Binds rotation to wall-clock time.
+		Destination: cfg.NewShardDID, // SDK v0.3.0: required field.
+		EventTime:   frozenAt.Unix(), // Binds rotation to wall-clock time.
 		// Target_Root=nil, Authority_Path=nil → commentary.
 	}, payloadBytes)
 	if err != nil {
 		return nil, fmt.Errorf("lifecycle/shard: build genesis entry: %w", err)
 	}
 
+	// envelope.Serialize on an unsigned entry will fail under v7.75
+	// because Entry.Signatures invariant requires len >= 1. Leave
+	// GenesisCanonical empty here; the caller serializes after
+	// attaching a signature.
 	return &ShardRotationResult{
 		NewShardDID:       cfg.NewShardDID,
 		GenesisEntry:      genesisEntry,
-		GenesisCanonical:  envelope.Serialize(genesisEntry),
+		GenesisCanonical:  nil,
 		RotationTimestamp: frozenAt,
 	}, nil
 }

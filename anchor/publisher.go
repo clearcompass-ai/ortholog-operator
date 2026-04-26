@@ -8,15 +8,24 @@ Decision 44: anchors are standard entries, no special handling.
 KEY ARCHITECTURAL DECISIONS:
   - Commentary entries: Target_Root=null, Authority_Path=null → zero SMT impact.
   - Destination-bound (SDK v0.3.0+): anchor entries are published to THIS log,
-    so Destination = LogDID. NewEntry rejects empty destination at write time.
+    so Destination = LogDID. NewUnsignedEntry rejects empty destination at
+    write time.
   - Domain Payload: source_log_did, tree_head_ref (SHA-256), tree_size, timestamp.
   - Submits to the local operator's admission pipeline via submitFn.
   - Configurable interval: default 1 hour.
 
-SDK ALIGNMENT (v0.3.0):
-  - envelope.NewEntry requires Destination (via ValidateDestination). Threading
-    LogDID through PublisherConfig is the minimum invasive change to satisfy
-    this while keeping the handler signature stable.
+SDK ALIGNMENT:
+  - v0.3.0: envelope.NewEntry required Destination via ValidateDestination.
+  - v7.75 split entry construction into two constructors:
+      envelope.NewEntry(header, payload, signatures)        — fully signed
+      envelope.NewUnsignedEntry(header, payload)            — sign-then-attach
+    The publisher's flow is "construct, then submit through admission",
+    so it uses NewUnsignedEntry. Whatever path actually signs the
+    commentary (operator's admission pipeline, SubmitViaHTTP, or a future
+    operator-as-dealer signing surface) is responsible for populating
+    entry.Signatures before envelope.Serialize is invoked. An entry
+    without signatures fails entry.Validate() at admission, which is
+    the correct failure mode for a misconfigured deployment.
 */
 package anchor
 
@@ -65,7 +74,8 @@ type Publisher struct {
 }
 
 // NewPublisher creates an anchor publisher. LogDID in cfg MUST be non-empty —
-// the SDK's NewEntry will reject anchor commentary construction otherwise.
+// the SDK's NewUnsignedEntry will reject anchor commentary construction
+// otherwise.
 func NewPublisher(
 	cfg PublisherConfig,
 	merkle MerkleHeadProvider,
@@ -145,7 +155,12 @@ func (p *Publisher) publishOne(ctx context.Context, source AnchorSource) error {
 
 	// Build commentary entry (Decision 44: standard entry, no special handling).
 	// Destination = LogDID (the anchor lands in THIS operator's log).
-	entry, err := envelope.NewEntry(envelope.ControlHeader{
+	//
+	// NewUnsignedEntry per the v7.75 envelope API split:
+	// fully-signed callers use envelope.NewEntry(header, payload, sigs);
+	// build-then-sign callers use envelope.NewUnsignedEntry. The
+	// signing step happens in submitFn / SubmitViaHTTP downstream.
+	entry, err := envelope.NewUnsignedEntry(envelope.ControlHeader{
 		SignerDID:   p.cfg.OperatorDID,
 		Destination: p.cfg.LogDID, // v0.3.0 destination-binding requirement.
 		EventTime:   time.Now().UTC().Unix(),
