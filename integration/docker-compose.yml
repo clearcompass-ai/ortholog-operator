@@ -1,0 +1,121 @@
+# Wave 1 v3 §CI2 — Operator integration test harness.
+#
+# v3 changelog item "CI2 Database Emulator Fixed" replaces the v1/v2
+# Spanner emulator with a Postgres container so the operator's
+# native pgxpool connections, embedded schemaDDL queries, and
+# pg_advisory_lock builder exclusivity all work without protocol
+# adapters. Tessera storage is fronted by fake-gcs-server because
+# the operator currently writes Tessera tiles to GCS-shaped object
+# storage; in production this is real GCS, in CI it is the local
+# emulator.
+#
+# Bring-up:
+#
+#   cd integration
+#   docker-compose up -d
+#   ORTHOLOG_TEST_DSN="postgres://ortholog:ortholog@localhost:5544/ortholog_test?sslmode=disable" \
+#   ORTHOLOG_TEST_GCS_ENDPOINT="http://localhost:4443" \
+#   go test ./...
+#
+# CI3, CI4, CI5 integration tests skip when ORTHOLOG_TEST_DSN is
+# unset, so this harness is the gate that makes them run. The
+# unit-test suite is unaffected and runs unconditionally.
+#
+# Persistence: every container declares no volumes. State is
+# ephemeral — containers can be recreated freely between test
+# runs and CI parallelism is not constrained by shared state.
+#
+# Network: services bind to localhost on non-default ports (5544
+# for Postgres, 4443 for fake-gcs-server) to avoid clashing with
+# whatever the developer might have running locally. Inside the
+# Docker network the containers reach each other by service name.
+
+version: "3.9"
+
+services:
+  # ─────────────────────────────────────────────────────────────────
+  # Postgres — operator's metadata + index store
+  # ─────────────────────────────────────────────────────────────────
+  postgres:
+    # Pinned to a specific Postgres version. The operator schema
+    # uses only standard SQL (BIGINT[], BYTEA, partial indexes,
+    # ON CONFLICT DO UPDATE, RETURNING xmax) which Postgres has
+    # supported for many years; pinning to 16 just keeps test
+    # behavior reproducible across environments.
+    image: postgres:16-alpine
+    container_name: ortholog_test_postgres
+    environment:
+      POSTGRES_USER: ortholog
+      POSTGRES_PASSWORD: ortholog
+      POSTGRES_DB: ortholog_test
+      # fsync=off + synchronous_commit=off massively speed up
+      # test runs and are SAFE because the data is ephemeral.
+      # NEVER use these settings in production.
+      PGOPTIONS: "-c fsync=off -c synchronous_commit=off -c full_page_writes=off"
+    ports:
+      - "127.0.0.1:5544:5432"
+    healthcheck:
+      # The operator's RunMigrations starts as soon as the pool
+      # reports healthy; gating on pg_isready means tests don't
+      # race the postgres init sequence.
+      test: ["CMD-SHELL", "pg_isready -U ortholog -d ortholog_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  # ─────────────────────────────────────────────────────────────────
+  # fake-gcs-server — Tessera tile / entry-bundle storage
+  # ─────────────────────────────────────────────────────────────────
+  fake-gcs:
+    # fsouza/fake-gcs-server is the de-facto local-dev GCS
+    # emulator: HTTP API-compatible with google-cloud-storage
+    # clients, single binary, no auth in -scheme http mode.
+    image: fsouza/fake-gcs-server:latest
+    container_name: ortholog_test_gcs
+    command:
+      - "-scheme=http"
+      - "-port=4443"
+      - "-public-host=localhost:4443"
+      # The bucket the operator writes tiles to. Created at
+      # startup so tests don't have to provision it.
+      - "-data=/data"
+    ports:
+      - "127.0.0.1:4443:4443"
+    healthcheck:
+      # fake-gcs-server has no built-in /healthz so we rely on
+      # the storage-layer endpoint that always responds with the
+      # bucket list (empty initially).
+      test: ["CMD", "wget", "-qO-", "http://localhost:4443/storage/v1/b"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  # ─────────────────────────────────────────────────────────────────
+  # bucket-init — one-shot job that creates the tiles bucket on the
+  # fake-gcs-server before tests run.
+  # ─────────────────────────────────────────────────────────────────
+  bucket-init:
+    image: curlimages/curl:latest
+    container_name: ortholog_test_bucket_init
+    depends_on:
+      fake-gcs:
+        condition: service_healthy
+    # POST to the storage v1 endpoint creates the bucket. Idempotent
+    # via the curl exit-code dance: 200 (created) or 409 (already
+    # exists) both succeed; anything else fails.
+    entrypoint: >
+      sh -c '
+        set -e;
+        STATUS=$$(curl -s -o /dev/null -w "%{http_code}" -X POST
+          -H "Content-Type: application/json"
+          -d ''{"name":"ortholog-tiles"}''
+          http://fake-gcs:4443/storage/v1/b);
+        case "$$STATUS" in
+          200|201|409) echo "bucket ready (status=$$STATUS)"; exit 0;;
+          *) echo "bucket create failed: $$STATUS"; exit 1;;
+        esac
+      '
+
+# Networks are auto-created. Service names (postgres, fake-gcs)
+# resolve via Docker's embedded DNS for inter-container access;
+# host-side access is via the published 127.0.0.1 ports above.
