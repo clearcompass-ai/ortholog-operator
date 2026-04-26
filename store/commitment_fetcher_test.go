@@ -40,8 +40,18 @@ import (
 
 // fakeEntryReader satisfies tessera.EntryReader by returning canned
 // RawEntry values keyed by sequence number. Reads of unknown
-// sequences return errFakeReaderMiss so the test surfaces the
-// fetcher's error path on Tessera-side misses.
+// sequences return an error so the test surfaces the fetcher's
+// error path on Tessera-side misses.
+//
+// tessera.EntryReader's full interface (per tessera/entry_reader.go):
+//
+//	ReadEntry(seq uint64) (RawEntry, error)
+//	ReadEntryBatch(seqs []uint64) ([]RawEntry, error)
+//
+// Both methods are implemented below. The fetcher under test calls
+// ReadEntry sequentially today; ReadEntryBatch is here so the fake
+// also satisfies the interface for any future fetcher path that
+// switches to batch reads.
 type fakeEntryReader struct {
 	entries map[uint64]tessera.RawEntry
 }
@@ -53,6 +63,27 @@ func (f *fakeEntryReader) ReadEntry(seq uint64) (tessera.RawEntry, error) {
 	}
 	return raw, nil
 }
+
+// ReadEntryBatch returns each requested sequence's entry in the
+// same order as the input slice. Mirrors the real
+// InMemoryEntryStore.ReadEntryBatch semantics: any missing sequence
+// is a fatal error for the whole batch (so callers don't get a
+// silent short slice).
+func (f *fakeEntryReader) ReadEntryBatch(seqs []uint64) ([]tessera.RawEntry, error) {
+	out := make([]tessera.RawEntry, len(seqs))
+	for i, seq := range seqs {
+		raw, ok := f.entries[seq]
+		if !ok {
+			return nil, fmt.Errorf("fakeEntryReader: no entry seq=%d (batch)", seq)
+		}
+		out[i] = raw
+	}
+	return out, nil
+}
+
+// Compile-time check: a future tessera.EntryReader change surfaces
+// here as a build error rather than at the call site.
+var _ tessera.EntryReader = (*fakeEntryReader)(nil)
 
 // ─────────────────────────────────────────────────────────────────────
 // Test fixtures
@@ -190,7 +221,7 @@ func TestFindCommitmentEntries_SingleRow(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected 1 entry, got %d", len(got))
 	}
-	assertEntryShape(t, got[0], seq, []byte("canonical-100"), []byte("sig-100"))
+	assertEntryShape(t, got[0], seq, []byte("canonical-100"))
 }
 
 // TestFindCommitmentEntries_Equivocation is the load-bearing test:
@@ -229,8 +260,8 @@ func TestFindCommitmentEntries_Equivocation(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("expected 2 entries (equivocation), got %d", len(got))
 	}
-	assertEntryShape(t, got[0], 100, []byte("canonical-100"), []byte("sig-100"))
-	assertEntryShape(t, got[1], 200, []byte("canonical-200"), []byte("sig-200"))
+	assertEntryShape(t, got[0], 100, []byte("canonical-100"))
+	assertEntryShape(t, got[1], 200, []byte("canonical-200"))
 }
 
 // TestFindCommitmentEntries_TesseraReadError surfaces a Tessera
@@ -288,11 +319,19 @@ func TestFindCommitmentEntries_EmptySchemaID(t *testing.T) {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────
 
+// assertEntryShape pins the v6 EntryWithMetadata field set:
+// CanonicalBytes, LogTime, Position. SignatureBytes / SignatureAlgoID
+// are gone (signatures live inside CanonicalBytes; callers that need
+// them call envelope.Deserialize). The fakeEntryReader still
+// populates SigBytes on tessera.RawEntry — the operator's byte
+// store carries the inline signature bytes — but the fetcher does
+// not surface them through EntryWithMetadata, so this assertion
+// does not check them.
 func assertEntryShape(
 	t *testing.T,
 	got *types.EntryWithMetadata,
 	wantSeq uint64,
-	wantCanonical, wantSig []byte,
+	wantCanonical []byte,
 ) {
 	t.Helper()
 	if got == nil {
@@ -309,10 +348,6 @@ func assertEntryShape(
 	if !bytesEqual(got.CanonicalBytes, wantCanonical) {
 		t.Errorf("canonical bytes mismatch: got %q, want %q",
 			got.CanonicalBytes, wantCanonical)
-	}
-	if !bytesEqual(got.SignatureBytes, wantSig) {
-		t.Errorf("signature bytes mismatch: got %q, want %q",
-			got.SignatureBytes, wantSig)
 	}
 }
 
