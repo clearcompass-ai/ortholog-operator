@@ -20,7 +20,13 @@ Wave 1 v3 §C5 contract:
     (metadata) → tessera.EntryReader (canonical bytes) so the
     EntryWithMetadata struct returned matches what
     PostgresEntryFetcher.Fetch produces — same canonical bytes,
-    same log_time, same position, same signature side-data.
+    same log_time, same position.
+
+EntryWithMetadata field set: under v6 the SDK type carries only
+CanonicalBytes, LogTime, Position. Signatures live inside
+CanonicalBytes (extracted via envelope.Deserialize when needed).
+The earlier SignatureAlgoID/SignatureBytes sidecar fields were
+removed; this fetcher reads only what the type carries.
 
 DESIGN RULE (mirrors store/entries.go): Postgres is an index;
 Tessera is the source of truth for entry bytes. The fetcher reads
@@ -84,12 +90,11 @@ func NewPostgresCommitmentFetcher(
 //     one or more elements.
 //   - (nil, error) on database / Tessera transport failure.
 //
-// Each EntryWithMetadata is populated identically to
-// PostgresEntryFetcher.Fetch output:
+// Each EntryWithMetadata is populated to the v6 type's three fields:
 //
 //   - Position: {LogDID: f.logDID, Sequence: <row>}
-//   - CanonicalBytes / SignatureBytes: from the Tessera reader
-//   - LogTime / SignatureAlgoID: from the entry_index row
+//   - CanonicalBytes: from the Tessera reader
+//   - LogTime: from the entry_index row
 //
 // Stable ordering by sequence number guarantees that callers
 // observing equivocation see the entries in admission order.
@@ -115,10 +120,10 @@ func (f *PostgresCommitmentFetcher) FindCommitmentEntries(
 
 	// Join: commitment_split_id provides the candidate sequence
 	// numbers under (schema_id, split_id); entry_index supplies the
-	// matching log_time and signature algorithm id. Stable ASC sort
-	// by sequence so equivocation evidence has deterministic order.
+	// matching log_time. Stable ASC sort by sequence so equivocation
+	// evidence has deterministic order.
 	rows, err := f.db.Query(ctx, `
-		SELECT csi.sequence_number, ei.log_time, ei.sig_algorithm_id
+		SELECT csi.sequence_number, ei.log_time
 		FROM commitment_split_id AS csi
 		JOIN entry_index           AS ei  USING (sequence_number)
 		WHERE csi.schema_id = $1 AND csi.split_id = $2
@@ -136,12 +141,11 @@ func (f *PostgresCommitmentFetcher) FindCommitmentEntries(
 	type rowMeta struct {
 		seq     uint64
 		logTime time.Time
-		algoID  int16
 	}
 	var rowMetas []rowMeta
 	for rows.Next() {
 		var rm rowMeta
-		if scanErr := rows.Scan(&rm.seq, &rm.logTime, &rm.algoID); scanErr != nil {
+		if scanErr := rows.Scan(&rm.seq, &rm.logTime); scanErr != nil {
 			return nil, fmt.Errorf(
 				"store/commitment_fetcher: scan: %w", scanErr,
 			)
@@ -161,11 +165,11 @@ func (f *PostgresCommitmentFetcher) FindCommitmentEntries(
 		return nil, nil
 	}
 
-	// Read canonical bytes from Tessera one row at a time. Sequential
-	// reads keep the implementation simple; if equivocation lookup
-	// throughput becomes a bottleneck, a batch-read interface on
-	// tessera.EntryReader can replace this loop without changing the
-	// outward contract.
+	// Read canonical bytes from Tessera one row at a time. The
+	// signatures live inside the canonical bytes (v6 multi-sig
+	// section), so the EntryWithMetadata's CanonicalBytes field
+	// is the complete view a caller needs — they call
+	// envelope.Deserialize on it when they need the parsed Entry.
 	out := make([]*types.EntryWithMetadata, 0, len(rowMetas))
 	for _, rm := range rowMetas {
 		raw, readErr := f.reader.ReadEntry(rm.seq)
@@ -180,10 +184,8 @@ func (f *PostgresCommitmentFetcher) FindCommitmentEntries(
 				LogDID:   f.logDID,
 				Sequence: rm.seq,
 			},
-			CanonicalBytes:  raw.CanonicalBytes,
-			LogTime:         rm.logTime,
-			SignatureAlgoID: uint16(rm.algoID),
-			SignatureBytes:  raw.SigBytes,
+			CanonicalBytes: raw.CanonicalBytes,
+			LogTime:        rm.logTime,
 		})
 	}
 	return out, nil
