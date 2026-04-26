@@ -25,13 +25,28 @@ KEY ARCHITECTURAL DECISIONS:
     - Shard metadata includes both tile and byte archive endpoints.
 
 OVERVIEW:
-    Fetch(pos) → resolve shard → fetch bytes from byte archive → split → return.
+    Fetch(pos)     → resolve shard → fetch wire bytes from byte archive → return.
     FetchHash(pos) → resolve shard → fetch hash from entry tile → return.
+
+SDK ALIGNMENT:
+    - v0.3.0-tessera: envelope.StripSignature split a wire entry into
+      (canonical, algoID, sigBytes) so EntryWithMetadata could carry the
+      sidecar fields SignatureAlgoID and SignatureBytes.
+    - v7.75: signatures live INSIDE the canonical bytes (the v6
+      multi-sig section appended by envelope.Serialize). The wire bytes
+      ARE the canonical bytes; envelope.StripSignature is removed.
+      EntryWithMetadata now exposes only CanonicalBytes, LogTime, and
+      Position. Callers that need the primary signature's algoID or raw
+      bytes call envelope.Deserialize(meta.CanonicalBytes) and read
+      entry.Signatures[0].
+    - This file is updated to match: the byte-archive bytes are
+      assigned to CanonicalBytes directly without any split call. The
+      SignatureAlgoID and SignatureBytes fields are gone from
+      EntryWithMetadata so we no longer set them.
 
 KEY DEPENDENCIES:
     - tessera/entry_reader.go: ParseEntryBundle for tile parsing.
     - tessera/tile_reader.go: EntryTilePath for c2sp.org path encoding.
-    - github.com/clearcompass-ai/ortholog-sdk/core/envelope: StripSignature.
 */
 package lifecycle
 
@@ -45,7 +60,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
 	"github.com/clearcompass-ai/ortholog-sdk/types"
 
 	"github.com/clearcompass-ai/ortholog-operator/tessera"
@@ -57,14 +71,14 @@ import (
 
 // ShardMeta describes an archived shard's location and range.
 type ShardMeta struct {
-	ShardDID             string `json:"shard_did"`
-	SequenceStart        uint64 `json:"sequence_start"`
-	SequenceEnd          uint64 `json:"sequence_end"`
-	TileArchiveEndpoint  string `json:"tile_archive_endpoint"`  // Static tile files (hash-only).
-	ByteArchiveEndpoint  string `json:"byte_archive_endpoint"`  // Full entry bytes.
-	FinalRootHash        string `json:"final_root_hash"`
-	FinalTreeSize        uint64 `json:"final_tree_size"`
-	ChainPosition        int    `json:"chain_position"`
+	ShardDID            string `json:"shard_did"`
+	SequenceStart       uint64 `json:"sequence_start"`
+	SequenceEnd         uint64 `json:"sequence_end"`
+	TileArchiveEndpoint string `json:"tile_archive_endpoint"` // Static tile files (hash-only).
+	ByteArchiveEndpoint string `json:"byte_archive_endpoint"` // Full entry bytes.
+	FinalRootHash       string `json:"final_root_hash"`
+	FinalTreeSize       uint64 `json:"final_tree_size"`
+	ChainPosition       int    `json:"chain_position"`
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -136,7 +150,19 @@ func (r *ArchiveReader) AddShard(meta ShardMeta) {
 // Returns the same types.EntryWithMetadata as the live operator's Fetch.
 //
 // Hash-only architecture: tiles contain hashes only. Full wire bytes
-// (canonical + sig_envelope) are in the byte archive at a separate endpoint.
+// are in the byte archive at a separate endpoint. Under v7.75 the wire
+// bytes ARE the canonical bytes — signatures live in the v6 multi-sig
+// section appended inside the canonical form, not as a separate
+// envelope. Callers that need the primary signature's algoID or raw
+// bytes deserialize CanonicalBytes via envelope.Deserialize and read
+// entry.Signatures[0].
+//
+// LogTime is left at the zero value: the byte archive does not carry
+// admission-time metadata, and the live operator's
+// PostgresEntryFetcher is the authoritative source for log_time on
+// hot-path entries. Archive consumers that need log_time pair this
+// fetcher with a separate metadata index (out of scope for the
+// archive reader).
 func (r *ArchiveReader) Fetch(pos types.LogPosition) (*types.EntryWithMetadata, error) {
 	shard, err := r.resolveShard(pos)
 	if err != nil {
@@ -155,17 +181,9 @@ func (r *ArchiveReader) Fetch(pos types.LogPosition) (*types.EntryWithMetadata, 
 			pos.Sequence, shard.ShardDID, err)
 	}
 
-	// Split wire bytes into canonical + signature.
-	canonical, algoID, sigBytes, err := envelope.StripSignature(wireBytes)
-	if err != nil {
-		return nil, fmt.Errorf("lifecycle/archive: strip signature seq=%d: %w", pos.Sequence, err)
-	}
-
 	return &types.EntryWithMetadata{
-		Position:        pos,
-		CanonicalBytes:  canonical,
-		SignatureAlgoID: algoID,
-		SignatureBytes:  sigBytes,
+		Position:       pos,
+		CanonicalBytes: wireBytes,
 	}, nil
 }
 
