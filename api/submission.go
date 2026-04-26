@@ -31,9 +31,20 @@ SDK v0.3.0 HARDENING:
     against captured-but-never-ingested signed entries being replayed
     days later.
   - Step 5 (UPDATED): stamp hash via envelope.EntryIdentity(entry) and
-    epoch via admission.CurrentEpoch (handles pre-1970 clock edge).
+    epoch via sdkadmission.CurrentEpoch (handles pre-1970 clock edge).
   - Step 8 (UPDATED): canonical hash via envelope.EntryIdentity(entry) —
     the single authoritative entry-hash primitive.
+
+v7.75 WAVE 1 ADMISSION PACKAGE:
+  - Step 3a-NFC (NEW): admission.CheckNFC asserts NFC normalization
+    on every DID-shaped header field (SignerDID, Destination,
+    DelegateDID when non-nil, AuthoritySet keys). Defensive only —
+    the operator never normalizes on the caller's behalf, per the
+    SDK Decision 52 caller-normalizes contract. Rejects with HTTP 422.
+  - Step 4 (REFACTORED): admission.VerifyEntrySignature wraps the
+    SDK signatures.VerifyEntry primitive. The Phase 2 nil-resolver
+    passthrough is preserved internally to the wrapper, so this
+    file no longer branches on resolver presence.
 
   - DIDResolver: nil = Phase 2 wire format trust model.
     set = Phase 4 full DID→pubkey→VerifyEntry. Future migration can replace
@@ -48,6 +59,7 @@ DEPENDENCY SHAPE:
 	Crosscutting fields (LogDID, Logger, MaxEntrySize, Queue) live at the top.
 
 INVARIANTS:
+  - Past step 3a-NFC: all entries have NFC-normalized DID-shaped fields.
   - Past step 3b: all entries are bound to THIS log's LogDID.
   - Past step 4: all entries have verified signatures (SDK-D5).
   - Log_Time is monotonically non-decreasing within single-operator deployment.
@@ -72,10 +84,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
-	"github.com/clearcompass-ai/ortholog-sdk/crypto/admission"
-	"github.com/clearcompass-ai/ortholog-sdk/crypto/signatures"
+	sdkadmission "github.com/clearcompass-ai/ortholog-sdk/crypto/admission"
 	"github.com/clearcompass-ai/ortholog-sdk/exchange/policy"
 
+	"github.com/clearcompass-ai/ortholog-operator/admission"
 	"github.com/clearcompass-ai/ortholog-operator/api/middleware"
 	"github.com/clearcompass-ai/ortholog-operator/builder"
 	"github.com/clearcompass-ai/ortholog-operator/store"
@@ -91,6 +103,10 @@ import (
 //
 // nil = Phase 2 trust model (wire format integrity only).
 // set = Phase 4 full verification (DID → pubkey → sdk VerifyEntry).
+//
+// Structurally compatible with admission.DIDResolver — the operator's
+// admission package defines the same single-method interface, and Go
+// auto-converts at the call site to admission.VerifyEntrySignature.
 //
 // Future migration: replace this with did.VerifierRegistry, whose
 // VerifyEntry method enforces destination binding automatically and
@@ -222,6 +238,18 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 			return
 		}
 
+		// ── Step 3a-NFC: Defensive NFC assertion (Wave 1 v7.75) ────────
+		// SDK Decision 52 places NFC normalization at the caller boundary.
+		// The operator asserts the caller honored that contract and rejects
+		// mismatches. The operator NEVER normalizes on the caller's behalf —
+		// silent normalization here would diverge the canonical-hash bytes
+		// the caller signed from the bytes the operator stored.
+		if err := admission.CheckNFC(entry); err != nil {
+			writeError(w, http.StatusUnprocessableEntity,
+				fmt.Sprintf("NFC: %s", err))
+			return
+		}
+
 		// ── Step 3b: Destination binding enforcement (NEW) ────────────
 		// The entry's canonical hash commits to Header.Destination. A valid
 		// signature proves the signer intended the entry for SOME destination;
@@ -250,33 +278,26 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 		}
 
 		// ── Step 4: Signature verification (SDK-D5) ────────────────────
+		// admission.VerifyEntrySignature handles both branches:
+		//   - nil resolver: Phase 2 trust model passthrough (no crypto verify).
+		//   - non-nil resolver: Phase 4 DID→pubkey→signatures.VerifyEntry,
+		//     with the SDK mutation-audit gates firing inside the call.
 		if entry.Header.SignerDID == "" {
 			// Validate() already catches this, but belt-and-braces.
 			writeError(w, http.StatusUnprocessableEntity, "empty signer DID")
 			return
 		}
-
-		if deps.Identity.DIDResolver != nil {
-			// Phase 4: full cryptographic verification.
-			pubkey, resolveErr := deps.Identity.DIDResolver.ResolvePublicKey(ctx, entry.Header.SignerDID)
-			if resolveErr != nil {
-				writeError(w, http.StatusUnauthorized,
-					fmt.Sprintf("DID resolution failed for %s: %s",
-						entry.Header.SignerDID, resolveErr))
-				return
+		if err := admission.VerifyEntrySignature(ctx, entry, sigBytes, deps.Identity.DIDResolver); err != nil {
+			switch {
+			case errors.Is(err, admission.ErrSignerDIDResolution):
+				writeError(w, http.StatusUnauthorized, err.Error())
+			case errors.Is(err, admission.ErrSignatureInvalid):
+				writeError(w, http.StatusUnauthorized, err.Error())
+			default:
+				deps.Logger.Error("signature verification path failed", "error", err)
+				writeError(w, http.StatusInternalServerError, "signature verification failed")
 			}
-			// Use envelope.EntryIdentity — single source of truth for entry hashes.
-			// Identical bytes to sha256.Sum256(canonical), but the vocabulary
-			// makes explicit that this is the Tessera-aligned dedup key.
-			canonicalHash := envelope.EntryIdentity(entry)
-			if verifyErr := signatures.VerifyEntry(canonicalHash, sigBytes, pubkey); verifyErr != nil {
-				writeError(w, http.StatusUnauthorized,
-					fmt.Sprintf("signature verification failed: %s", verifyErr))
-				return
-			}
-		} else {
-			// Phase 2 trust model: wire format integrity only.
-			_ = sigBytes
+			return
 		}
 
 		// ── Step 5: Entry size (SDK-D11) ───────────────────────────────
@@ -312,7 +333,7 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 				return
 			}
 
-			apiProof := admission.ProofFromWire(h.AdmissionProof, deps.LogDID)
+			apiProof := sdkadmission.ProofFromWire(h.AdmissionProof, deps.LogDID)
 
 			// SDK v0.3.0: envelope.EntryIdentity is the canonical entry-hash
 			// primitive. Byte-identical to sha256.Sum256(canonical) but binds
@@ -320,20 +341,20 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 			canonicalHash := envelope.EntryIdentity(entry)
 			currentDifficulty := deps.Admission.DiffController.CurrentDifficulty()
 			hashFuncName := deps.Admission.DiffController.HashFunction()
-			var hashFunc admission.HashFunc
+			var hashFunc sdkadmission.HashFunc
 			switch hashFuncName {
 			case "argon2id":
-				hashFunc = admission.HashArgon2id
+				hashFunc = sdkadmission.HashArgon2id
 			default:
-				hashFunc = admission.HashSHA256
+				hashFunc = sdkadmission.HashSHA256
 			}
 
 			// SDK admission.CurrentEpoch handles the pre-1970 clock edge case
 			// (negative Unix timestamp cast to uint64 would silently underflow).
-			currentEpoch := admission.CurrentEpoch(uint64(deps.Admission.EpochWindowSeconds))
+			currentEpoch := sdkadmission.CurrentEpoch(uint64(deps.Admission.EpochWindowSeconds))
 			acceptanceWindow := uint64(deps.Admission.EpochAcceptanceWindow)
 
-			if err := admission.VerifyStamp(
+			if err := sdkadmission.VerifyStamp(
 				apiProof,
 				canonicalHash,
 				deps.LogDID,
