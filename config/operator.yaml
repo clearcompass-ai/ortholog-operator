@@ -3,14 +3,53 @@
 #
 # Full operator configuration schema. Override with env vars.
 #
-# CHANGES: Added did_resolver + schema sections.
-#          Shard section deferred to post Phase 6.
+# CHANGES (PR 1 — VerifierRegistry alignment):
+#   - ADDED:   admitted_exchanges list (destination-binding enforcement).
+#   - ADDED:   web_resolver section (shared across all per-exchange registries).
+#   - REMOVED: did_resolver section (subsumed by registries' internal
+#              web resolver path).
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Identity
 operator:
   log_did: "did:ortholog:operator:001"
   operator_did: "did:ortholog:operator:001:signer"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Admitted exchanges (destination-binding enforcement)
+# ─────────────────────────────────────────────────────────────────────────────
+# Every entry submitted to this operator MUST have
+# ControlHeader.Destination set to one of these exchange DIDs. The
+# operator constructs one did.VerifierRegistry per admitted exchange at
+# startup and routes each incoming entry to the registry scoped to its
+# Destination.
+#
+# Cross-destination replay is rejected at admission with HTTP 403: an
+# entry bound to exchange A cannot be accepted by a registry scoped for
+# exchange B, even if the signature is cryptographically valid.
+#
+# INVARIANT: at least one admitted exchange is required. The operator
+# fails to start with an empty list. Each entry is validated via
+# envelope.ValidateDestination at startup (non-empty, no leading/
+# trailing whitespace, within MaxDestinationDIDLen).
+#
+# Env-var override: OPERATOR_ADMITTED_EXCHANGES (comma-separated).
+admitted_exchanges:
+  - "did:web:exchange.example.com"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Web DID resolver (shared across all admitted exchanges' registries)
+# ─────────────────────────────────────────────────────────────────────────────
+# Backs the did:web resolution path inside each VerifierRegistry's web
+# verifier. did:key and did:pkh are pure-parse methods and never touch
+# this resolver.
+#
+# The HTTP client is wrapped in a did.CachingResolver with the
+# configured TTL so DID documents aren't re-fetched on every signature
+# verification under sustained load.
+web_resolver:
+  timeout: "15s"
+  cache_ttl: "5m"
 
 # Postgres connection
 postgres:
@@ -27,7 +66,7 @@ server:
   read_timeout: "30s"
   write_timeout: "60s"
   shutdown_timeout: "30s"
-  max_entry_size: 1048576  # 1MB (SDK-D11)
+  max_entry_size: 1048576  # 1 MB (SDK-D11)
 
 # Builder loop
 builder:
@@ -53,13 +92,11 @@ tessera:
   timeout: "30s"
   tile_cache_size: 10000
   tile_storage: object
-
   object:
     endpoint: ""
     bucket: davidson-cases-tiles
     region: us-east-1
     path_style: false
-
   filesystem:
     root: /var/lib/tessera/tiles
 
@@ -88,16 +125,6 @@ anchor:
 smt:
   warm_top_levels: 32
   cache_size: 100000
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DID resolution (Phase 4)
-# ─────────────────────────────────────────────────────────────────────────────
-# When configured, submission handler performs full DID → pubkey → VerifyEntry.
-# Empty = Phase 2 trust model (nil DIDResolver, wire format integrity only).
-did_resolver:
-  endpoint: ""      # Empty = Phase 2 trust model
-  method: "http"    # "http" (REST API) or "local" (embedded)
-  timeout: "5s"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Schema resolution

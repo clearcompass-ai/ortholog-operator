@@ -17,12 +17,16 @@ SDK ALIGNMENT (v0.3.0):
   - envelope.NewEntry requires Destination (via ValidateDestination). Threading
     LogDID through PublisherConfig is the minimum invasive change to satisfy
     this while keeping the handler signature stable.
+  - tree_head_ref uses stdlib crypto/sha256 (arbitrary-bytes hashing of a
+    remote HTTP body). envelope.EntryIdentity would be wrong — it's reserved
+    for Entry-shaped input producing Tessera dedup keys.
 */
 package anchor
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -31,7 +35,6 @@ import (
 	"time"
 
 	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
-	"github.com/clearcompass-ai/ortholog-sdk/crypto"
 	"github.com/clearcompass-ai/ortholog-sdk/types"
 )
 
@@ -132,10 +135,11 @@ func (p *Publisher) publishOne(ctx context.Context, source AnchorSource) error {
 	}
 
 	// Build anchor payload. tree_head_ref is a plain SHA-256 of the remote
-	// HTTP body — this is arbitrary bytes, NOT an Entry, so crypto.HashBytes
-	// is the correct primitive (envelope.EntryIdentity is for Entry-shaped
-	// input only).
-	treeHeadRef := crypto.HashBytes(body)
+	// HTTP body — arbitrary bytes, NOT an Entry. envelope.EntryIdentity
+	// would be wrong here (it's only correct for Entry-shaped input,
+	// producing the Tessera dedup key). stdlib crypto/sha256 is the
+	// idiomatic primitive for opaque-bytes hashing.
+	treeHeadRef := sha256.Sum256(body)
 	payload, _ := json.Marshal(map[string]any{
 		"anchor_type":    "tree_head_ref",
 		"source_log_did": source.LogDID,

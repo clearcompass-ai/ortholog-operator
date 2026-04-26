@@ -8,38 +8,42 @@ DESCRIPTION:
 	Runs the admission HTTP server, builder loop, and (optional) anchor
 	publisher under a shared cancellable context.
 
-SDK v0.3.0 WIRING CHANGES (addressed in this rewrite):
+PR 1 WIRING CHANGES:
+
+	Per-exchange VerifierRegistry construction. cfg.AdmittedExchanges
+	drives the map; each DID gets its own registry via
+	did.DefaultVerifierRegistry, sharing a did.CachingResolver-wrapped
+	WebDIDResolver across all registries for connection/cache efficiency.
+	The previous nil DIDResolver field in IdentityDeps is replaced with
+	the registry map.
+
+SDK v0.3.0 WIRING (retained):
  1. anchor.PublisherConfig requires LogDID — threaded from cfg.LogDID.
  2. builder.NewCommitmentPublisher is (operatorDID, logDID, cfg, submitFn,
     logger) — both DIDs passed explicitly.
  3. api.SubmissionDeps has FreshnessTolerance (defaults to
     policy.FreshnessInteractive = 5 min if zero). Explicit here for
     auditability.
- 4. Phase 4 DID verifier scaffolded behind a nil — when ready, swap
-    for did.DefaultVerifierRegistry(cfg.LogDID, resolver).
 
-OPERATOR INTERNAL SIGNATURES (the ones the last attempt got wrong):
+OPERATOR INTERNAL SIGNATURES:
   - tessera.NewClient(ClientConfig{BaseURL, Timeout}, logger) → *Client.
-    Struct config, single return, no Close method.
   - tessera.NewTesseraAdapter(client, tileReader, logger) → MerkleAppender.
-    Builder/anchor talk to the adapter, not the raw client.
-  - tessera.NewInMemoryEntryStore() → *InMemoryEntryStore. The only
-    byte-store implementation shipped today. A persistent backend is the
-    operator's responsibility to swap in.
+  - tessera.NewInMemoryEntryStore() → *InMemoryEntryStore.
   - store.NewPostgresNodeCache(pool, cacheSize) → *PostgresNodeCache.
-    Cache size MUST be passed; zero would be a pathological no-cache path.
   - builder.NewDeltaBufferStore(pool, windowSize, logger) → *DeltaBufferStore.
   - bufferStore.Load(ctx) → (*sdkbuilder.DeltaWindowBuffer, error).
-    Returns a fresh buffer. We do NOT pass our own buffer in.
-  - middleware.NewDifficultyController(queue, cfg, logger) → takes the
-    queue FIRST (it polls queue depth for auto-adjustment).
-  - middleware.DefaultDifficultyConfig() returns a ready-to-use config
-    with all seven fields populated (InitialDifficulty, Min/Max,
-    LowThreshold, HighThreshold, AdjustInterval, HashFunction).
+  - middleware.NewDifficultyController(queue, cfg, logger) → queue first.
+  - middleware.DefaultDifficultyConfig() → ready-to-use preset.
+  - did.NewWebDIDResolver(*http.Client) → *WebDIDResolver.
+  - did.NewCachingResolver(DIDResolver, ttl) → *CachingResolver.
+  - did.DefaultVerifierRegistry(destinationDID, resolver) → *VerifierRegistry.
 
 INVARIANTS:
-  - cfg.LogDID MUST be non-empty: submission handler panics at
-    construction otherwise (destination-binding enforcement gate).
+  - cfg.LogDID MUST be non-empty (physical log identity; Mode B stamp
+    binding; Tessera origin; Postgres lock scope; anchor publishing).
+  - cfg.AdmittedExchanges MUST be non-empty. Each DID must pass
+    envelope.ValidateDestination (non-empty, no whitespace padding,
+    within MaxDestinationDIDLen). The operator fails fast otherwise.
   - cfg.OperatorDID defaults to cfg.LogDID for single-exchange
     deployments where the operator IS the exchange.
   - ByteStore here is NewInMemoryEntryStore() — bytes are lost on
@@ -52,8 +56,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -63,6 +69,7 @@ import (
 	sdkbuilder "github.com/clearcompass-ai/ortholog-sdk/builder"
 	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
 	"github.com/clearcompass-ai/ortholog-sdk/core/smt"
+	"github.com/clearcompass-ai/ortholog-sdk/did"
 	"github.com/clearcompass-ai/ortholog-sdk/exchange/policy"
 
 	"github.com/clearcompass-ai/ortholog-operator/anchor"
@@ -81,8 +88,11 @@ import (
 type Config struct {
 	ServerAddr            string
 	DatabaseURL           string
-	LogDID                string // Destination for self-published entries (anchors, commitments).
-	OperatorDID           string // Signer DID for operator-authored commentary.
+	LogDID                string   // Physical log identity. Mode B stamp binding; Tessera origin; Postgres lock; anchor publishing.
+	OperatorDID           string   // Signer DID for operator-authored commentary (commitments, anchors).
+	AdmittedExchanges     []string // Exchange DIDs this operator admits entries for. Each gets its own VerifierRegistry.
+	WebResolverTimeout    time.Duration
+	WebResolverCacheTTL   time.Duration
 	MaxEntrySize          int64
 	BatchSize             int
 	PollInterval          time.Duration
@@ -90,7 +100,7 @@ type Config struct {
 	EpochAcceptanceWindow int
 	AnchorInterval        time.Duration
 	AnchorSources         []anchor.AnchorSource
-	TesseraBaseURL        string // HTTP URL of the Tessera personality.
+	TesseraBaseURL        string
 	TileCacheSize         int
 	SMTNodeCacheSize      int
 	DeltaWindow           int
@@ -104,6 +114,9 @@ func loadConfig() (*Config, error) {
 		DatabaseURL:           os.Getenv("OPERATOR_DATABASE_URL"),
 		LogDID:                os.Getenv("OPERATOR_LOG_DID"),
 		OperatorDID:           os.Getenv("OPERATOR_DID"),
+		AdmittedExchanges:     parseCSV(os.Getenv("OPERATOR_ADMITTED_EXCHANGES")),
+		WebResolverTimeout:    15 * time.Second,
+		WebResolverCacheTTL:   5 * time.Minute,
 		MaxEntrySize:          1 << 20, // 1 MB, matches SDK-D11.
 		BatchSize:             1000,
 		PollInterval:          100 * time.Millisecond,
@@ -120,10 +133,18 @@ func loadConfig() (*Config, error) {
 		return nil, fmt.Errorf("OPERATOR_DATABASE_URL required")
 	}
 	if cfg.LogDID == "" {
-		return nil, fmt.Errorf("OPERATOR_LOG_DID required (destination-binding)")
+		return nil, fmt.Errorf("OPERATOR_LOG_DID required (physical log identity)")
 	}
 	if cfg.OperatorDID == "" {
 		cfg.OperatorDID = cfg.LogDID
+	}
+	if len(cfg.AdmittedExchanges) == 0 {
+		return nil, fmt.Errorf("OPERATOR_ADMITTED_EXCHANGES required (comma-separated exchange DIDs)")
+	}
+	for _, d := range cfg.AdmittedExchanges {
+		if err := envelope.ValidateDestination(d); err != nil {
+			return nil, fmt.Errorf("invalid admitted exchange %q: %w", d, err)
+		}
 	}
 	return cfg, nil
 }
@@ -133,6 +154,22 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// parseCSV splits a comma-separated string, trims whitespace from each
+// element, and drops empty elements. Returns nil for empty input.
+func parseCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -158,6 +195,7 @@ func main() {
 	logger.Info("operator starting",
 		"log_did", cfg.LogDID,
 		"operator_did", cfg.OperatorDID,
+		"admitted_exchanges", cfg.AdmittedExchanges,
 		"addr", cfg.ServerAddr,
 		"tessera_url", cfg.TesseraBaseURL,
 		"sdk_version", "v0.3.0-tessera",
@@ -213,6 +251,27 @@ func main() {
 		Timeout: 30 * time.Second,
 	}, logger)
 	tesseraAdapter := tessera.NewTesseraAdapter(tesseraClient, tileReader, logger)
+
+	// ── DID resolution + per-exchange verifier registries (PR 1) ──────
+	//
+	// Shared web resolver backs every admitted exchange's registry.
+	// CachingResolver wraps it so DID documents aren't re-fetched on
+	// every signature verification under sustained load. did:key and
+	// did:pkh are pure-parse methods and don't use this resolver.
+	//
+	// One did.VerifierRegistry is constructed per admitted exchange.
+	// Each registry is scoped to its exchange DID and returns
+	// did.ErrDestinationMismatch at VerifyEntry time if an entry's
+	// Destination doesn't match — the runtime enforcement of
+	// destination binding.
+	webResolver := did.NewWebDIDResolver(&http.Client{Timeout: cfg.WebResolverTimeout})
+	cachingResolver := did.NewCachingResolver(webResolver, cfg.WebResolverCacheTTL)
+
+	registries := make(map[string]*did.VerifierRegistry, len(cfg.AdmittedExchanges))
+	for _, exchangeDID := range cfg.AdmittedExchanges {
+		registries[exchangeDID] = did.DefaultVerifierRegistry(exchangeDID, cachingResolver)
+		logger.Info("admitted exchange registered", "destination", exchangeDID)
+	}
 
 	// ── Builder dependencies ──────────────────────────────────────────
 	fetcher := store.NewPostgresEntryFetcher(pool, byteStore, cfg.LogDID)
@@ -306,7 +365,7 @@ func main() {
 		},
 		Identity: api.IdentityDeps{
 			CreditStore: creditStore,
-			DIDResolver: nil, // Phase 4: wire did.DefaultVerifierRegistry.
+			Registries:  registries,
 		},
 		Queue:              queue,
 		LogDID:             cfg.LogDID,

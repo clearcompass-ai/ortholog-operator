@@ -18,6 +18,18 @@ KEY ARCHITECTURAL DECISIONS:
   - SubmissionDeps uses the cohesive sub-struct shape (StorageDeps +
     AdmissionConfig + IdentityDeps).
 
+PR 2 — WAVE 1 CHANGES:
+  - Construct did.VerifierRegistry scoped to testExchangeDID at startup,
+    wire it into SubmissionDeps.Identity.Registries. Replaces the
+    Phase-2-trust-model nil DIDResolver.
+  - panicResolver guards against unintended did:web resolution: the test
+    suite uses did:example:* signers which don't correspond to any DID
+    method; the resolver should never be invoked. A panic surfaces
+    unexpected code paths immediately.
+  - startTestOperatorMultiExchange variant accepts a caller-supplied set
+    of admitted exchanges. Used by Wave 3's multi-exchange admission
+    tests. Single-exchange tests continue to use startTestOperator.
+
 OVERVIEW:
 
 	startTestOperator creates: Postgres pool → clean tables → stores →
@@ -28,6 +40,7 @@ KEY DEPENDENCIES:
   - All api/ handlers wired with real Postgres stores.
   - builder/loop.go runs in background goroutine.
   - tessera/entry_reader.go InMemoryEntryStore for byte storage.
+  - did.DefaultVerifierRegistry for per-exchange signature routing.
 */
 package tests
 
@@ -47,6 +60,7 @@ import (
 	sdkbuilder "github.com/clearcompass-ai/ortholog-sdk/builder"
 	"github.com/clearcompass-ai/ortholog-sdk/core/envelope"
 	"github.com/clearcompass-ai/ortholog-sdk/core/smt"
+	"github.com/clearcompass-ai/ortholog-sdk/did"
 	"github.com/clearcompass-ai/ortholog-sdk/types"
 
 	"github.com/clearcompass-ai/ortholog-operator/api"
@@ -71,7 +85,24 @@ type testOperator struct {
 	cancel      context.CancelFunc
 }
 
+// startTestOperator creates a test operator admitting exactly one
+// exchange: testExchangeDID. This is the default for single-exchange
+// tests (the majority).
+//
+// For tests that exercise multi-exchange admission or cross-exchange
+// rejection, use startTestOperatorMultiExchange.
 func startTestOperator(t *testing.T) *testOperator {
+	t.Helper()
+	return startTestOperatorMultiExchange(t, []string{testExchangeDID})
+}
+
+// startTestOperatorMultiExchange creates a test operator admitting the
+// given set of exchange DIDs. Each DID gets its own VerifierRegistry.
+//
+// Callers provide the full list; an empty list triggers the handler
+// construction panic in NewSubmissionHandler (as intended — an operator
+// with no admitted exchanges cannot admit any entries).
+func startTestOperatorMultiExchange(t *testing.T, admittedExchanges []string) *testOperator {
 	t.Helper()
 
 	dsn := os.Getenv("ORTHOLOG_TEST_DSN")
@@ -146,10 +177,21 @@ func startTestOperator(t *testing.T) *testOperator {
 		queue, middleware.DefaultDifficultyConfig(), logger,
 	)
 
+	// ── Per-exchange VerifierRegistries ────────────────────────────────
+	//
+	// Each admitted exchange gets its own VerifierRegistry scoped to
+	// that exchange's DID. The registries share a panicResolver — tests
+	// use did:example:* or did:key signers, neither of which invokes the
+	// web resolver. If a panic fires, a test is doing something
+	// unexpected and we want the trace immediately.
+	registries := make(map[string]*did.VerifierRegistry, len(admittedExchanges))
+	for _, exchangeDID := range admittedExchanges {
+		registries[exchangeDID] = did.DefaultVerifierRegistry(exchangeDID, panicResolver{})
+	}
+
 	// ── HTTP handlers ──────────────────────────────────────────────────
 	queryAPI := indexes.NewPostgresQueryAPI(pool, entryBytes, testLogDID)
 
-	// SubmissionDeps using the cohesive sub-struct shape.
 	submissionDeps := &api.SubmissionDeps{
 		Storage: api.StorageDeps{
 			DB:          pool,
@@ -158,12 +200,12 @@ func startTestOperator(t *testing.T) *testOperator {
 		},
 		Admission: api.AdmissionConfig{
 			DiffController:        diffController,
-			EpochWindowSeconds:    3600, // 1 hour
-			EpochAcceptanceWindow: 1,    // accept current ± 1
+			EpochWindowSeconds:    testEpochWindowSeconds,
+			EpochAcceptanceWindow: testEpochAcceptanceWindow,
 		},
 		Identity: api.IdentityDeps{
 			CreditStore: creditStore,
-			DIDResolver: nil,
+			Registries:  registries,
 		},
 		Queue:        queue,
 		LogDID:       testLogDID,
@@ -273,6 +315,24 @@ func (op *testOperator) seedSession(t *testing.T, token, exchangeDID string, cre
 }
 
 // -------------------------------------------------------------------------------------------------
+// panicResolver — guard against unintended did:web resolution
+// -------------------------------------------------------------------------------------------------
+
+// panicResolver is a did.DIDResolver that panics on any Resolve call.
+// Used in test VerifierRegistry construction because the test suite
+// uses did:example:* and did:key signers — neither invokes the web
+// resolver. A panic surfaces unexpected code paths immediately.
+//
+// If a future test deliberately uses did:web signers, pass a real
+// did.DIDResolver (likely did.CachingResolver wrapping a fixture-backed
+// resolver) to startTestOperatorMultiExchange's registry construction.
+type panicResolver struct{}
+
+func (panicResolver) Resolve(didStr string) (*did.DIDDocument, error) {
+	panic(fmt.Sprintf("panicResolver: unexpected resolve of %q — tests shouldn't invoke web resolution", didStr))
+}
+
+// -------------------------------------------------------------------------------------------------
 // Stubs
 // -------------------------------------------------------------------------------------------------
 
@@ -311,26 +371,6 @@ func (s *stubWitnessCosigner) RequestCosignatures(_ context.Context, _ types.Tre
 // -------------------------------------------------------------------------------------------------
 // Lightweight test-server adapter for destination_binding_test.go
 // -------------------------------------------------------------------------------------------------
-//
-// destination_binding_test.go was authored against a hypothetical
-// newTestServer(t) helper whose docstring says:
-//
-//     "test harness returning *httptest.Server configured with testLogDID
-//     as cfg.LogDID and testOperatorDID as cfg.OperatorDID. Assumed
-//     present in testserver_test.go. If unavailable, port the factory
-//     pattern from http_integration_test.go."
-//
-// Rather than duplicate the factory (risking drift between two
-// implementations of the same wiring), this helper delegates to
-// startTestOperator and exposes a minimal .URL/.Close() surface — the
-// only surface destination_binding_test.go actually uses.
-//
-// The return type is a local *testServer rather than literal
-// *httptest.Server because startTestOperator already runs a real
-// HTTP server on a net.Listener. Creating an httptest.Server on top
-// would be a second server; wrapping the existing one with a type
-// that satisfies the call-site contract is both simpler and more
-// honest about what's happening.
 
 type testServer struct {
 	URL string
@@ -345,11 +385,7 @@ func (s *testServer) Close() {}
 
 // newTestServer returns a lightweight test-server handle for tests that
 // only need a running HTTP endpoint bound to testLogDID — no credit
-// seeding, no session tokens, no queue introspection. Currently used
-// by destination_binding_test.go's five security invariants.
-//
-// For tests that need richer access (seedSession, direct Pool queries,
-// CreditStore inspection), use startTestOperator directly.
+// seeding, no session tokens, no queue introspection.
 func newTestServer(t *testing.T) *testServer {
 	t.Helper()
 	op := startTestOperator(t)

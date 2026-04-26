@@ -12,6 +12,22 @@ Provides:
   - SDK v0.1.0 admission helpers — buildStampParams, verifyStampForTest —
     that wrap the post-Wave-1.5 GenerateStamp(StampParams) and
     VerifyStamp(8-arg) APIs so test code stays readable.
+
+PR 2 — WAVE 1 CHANGES:
+  - Split the conflated testLogDID into TWO distinct constants:
+    testLogDID       — the operator's PHYSICAL LOG identity
+    testExchangeDID  — the EXCHANGE DID this test operator admits for
+    These are separate concepts with separate values. Tests that used
+    the same string for both roles are structurally impossible to write
+    after this change.
+  - Added testHeader(destinationDID, signerDID) as the REQUIRED
+    constructor for ControlHeader in this package. Omitting either
+    mandatory arg is a compile-time error (not a runtime panic),
+    catching the "forgot Destination" bug at development time.
+  - Updated generateEntries, addRootEntity, addDelegation,
+    addScopeEntity to construct headers via testHeader with
+    testExchangeDID. These helpers previously used p.LogDID for the
+    Destination field (implicitly conflating log and exchange).
 */
 package tests
 
@@ -40,7 +56,25 @@ import (
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const testLogDID = "did:ortholog:test:integration"
+// testLogDID is the operator's PHYSICAL LOG identity. Used for:
+//   - startTestOperator's deps.LogDID
+//   - Mode B stamp's LogDID binding
+//   - LogPosition.LogDID in generated positions (pos() helper)
+//   - Tessera origin, Postgres advisory lock scope
+//
+// Distinct from testExchangeDID by construction: they hold different
+// string values so any test that conflates them fails loudly.
+const testLogDID = "did:ortholog:test:log"
+
+// testExchangeDID is the EXCHANGE DID this test operator admits for. Used for:
+//   - ControlHeader.Destination in every test entry (via testHeader)
+//   - startTestOperator's deps.Identity.Registries map key
+//   - seedSession's exchange_did column for Mode A tests
+//
+// In multi-exchange tests (startTestOperatorMultiExchange), this is the
+// default single-exchange value; additional exchange DIDs are passed as
+// explicit constants at the call site.
+const testExchangeDID = "did:web:exchange.test.example"
 
 // testEpochWindowSeconds is the epoch length used by HTTP integration tests.
 // 1 hour matches the production default (ORTHOLOG_EPOCH_WINDOW_SECONDS=3600)
@@ -55,6 +89,44 @@ const testEpochAcceptanceWindow = 1
 // Postgres-backed query tests. Reset in cleanTables. This is the ONLY
 // source of entry bytes in the test suite (Postgres stores index only).
 var testEntryBytes = optessera.NewInMemoryEntryStore()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ControlHeader constructor — REQUIRED for all test entry construction
+// ─────────────────────────────────────────────────────────────────────────────
+
+// testHeader is the REQUIRED constructor for ControlHeader in this test
+// package. Two mandatory positional arguments — destination exchange DID
+// and signer DID — correspond to the two fields that NewEntry validates
+// as non-empty. Omission is a compile error (missing argument), not a
+// runtime panic later in the pipeline.
+//
+// Usage:
+//
+//	h := testHeader(testExchangeDID, "did:example:alice")
+//	h.AuthorityPath = sameSigner()
+//	h.TargetRoot    = ptrTo(pos(1))
+//	entry := makeEntry(t, h, payload)
+//
+// For normal single-exchange tests, pass testExchangeDID. For tests that
+// deliberately construct entries with mismatched destinations (for
+// cross-exchange rejection tests), pass an explicit string that isn't
+// in the operator's admitted-exchanges set.
+//
+// DO NOT use envelope.ControlHeader{} literals elsewhere in this
+// package. CI hygiene (PR 3) grep-bans direct literals outside
+// helpers_test.go and destination_binding_test.go.
+func testHeader(destinationDID, signerDID string) envelope.ControlHeader {
+	if destinationDID == "" {
+		panic("testHeader: destinationDID required — pass testExchangeDID for normal tests")
+	}
+	if signerDID == "" {
+		panic("testHeader: signerDID required")
+	}
+	return envelope.ControlHeader{
+		SignerDID:   signerDID,
+		Destination: destinationDID,
+	}
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Position helpers
@@ -137,7 +209,7 @@ func buildStampParams(entryHash [32]byte, logDID string, difficulty uint32) admi
 // + nonce and runs VerifyStamp with the test epoch and acceptance window.
 // Returns the verification error (or nil on success).
 //
-// This is the canonical test-side equivalent of the operator's Step 5
+// This is the canonical test-side equivalent of the operator's Step 7
 // admission verification — uses ProofFromWire's API form, the same hash
 // function, and the same epoch/window the operator uses at runtime.
 func verifyStampForTest(p admission.StampParams, nonce uint64, expectedLog string, minDifficulty uint32) error {
@@ -245,12 +317,15 @@ func newHarness() *testHarness {
 }
 
 // addRootEntity creates a root entity leaf in the SMT and stores the entry.
+//
+// The entry lives at position p (pos() assigns testLogDID) but its
+// Destination is testExchangeDID. This separation is deliberate: p is
+// the physical location, Destination is the exchange binding.
 func (h *testHarness) addRootEntity(t *testing.T, p types.LogPosition, signerDID string) *envelope.Entry {
 	t.Helper()
-	entry := makeEntry(t, envelope.ControlHeader{
-		SignerDID:     signerDID,
-		AuthorityPath: sameSigner(),
-	}, nil)
+	hdr := testHeader(testExchangeDID, signerDID)
+	hdr.AuthorityPath = sameSigner()
+	entry := makeEntry(t, hdr, nil)
 	h.fetcher.storeEntry(p, entry)
 	key := smt.DeriveKey(p)
 	leaf := types.SMTLeaf{Key: key, OriginTip: p, AuthorityTip: p}
@@ -263,11 +338,10 @@ func (h *testHarness) addRootEntity(t *testing.T, p types.LogPosition, signerDID
 // addDelegation creates a delegation entry and leaf.
 func (h *testHarness) addDelegation(t *testing.T, delegPos types.LogPosition, signerDID, delegateDID string) *envelope.Entry {
 	t.Helper()
-	entry := makeEntry(t, envelope.ControlHeader{
-		SignerDID:     signerDID,
-		AuthorityPath: sameSigner(),
-		DelegateDID:   &delegateDID,
-	}, nil)
+	hdr := testHeader(testExchangeDID, signerDID)
+	hdr.AuthorityPath = sameSigner()
+	hdr.DelegateDID = &delegateDID
+	entry := makeEntry(t, hdr, nil)
 	h.fetcher.storeEntry(delegPos, entry)
 	key := smt.DeriveKey(delegPos)
 	_ = h.tree.SetLeaf(key, types.SMTLeaf{Key: key, OriginTip: delegPos, AuthorityTip: delegPos})
@@ -277,11 +351,10 @@ func (h *testHarness) addDelegation(t *testing.T, delegPos types.LogPosition, si
 // addScopeEntity creates a scope entity with an authority set.
 func (h *testHarness) addScopeEntity(t *testing.T, p types.LogPosition, signerDID string, authSet map[string]struct{}) *envelope.Entry {
 	t.Helper()
-	entry := makeEntry(t, envelope.ControlHeader{
-		SignerDID:     signerDID,
-		AuthorityPath: sameSigner(),
-		AuthoritySet:  authSet,
-	}, nil)
+	hdr := testHeader(testExchangeDID, signerDID)
+	hdr.AuthorityPath = sameSigner()
+	hdr.AuthoritySet = authSet
+	entry := makeEntry(t, hdr, nil)
 	h.fetcher.storeEntry(p, entry)
 	key := smt.DeriveKey(p)
 	_ = h.tree.SetLeaf(key, types.SMTLeaf{Key: key, OriginTip: p, AuthorityTip: p})
@@ -355,19 +428,26 @@ func (h *testHarness) root(t *testing.T) [32]byte {
 // Bulk entry generation
 // ─────────────────────────────────────────────────────────────────────────────
 
+// generateEntries produces n test entries with sequential positions.
+//
+// Every entry is bound to testExchangeDID (the test operator's admitted
+// exchange). Positions are issued via pos(), which tags them with
+// testLogDID (the physical log identity). The two DIDs are distinct by
+// construction.
 func generateEntries(n int) ([]*envelope.Entry, []types.LogPosition) {
 	entries := make([]*envelope.Entry, n)
 	positions := make([]types.LogPosition, n)
 	for i := 0; i < n; i++ {
-		var ap *envelope.AuthorityPath
+		hdr := testHeader(testExchangeDID, didForUser(i/10))
 		if i%5 == 0 {
 			v := envelope.AuthoritySameSigner
-			ap = &v
+			hdr.AuthorityPath = &v
 		}
-		entries[i], _ = envelope.NewEntry(envelope.ControlHeader{
-			SignerDID:     didForUser(i / 10),
-			AuthorityPath: ap,
-		}, []byte{byte(i)})
+		entry, err := envelope.NewEntry(hdr, []byte{byte(i)})
+		if err != nil {
+			panic(fmt.Sprintf("generateEntries[%d]: NewEntry failed: %v", i, err))
+		}
+		entries[i] = entry
 		positions[i] = pos(uint64(i + 1))
 	}
 	return entries, positions
