@@ -92,15 +92,18 @@ type EntryResponse struct {
 // This is the single site where canonical hashes are computed for the
 // read path — aligning here aligns every query endpoint at once.
 //
-// SignerDID is not a field on EntryWithMetadata. We deserialize to extract
-// it alongside protocol version and payload size.
+// SignerDID and SigAlgorithmID are not fields on EntryWithMetadata
+// under v7.75 — both live inside CanonicalBytes (in the v6 multi-sig
+// section) and surface via envelope.Deserialize. We deserialize once
+// per entry to extract them alongside protocol version and payload
+// size. On a malformed-bytes degraded path SigAlgorithmID is left
+// at its zero value (the entry is structurally broken anyway).
 func toEntryResponses(metas []types.EntryWithMetadata) []EntryResponse {
 	out := make([]EntryResponse, 0, len(metas))
 	for _, ewm := range metas {
 		resp := EntryResponse{
 			SequenceNumber: ewm.Position.Sequence,
 			LogTime:        ewm.LogTime.Format(time.RFC3339Nano),
-			SigAlgorithmID: ewm.SignatureAlgoID,
 			CanonicalSize:  len(ewm.CanonicalBytes),
 		}
 
@@ -115,6 +118,9 @@ func toEntryResponses(metas []types.EntryWithMetadata) []EntryResponse {
 			resp.ProtocolVer = entry.Header.ProtocolVersion
 			resp.PayloadSize = len(entry.DomainPayload)
 			resp.SignerDID = entry.Header.SignerDID
+			// Deserialize rejects zero-sig sections, so Signatures[0]
+			// is safe inside this success branch.
+			resp.SigAlgorithmID = entry.Signatures[0].AlgoID
 		}
 
 		out = append(out, resp)
@@ -223,9 +229,12 @@ func NewHashLookupHandler(deps *QueryDeps) http.HandlerFunc {
 // GET /v1/entries/{seq}/raw — raw wire bytes
 // ─────────────────────────────────────────────────────────────────────
 
-// NewRawEntryHandler returns canonical bytes + signature envelope as a
-// single byte stream. Consumers feed this into envelope.StripSignature
-// then envelope.Deserialize then envelope.EntryIdentity to verify.
+// NewRawEntryHandler returns the entry's full wire bytes as a single
+// byte stream. Under v7.75 the wire bytes ARE the canonical bytes —
+// the multi-sig section is appended INSIDE the canonical form by
+// envelope.Serialize, so EntryWithMetadata.CanonicalBytes already
+// carries the signatures. Consumers feed this directly into
+// envelope.Deserialize then envelope.EntryIdentity to verify.
 func NewRawEntryHandler(deps *QueryDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		seqStr := r.URL.Path[len("/v1/entries/"):]
@@ -250,17 +259,10 @@ func NewRawEntryHandler(deps *QueryDeps) http.HandlerFunc {
 		}
 		ewm := entries[0]
 
-		wire, err := envelope.AppendSignature(ewm.CanonicalBytes, ewm.SignatureAlgoID, ewm.SignatureBytes)
-		if err != nil {
-			deps.Logger.Error("append signature failed", "seq", seq, "error", err)
-			writeError(w, http.StatusInternalServerError, "reconstruction failed")
-			return
-		}
-
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("X-Sequence", strconv.FormatUint(seq, 10))
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(wire)
+		_, _ = w.Write(ewm.CanonicalBytes)
 	}
 }
 
