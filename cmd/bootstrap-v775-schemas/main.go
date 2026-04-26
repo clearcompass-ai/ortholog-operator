@@ -2,21 +2,37 @@
 Command bootstrap-v775-schemas — F4 schema-entry bootstrap script.
 
 Wave 1 v3 §F4. Idempotent script that publishes the two v7.75
-cryptographic-commitment schema-definition entries
+cryptographic-commitment schema-marker entries
 (pre-grant-commitment-v1, escrow-split-commitment-v1) on the
-operator's log so downstream consumers can resolve them via
-SchemaRef. Run once at cutover; safe to re-run (already-bootstrapped
-schemas are detected and the script exits without resubmitting).
+operator's log so downstream consumers can locate them via the
+output YAML's (sequence_number, canonical_hash) map. Run once at
+cutover; safe to re-run.
 
 Why bootstrap? The C2 admission dispatcher in api/submission.go
 recognizes commitment payloads by their embedded schema_id field
-and does NOT require a schema-definition entry on log to admit a
-commitment entry. The bootstrap exists for downstream consumers
-that look up schemas via SchemaRef pointers — a SchemaRef pointing
-at a missing entry resolves to strict-OCC default in the SDK's
-CachingResolver, which is correct for unknown schemas but not
-discoverable for tooling that wants to enumerate all v7.75
-schemas on the log.
+and does NOT require any schema entry on log to admit a
+commitment entry. The bootstrap exists for downstream tooling that
+wants to discover "what v7.75 schemas does this log declare?" via
+a stable (schema_id → log position) map.
+
+Why commentary, not BuildSchemaEntry? Wave 1 v3's §F4 originally
+called for builder.BuildSchemaEntry, on the assumption that
+SchemaParameters could carry a schema_id discriminator. The actual
+v7.75 SchemaParameters type (types/schema_parameters.go) has no
+schema_id field — its CommutativeOperations slot is []uint32, not
+[]string, and none of the other declared fields (ActivationDelay,
+MigrationPolicy, GrantAuthorizationMode, etc.) naturally encode a
+string label. Forcing one in would be a semantic abuse that the
+SDK schema parsers and verifier code paths would not interpret
+correctly.
+
+This script switches to builder.BuildCommentary with an explicit
+JSON payload carrying the schema_id. The two resulting entries
+have distinct canonical bytes (different payloads ⇒ different
+canonical hashes) and the schema_id is plainly visible in the
+payload for any consumer that wants to enumerate. The output YAML
+is unchanged — consumers still resolve a schema_id to its
+sequence_number via the YAML map this script writes.
 
 Idempotency model:
 
@@ -27,11 +43,11 @@ Idempotency model:
     operator. This is the fast-path for production deploys where
     the bootstrap has already run.
   - If the output file is missing or incomplete, the script builds
-    fresh schema entries and submits them via POST /v1/entries/batch.
+    fresh commentary entries and submits them via POST /v1/entries/batch.
     The operator's UNIQUE constraint on canonical_hash means a
     duplicate submission (same content) returns HTTP 409; the script
-    treats 409 as success and re-queries the operator to discover
-    the existing position.
+    aborts and operators reconcile manually (rare — only happens
+    when the YAML was deleted while the operator state survived).
 
 Usage:
 
@@ -44,8 +60,7 @@ Usage:
 
 Run order in deploy: schema bootstrap → service start. The operator
 itself does NOT need the schemas to start (commitment admission
-works without them); the bootstrap is a separate cutover step that
-makes SchemaRef-based lookups resolve correctly for tooling.
+works without them); the bootstrap is a separate cutover step.
 */
 package main
 
@@ -68,7 +83,6 @@ import (
 	"github.com/clearcompass-ai/ortholog-sdk/crypto/artifact"
 	"github.com/clearcompass-ai/ortholog-sdk/crypto/escrow"
 	"github.com/clearcompass-ai/ortholog-sdk/crypto/signatures"
-	"github.com/clearcompass-ai/ortholog-sdk/types"
 )
 
 // ─────────────────────────────────────────────────────────────────────
@@ -88,7 +102,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.OperatorURL, "operator-url", "",
 		"base URL of the operator HTTP API (e.g. http://localhost:8080)")
 	flag.StringVar(&cfg.SignerDID, "signer-did", "",
-		"DID that signs the schema-definition entries (operator institutional DID)")
+		"DID that signs the schema-marker entries (operator institutional DID)")
 	flag.StringVar(&cfg.LogDID, "log-did", "",
 		"destination log DID for the schema entries (must equal operator's LogDID)")
 	flag.StringVar(&cfg.KeyPath, "key-path", "",
@@ -163,14 +177,14 @@ func main() {
 		logger.Fatalf("load key: %v", err)
 	}
 
-	// Build + sign + serialize each schema entry.
+	// Build + sign + serialize each schema marker entry.
 	preWire, err := buildAndSign(cfg, priv, artifact.PREGrantCommitmentSchemaID)
 	if err != nil {
-		logger.Fatalf("build pre-grant schema entry: %v", err)
+		logger.Fatalf("build pre-grant schema marker: %v", err)
 	}
 	escrowWire, err := buildAndSign(cfg, priv, escrow.EscrowSplitCommitmentSchemaID)
 	if err != nil {
-		logger.Fatalf("build escrow-split schema entry: %v", err)
+		logger.Fatalf("build escrow-split schema marker: %v", err)
 	}
 
 	// Submit batch.
@@ -215,45 +229,43 @@ func main() {
 // Build + sign
 // ─────────────────────────────────────────────────────────────────────
 
-// buildAndSign constructs a schema-definition entry for the supplied
+// schemaMarkerPayload is the JSON shape this bootstrap publishes as
+// the Domain Payload of each commentary entry. Carries the
+// schema_id explicitly so any consumer reading the entry's payload
+// can identify which v7.75 schema this marker stands in for.
+type schemaMarkerPayload struct {
+	MarkerType string `json:"marker_type"`
+	SchemaID   string `json:"schema_id"`
+	V775       bool   `json:"v775"`
+}
+
+// buildAndSign constructs a commentary marker entry for the supplied
 // schema_id, signs it with the operator's key, and returns the wire
 // bytes ready for batch submission.
 //
-// SchemaParameters is left mostly at zero values — the v7.75
-// commitment schemas are structural validators with no governance
-// semantics. The schema_id discriminator embedded in the
-// commitment payload itself is what dispatches admission validation;
-// the schema-definition entry exists for SchemaRef discoverability.
+// Why commentary instead of BuildSchemaEntry: see the file docblock.
+// Two distinct schema_ids produce two distinct payloads, and
+// envelope.Serialize hashes the payload bytes into the canonical
+// hash, so the two resulting entries are guaranteed to have distinct
+// canonical_hash values without abusing any SchemaParameters field.
 func buildAndSign(cfg config, priv *ecdsa.PrivateKey, schemaID string) ([]byte, error) {
-	// SchemaParameters with all zero values plus an EventTime stamp.
-	// The schema_id discriminator is conveyed via the entry's payload
-	// (BuildSchemaEntry marshals SchemaParameters into Domain Payload);
-	// downstream consumers that need to know "which v7.75 commitment
-	// schema is this" inspect either:
-	//   - The entry's canonical_hash matched against the
-	//     v775_schemas.yaml map this script writes, OR
-	//   - The CommutativeOperations field below, which we set to the
-	//     schema_id string for self-identification.
-	//
-	// Setting CommutativeOperations to the schema_id is a small abuse
-	// of the field — its semantic intent is to declare commutativity
-	// for OCC. For commitment schemas there are no commutative
-	// operations, so the field is harmless to repurpose as a label.
-	// A future Wave can add a dedicated schema_id field to
-	// SchemaParameters; for now this lets BuildSchemaEntry produce
-	// distinct canonical bytes per schema without an SDK change.
-	params := types.SchemaParameters{
-		CommutativeOperations: []string{schemaID},
+	payload, err := json.Marshal(schemaMarkerPayload{
+		MarkerType: "v775_commitment_schema",
+		SchemaID:   schemaID,
+		V775:       true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal marker payload: %w", err)
 	}
 
-	entry, err := builder.BuildSchemaEntry(builder.SchemaEntryParams{
+	entry, err := builder.BuildCommentary(builder.CommentaryParams{
 		Destination: cfg.LogDID,
 		SignerDID:   cfg.SignerDID,
-		Parameters:  params,
+		Payload:     payload,
 		EventTime:   time.Now().UTC().Unix(),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("BuildSchemaEntry: %w", err)
+		return nil, fmt.Errorf("BuildCommentary: %w", err)
 	}
 
 	// Sign the canonical signing payload per the v7 entry signing
