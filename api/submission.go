@@ -264,20 +264,20 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 			return
 		}
 
-		// ── Step 2: Strip signature, deserialize, validate algo ID ─────
-		canonical, algoID, sigBytes, err := envelope.StripSignature(raw)
-		if err != nil {
-			writeError(w, http.StatusUnauthorized,
-				fmt.Sprintf("signature envelope: %s", err))
-			return
-		}
-
-		entry, err := envelope.Deserialize(canonical)
+		// ── Step 2: Deserialize wire bytes, validate algo ID ───────────
+		// Under v7.75 the wire bytes ARE the canonical bytes — the
+		// multi-sig section is appended INSIDE the canonical form by
+		// envelope.Serialize, so envelope.StripSignature is gone.
+		// Deserialize rejects zero-sig sections (ErrEmptySignatureList),
+		// so entry.Signatures[0] is safe here.
+		entry, err := envelope.Deserialize(raw)
 		if err != nil {
 			writeError(w, http.StatusUnprocessableEntity,
 				fmt.Sprintf("deserialize: %s", err))
 			return
 		}
+		algoID := entry.Signatures[0].AlgoID
+		sigBytes := entry.Signatures[0].Bytes
 
 		if err := envelope.ValidateAlgorithmID(algoID); err != nil {
 			writeError(w, http.StatusUnauthorized, err.Error())
@@ -345,10 +345,12 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 		}
 
 		// ── Step 5: Entry size (SDK-D11) ───────────────────────────────
-		if int64(len(canonical)) > deps.MaxEntrySize {
+		// Wire bytes ARE the canonical bytes under v7.75 (multi-sig
+		// section is part of the canonical form).
+		if int64(len(raw)) > deps.MaxEntrySize {
 			writeError(w, http.StatusRequestEntityTooLarge,
 				fmt.Sprintf("canonical bytes %d exceed max %d",
-					len(canonical), deps.MaxEntrySize))
+					len(raw), deps.MaxEntrySize))
 			return
 		}
 
@@ -470,7 +472,11 @@ func NewSubmissionHandler(deps *SubmissionDeps) http.HandlerFunc {
 			}
 
 			if deps.Storage.EntryWriter != nil {
-				if writeErr := deps.Storage.EntryWriter.WriteEntry(seq, canonical, sigBytes); writeErr != nil {
+				// Wire bytes ARE the canonical bytes under v7.75; the
+				// signatures section lives inside `raw`. The legacy
+				// (canonical, sig) split is no longer meaningful — pass
+				// the full wire bytes as canonical and a nil sig.
+				if writeErr := deps.Storage.EntryWriter.WriteEntry(seq, raw, nil); writeErr != nil {
 					return fmt.Errorf("write entry bytes: %w", writeErr)
 				}
 			}
