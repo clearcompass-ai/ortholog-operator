@@ -9,8 +9,17 @@ entry bytes. Always.
 
   - Queries hit entry_index for sequence numbers + metadata.
   - Entry bytes hydrated via EntryReader (tessera.EntryReader).
-  - scanEntries: query rows → collect seqs + metadata → batch hydrate.
+  - scanAndHydrate: query rows → collect seqs + metadata → batch hydrate.
   - ReadEntryBatch is tile-aware: entries in the same tile = 1 read.
+
+EntryWithMetadata field set: under v6 the SDK type carries only
+CanonicalBytes, LogTime, Position. Signatures live inside
+CanonicalBytes (in the v6 multi-sig section) and are extracted via
+envelope.Deserialize when callers need them. The earlier
+SignatureAlgoID/SignatureBytes sidecar fields were removed; this
+query API reads only what the type carries. The entry_index column
+sig_algorithm_id remains in the table for diagnostics, but is not
+surfaced through the API response.
 */
 package indexes
 
@@ -45,15 +54,23 @@ func NewPostgresQueryAPI(db *pgxpool.Pool, reader tessera.EntryReader, logDID st
 	return &PostgresQueryAPI{db: db, reader: reader, logDID: logDID}
 }
 
-// indexMeta holds the metadata columns from entry_index.
+// indexMeta holds the metadata columns scanned from entry_index.
+// Aligned with the v6 EntryWithMetadata field set: only sequence
+// number and log time are needed to populate the response.
 type indexMeta struct {
-	Seq    uint64
-	Time   time.Time
-	AlgoID uint16
+	Seq  uint64
+	Time time.Time
 }
 
 // scanAndHydrate queries entry_index for metadata, then batch-hydrates
 // bytes from EntryReader. This is the shared path for all 5 query methods.
+//
+// Note on the SQL projection: per-method queries that call this
+// helper MUST select exactly (sequence_number, log_time) in that
+// order — the third column position previously held sig_algorithm_id,
+// which has been dropped because EntryWithMetadata no longer carries
+// it. Per-method query files in this package were updated alongside
+// this helper.
 func (q *PostgresQueryAPI) scanAndHydrate(ctx context.Context, rows interface {
 	Next() bool
 	Scan(dest ...any) error
@@ -66,14 +83,13 @@ func (q *PostgresQueryAPI) scanAndHydrate(ctx context.Context, rows interface {
 	var metas []indexMeta
 	for rows.Next() {
 		var (
-			seq    uint64
-			lt     time.Time
-			algoID int16
+			seq uint64
+			lt  time.Time
 		)
-		if err := rows.Scan(&seq, &lt, &algoID); err != nil {
+		if err := rows.Scan(&seq, &lt); err != nil {
 			return nil, fmt.Errorf("store/indexes: scan: %w", err)
 		}
-		metas = append(metas, indexMeta{Seq: seq, Time: lt, AlgoID: uint16(algoID)})
+		metas = append(metas, indexMeta{Seq: seq, Time: lt})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store/indexes: rows: %w", err)
@@ -93,15 +109,15 @@ func (q *PostgresQueryAPI) scanAndHydrate(ctx context.Context, rows interface {
 		return nil, fmt.Errorf("store/indexes: hydrate: %w", err)
 	}
 
-	// (3) Assemble []EntryWithMetadata.
+	// (3) Assemble []EntryWithMetadata. Three-field type per the v6
+	// SDK; signatures live inside CanonicalBytes and surface to
+	// callers via envelope.Deserialize.
 	results := make([]types.EntryWithMetadata, len(metas))
 	for i, m := range metas {
 		results[i] = types.EntryWithMetadata{
-			CanonicalBytes:  rawEntries[i].CanonicalBytes,
-			LogTime:         m.Time,
-			Position:        types.LogPosition{LogDID: q.logDID, Sequence: m.Seq},
-			SignatureAlgoID: m.AlgoID,
-			SignatureBytes:  rawEntries[i].SigBytes,
+			CanonicalBytes: rawEntries[i].CanonicalBytes,
+			LogTime:        m.Time,
+			Position:       types.LogPosition{LogDID: q.logDID, Sequence: m.Seq},
 		}
 	}
 	return results, nil
