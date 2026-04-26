@@ -18,7 +18,11 @@ INVARIANTS:
   - WithTransaction uses Serializable for builder commits, ReadCommitted
     for admission (configurable via TxOptions parameter).
 
-CHANGES: Added derivation_commitments table + index to schemaDDL.
+CHANGES:
+  - v0.3.0-tessera: Added derivation_commitments table + index.
+  - v7.75 Wave 1 (C3): Added commitment_split_id table + index for
+    cryptographic-commitment lookup; BTREE not UNIQUE per Decision 3
+    (equivocation evidence preservation).
 */
 package store
 
@@ -202,7 +206,7 @@ var schemaDDL = []string{
 		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`,
 
-	// ── Equivocation proofs ──────────────────────────────────────────
+	// ── Equivocation proofs (tree-head fork; v0.3.0-tessera) ────────
 	`CREATE TABLE IF NOT EXISTS equivocation_proofs (
 		id         SERIAL      PRIMARY KEY,
 		head_a     BYTEA       NOT NULL,
@@ -219,10 +223,11 @@ var schemaDDL = []string{
 		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`,
 
-	// ── Derivation commitments (NEW — fraud proof lookup index) ──────
+	// ── Derivation commitments (fraud proof lookup index) ────────────
 	// Post-commit persistence: crash between atomic commit and this
 	// insert loses the row. Acceptable — reconstructable from entries.
-	// See store/commitments.go for full crash recovery semantics.
+	// See store/derivation_commitments.go for full crash recovery
+	// semantics.
 	`CREATE TABLE IF NOT EXISTS derivation_commitments (
 		id              SERIAL      PRIMARY KEY,
 		range_start_seq BIGINT      NOT NULL,
@@ -235,6 +240,35 @@ var schemaDDL = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_commitment_range
 		ON derivation_commitments (range_start_seq, range_end_seq)`,
+
+	// ── Commitment SplitID index (v7.75 — Wave 1 C3) ─────────────────
+	// Maps the 32-byte SplitID embedded in pre-grant-commitment-v1 and
+	// escrow-split-commitment-v1 entry payloads to the entry's sequence
+	// number, enabling the SDK lookup primitives FetchPREGrantCommitment
+	// and FetchEscrowSplitCommitment per ADR-005 §6.2.
+	//
+	// Equivocation evidence preservation (Wave 1 v3 Decision 3): the
+	// (schema_id, split_id) index is BTREE, NOT UNIQUE. A malicious
+	// dealer publishing two distinct commitment entries under the same
+	// SplitID produces two rows here under the same key tuple; both
+	// MUST persist so the SDK can return *CommitmentEquivocationError
+	// to verifiers. Rejecting the second row on a UNIQUE constraint
+	// would silently destroy the cryptographic evidence the SDK's
+	// equivocation detection depends on.
+	//
+	// PRIMARY KEY on sequence_number is correct — two equivocating
+	// entries have distinct sequence numbers (each has its own admission)
+	// and the (schema_id, split_id) tuple is the lookup key, not the
+	// uniqueness key.
+	`CREATE TABLE IF NOT EXISTS commitment_split_id (
+		sequence_number BIGINT NOT NULL,
+		schema_id       TEXT   NOT NULL,
+		split_id        BYTEA  NOT NULL,
+		PRIMARY KEY (sequence_number),
+		FOREIGN KEY (sequence_number) REFERENCES entry_index (sequence_number)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_commitment_split_id
+		ON commitment_split_id (schema_id, split_id)`,
 
 	// ── Sequence ─────────────────────────────────────────────────────
 	`CREATE SEQUENCE IF NOT EXISTS entry_sequence START 1 NO CYCLE`,
